@@ -79,7 +79,7 @@ class TradeMasterBot(commands.Bot):
         self._trades_channel_id = _chan(settings.discord_channel_trades)
         self._logs_channel_id = _chan(settings.discord_channel_logs)
         self._guild_id = _chan(settings.discord_guild_id)
-        self._ready = asyncio.Event()
+        self._app_ready = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._register_commands()
 
@@ -93,7 +93,7 @@ class TradeMasterBot(commands.Bot):
         else:
             synced = await self.tree.sync()
         log.info("discord_commands_synced", count=len(synced))
-        self._ready.set()
+        self._app_ready.set()
 
     # ---------- lifecycle ----------
 
@@ -101,7 +101,7 @@ class TradeMasterBot(commands.Bot):
         if not self._token:
             raise RuntimeError("DISCORD_BOT_TOKEN is empty")
         self._task = asyncio.create_task(self.start(self._token))
-        await self._ready.wait()
+        await self._app_ready.wait()
         return self
 
     async def __aexit__(self, *_exc) -> None:

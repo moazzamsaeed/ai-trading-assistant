@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from enum import Enum
 
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
@@ -97,11 +98,18 @@ class PositionSnapshot:
     asset_class: str
 
 
+def _enum_str(v) -> str:
+    """alpaca-py returns some fields as enums; we want the underlying string value."""
+    if isinstance(v, Enum):
+        return str(v.value)
+    return str(v)
+
+
 def _to_account(raw) -> AccountSnapshot:
     return AccountSnapshot(
-        account_number=str(getattr(raw, "account_number", "")),
-        status=str(getattr(raw, "status", "")),
-        multiplier=str(getattr(raw, "multiplier", "")),
+        account_number=_enum_str(getattr(raw, "account_number", "")),
+        status=_enum_str(getattr(raw, "status", "")),
+        multiplier=_enum_str(getattr(raw, "multiplier", "")),
         cash=Decimal(str(getattr(raw, "cash", "0") or "0")),
         buying_power=Decimal(str(getattr(raw, "buying_power", "0") or "0")),
         equity=Decimal(str(getattr(raw, "equity", "0") or "0")),
