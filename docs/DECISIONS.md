@@ -236,3 +236,41 @@ a drop-in `price_paths` source — the rest of the simulator code
 available, add a `from_alpaca_history(date_range)` price-path source
 that pulls real chain snapshots. Compare backtest results between
 synthetic and real to calibrate the synthetic IV assumption.
+
+---
+
+## D-016 — Pre-market research model: gemini-2.5-pro (stable), not 3.1-pro-preview
+
+**Decision:** The router's `PRE_MARKET_RESEARCH` task type uses
+`gemini-2.5-pro` (stable) instead of `gemini-3.1-pro-preview`.
+
+**Why:** First integration test of the pre-market briefing failed
+three times on Gemini 3.1 Pro Preview with consistent 503
+"experiencing high demand" responses — even on simple 10-token
+prompts. The model is in preview status with severe load-balancing
+constraints. Gemini 2.5 Pro (stable) responds reliably to the same
+queries.
+
+For our pre-market news synthesis task, the benchmark difference
+between 2.5 Pro and 3.1 Pro Preview is irrelevant — the briefing is
+~500 words from ~300 tokens of news, well within 2.5 Pro's
+capabilities. Reliability > marginal GPQA score.
+
+**Alternatives considered:**
+- Stay on 3.1 Pro Preview and live with intermittent failures —
+  rejected. Briefings would silently skip on busy days; risk-event
+  log fills up with 503s.
+- Fallback chain (try 3.1 → fall back to 2.5) — rejected as
+  unnecessary complexity. The "preview model is unreliable" failure
+  mode is structural, not transient; we'd hit the fallback nearly
+  every call.
+
+**Implication:** Updates D-002's "highest GPQA score" reasoning for
+this specific task type. Other agents (Anthropic Opus 4.7, DeepSeek
+V4-Pro/Flash) remain unchanged — they're all on stable models.
+Cost-per-call drops from ~$2/$12 to $1.25/$10 per M tokens (lower
+budget impact too).
+
+**When to revisit:** Once Gemini 3.x emerges from preview status
+with stable production tier, swap back if benchmarks justify the
+cost delta for this task.

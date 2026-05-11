@@ -27,6 +27,12 @@ PRICING: dict[str, dict[str, Decimal]] = {
         "input": Decimal("2.00"),
         "output": Decimal("12.00"),
     },
+    # Gemini 2.5 Pro — stable production model used as the reliable
+    # alternative to 3.1-pro-preview (D-016). Tier 1 (≤200k input).
+    "gemini-2.5-pro": {
+        "input": Decimal("1.25"),
+        "output": Decimal("10.00"),
+    },
     # DeepSeek — discounted prices in effect until 2026-05-31; standard
     # prices ($1.74 input / $3.48 output) resume after.
     # https://api-docs.deepseek.com/quick_start/pricing

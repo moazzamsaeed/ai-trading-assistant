@@ -41,7 +41,7 @@ class TaskType(StrEnum):
 
 MODEL_MAP: dict[TaskType, tuple[str, str]] = {
     TaskType.ORCHESTRATE: ("anthropic", "claude-opus-4-7"),
-    TaskType.PRE_MARKET_RESEARCH: ("google", "gemini-3.1-pro-preview"),
+    TaskType.PRE_MARKET_RESEARCH: ("google", "gemini-2.5-pro"),
     TaskType.INTRADAY_SCAN: ("deepseek", "deepseek-v4-flash"),
     TaskType.FORMAT_ALERT: ("deepseek", "deepseek-v4-flash"),
     TaskType.OPTIONS_STRATEGY: ("deepseek", "deepseek-v4-pro"),

@@ -62,7 +62,7 @@ async def test_dispatches_to_correct_provider_for_each_task(monkeypatch, session
     )
 
     assert ("anthropic", "claude-opus-4-7") in calls
-    assert ("google", "gemini-3.1-pro-preview") in calls
+    assert ("google", "gemini-2.5-pro") in calls
     assert ("deepseek", "deepseek-v4-flash") in calls
 
 
