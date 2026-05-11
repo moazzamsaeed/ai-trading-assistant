@@ -73,3 +73,6 @@ Thumbs.db
 positions/
 trades/
 backtests/results/
+
+# Claude Code session state
+.claude/
