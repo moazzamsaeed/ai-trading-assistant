@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     trading_mode: Literal["paper", "live"] = "paper"
     account_type: Literal["cash"] = "cash"
 
+    enable_iron_condor: bool = False
+    directional_mode: Literal["aggressive", "selective"] = "selective"
+
     # Working capital ceiling. The risk manager treats the effective
     # cash as min(account.cash, trading_capital_usd). Paper account has
     # $100k but we cap at $5k so paper-trade results map to a real $5k

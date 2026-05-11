@@ -241,8 +241,15 @@ async def test_run_intraday_once(monkeypatch):
 # ----------------- iron condor entry -----------------
 
 
-def test_make_scheduler_registers_iron_condor_job():
+def test_make_scheduler_ic_absent_by_default():
     scheduler = sch.make_scheduler(**_all_posters())
+    assert scheduler.get_job("iron_condor_entry") is None
+    assert scheduler.get_job("iron_condor_exit") is None
+    assert scheduler.get_job("iron_condor_force_close") is None
+
+
+def test_make_scheduler_registers_iron_condor_job_when_enabled():
+    scheduler = sch.make_scheduler(**_all_posters(), enable_iron_condor=True)
     job = scheduler.get_job("iron_condor_entry")
     assert job is not None
     fields = {f.name: str(f) for f in job.trigger.fields}
@@ -403,8 +410,8 @@ async def test_run_iron_condor_once(monkeypatch):
 # ----------------- exit monitor -----------------
 
 
-def test_scheduler_registers_exit_jobs():
-    scheduler = sch.make_scheduler(**_all_posters())
+def test_scheduler_registers_exit_jobs_when_enabled():
+    scheduler = sch.make_scheduler(**_all_posters(), enable_iron_condor=True)
     monitor = scheduler.get_job("iron_condor_exit")
     force = scheduler.get_job("iron_condor_force_close")
     assert monitor is not None

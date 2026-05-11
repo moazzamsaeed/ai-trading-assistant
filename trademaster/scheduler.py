@@ -25,6 +25,7 @@ from agents.options.exit_monitor import run_exit_monitor
 from agents.options.strategist import run_iron_condor_strategist
 from agents.research.premarket import run_premarket_briefing
 from integrations import alpaca_client
+from trademaster.config import get_settings
 from trademaster.logging import get_logger
 from trademaster.state import get_state
 
@@ -236,13 +237,17 @@ def make_scheduler(
     signal_poster: Poster,
     trade_poster: Poster,
     log_poster: Poster | None = None,
+    enable_iron_condor: bool | None = None,
 ) -> AsyncIOScheduler:
     """Build an AsyncIOScheduler with all standing jobs registered.
 
     Errors caught by individual jobs route to `log_poster` if provided
     (defaults to a no-op for tests that don't care).
+    IC jobs are omitted unless `enable_iron_condor=True` (or ENABLE_IRON_CONDOR=true in env).
     """
     log_post = log_poster or _noop_poster
+    if enable_iron_condor is None:
+        enable_iron_condor = get_settings().enable_iron_condor
 
     scheduler = AsyncIOScheduler(timezone=PREMARKET_TZ)
 
@@ -287,63 +292,64 @@ def make_scheduler(
         misfire_grace_time=120,
     )
 
-    # Iron-condor entry: 9:45 ET Mon-Fri (STRATEGIES.md 9:45-10:30 window).
-    scheduler.add_job(
-        _iron_condor_entry_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour=9,
-            minute=45,
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={
-            "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
-            "log_poster": log_post,
-        },
-        id="iron_condor_entry",
-        replace_existing=True,
-        misfire_grace_time=300,
-    )
+    if enable_iron_condor:
+        # Iron-condor entry: 9:45 ET Mon-Fri (STRATEGIES.md 9:45-10:30 window).
+        scheduler.add_job(
+            _iron_condor_entry_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=9,
+                minute=45,
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={
+                "signal_poster": signal_poster,
+                "trade_poster": trade_poster,
+                "log_poster": log_post,
+            },
+            id="iron_condor_entry",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
 
-    # Exit monitor: every 5 min during RTH (10:00-15:45 ET).
-    scheduler.add_job(
-        _iron_condor_exit_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="10-15",
-            minute="0,5,10,15,20,25,30,35,40,45",
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={
-            "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
-            "log_poster": log_post,
-        },
-        id="iron_condor_exit",
-        replace_existing=True,
-        misfire_grace_time=120,
-    )
+        # Exit monitor: every 5 min during RTH (10:00-15:45 ET).
+        scheduler.add_job(
+            _iron_condor_exit_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="10-15",
+                minute="0,5,10,15,20,25,30,35,40,45",
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={
+                "signal_poster": signal_poster,
+                "trade_poster": trade_poster,
+                "log_poster": log_post,
+            },
+            id="iron_condor_exit",
+            replace_existing=True,
+            misfire_grace_time=120,
+        )
 
-    # Force-close at 15:50 ET — last call regardless of P&L.
-    scheduler.add_job(
-        _iron_condor_exit_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour=15,
-            minute=50,
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={
-            "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
-            "log_poster": log_post,
-            "force": True,
-        },
-        id="iron_condor_force_close",
-        replace_existing=True,
-        misfire_grace_time=120,
-    )
+        # Force-close at 15:50 ET — last call regardless of P&L.
+        scheduler.add_job(
+            _iron_condor_exit_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=15,
+                minute=50,
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={
+                "signal_poster": signal_poster,
+                "trade_poster": trade_poster,
+                "log_poster": log_post,
+                "force": True,
+            },
+            id="iron_condor_force_close",
+            replace_existing=True,
+            misfire_grace_time=120,
+        )
 
     log.info("scheduler_built", jobs=[j.id for j in scheduler.get_jobs()])
     return scheduler

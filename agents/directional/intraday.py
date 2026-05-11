@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from integrations import alpaca_client
 from integrations.alpaca_client import Bar, NewsArticle
 from trademaster import indicators
+from trademaster.config import get_settings
 from trademaster.db import Signal as SignalRow
 from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
@@ -54,15 +55,38 @@ class TickerDecision:
     reasoning: str
 
 
+_MODE_CONFIG = {
+    "aggressive": {
+        "selectivity": (
+            "Only signal HIGH conviction setups (3+ indicators aligning strongly). "
+            "MEDIUM conviction → HOLD. Miss opportunities before taking a bad trade."
+        ),
+        "strike": "Choose strike: ATM for all signals (max gamma exposure).",
+        "exit_hint": "Exits: take profit at +100% on premium, stop at -50% on premium.",
+        "profit_target": "+100%",
+        "stop_loss": "-50%",
+    },
+    "selective": {
+        "selectivity": (
+            "Selectivity matters. False positives are worse than missed opportunities. "
+            "Default to HOLD unless at least 2-3 indicators align."
+        ),
+        "strike": "Choose strike: ATM if HIGH conviction (max gamma); 1 strike OTM if MEDIUM.",
+        "exit_hint": "Exits: take profit at +50% on premium, stop at -30% on premium.",
+        "profit_target": "+50%",
+        "stop_loss": "-30%",
+    },
+}
+
 PROMPT_TEMPLATE = """You are an intraday directional options trader scanning at {now_iso}.
+Mode: {mode_upper}
 
 You see {n} tickers below with recent indicators and news. For each ticker, decide:
 - BUY_CALL  : bullish setup, buy a call option
 - BUY_PUT   : bearish setup, buy a put option
 - HOLD      : no edge
 
-Selectivity matters. False positives are worse than missed opportunities. Default to HOLD
-unless you see at least 2-3 indicators aligning. A typical strong setup:
+{selectivity} A typical strong setup:
 
   - Bullish: price > VWAP, RSI(14) in 40-65 range, EMA20 > EMA50, volume_ratio > 1.3,
              news catalyst or breaking out of recent range
@@ -70,9 +94,10 @@ unless you see at least 2-3 indicators aligning. A typical strong setup:
              news headwind or breaking down
 
 When you BUY:
-- Choose strike: ATM if HIGH conviction (max gamma); 1 strike OTM if MEDIUM/LOW
+- {strike}
 - Choose expiry: "0DTE" if HIGH conviction and current time before 14:00 ET; otherwise "WEEKLY"
 - Conviction reflects how many indicators align: HIGH = 3+, MEDIUM = 2, LOW = 1 (HOLD instead)
+- {exit_hint}
 
 Output a JSON array of objects, one per ticker, in the same order as input. Schema:
 [
@@ -161,7 +186,9 @@ def _next_friday(today: date) -> date:
     return today + timedelta(days=days)
 
 
-def format_directional_signal(d: TickerDecision, *, today: date) -> str:
+def format_directional_signal(
+    d: TickerDecision, *, today: date, mode: str = "selective"
+) -> str:
     """Plain-language buy signal for #signals."""
     action_word = "BUY a CALL" if d.action == "BUY_CALL" else "BUY a PUT"
     icon = "📈" if d.action == "BUY_CALL" else "📉"
@@ -170,8 +197,11 @@ def format_directional_signal(d: TickerDecision, *, today: date) -> str:
     else:
         wk = _next_friday(today)
         expiry_str = f"this Friday ({wk.isoformat()})"
+    mc = _MODE_CONFIG.get(mode, _MODE_CONFIG["selective"])
+    pt = mc["profit_target"]
+    sl = mc["stop_loss"]
     return (
-        f"{icon} **{d.ticker} signal — {action_word}**\n"
+        f"{icon} **{d.ticker} signal — {action_word}** [{mode.upper()}]\n"
         f"\n"
         f"**{action_word} on {d.ticker}** · strike **${d.strike}** · "
         f"expiry **{expiry_str}**\n"
@@ -179,8 +209,8 @@ def format_directional_signal(d: TickerDecision, *, today: date) -> str:
         f"Conviction: {d.conviction}\n"
         f"Why: {d.reasoning}\n"
         f"\n"
-        f"Suggested exits: take profit at **+50% premium**, "
-        f"stop loss at **-30% premium**, close before market close if 0DTE."
+        f"Suggested exits: take profit at **{pt} premium**, "
+        f"stop loss at **{sl} premium**, close before market close if 0DTE."
     )
 
 
@@ -191,6 +221,7 @@ async def run_directional_scan(
     session_factory: Callable[[], Session] | None = None,
     bars_fetcher=alpaca_client.get_recent_bars,
     news_fetcher=alpaca_client.get_recent_news,
+    mode: str | None = None,
 ) -> tuple[list[TickerDecision], list[str]]:
     """Scan the watchlist, return (decisions, signal_messages).
 
@@ -199,6 +230,9 @@ async def run_directional_scan(
     """
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
+    if mode is None:
+        mode = get_settings().directional_mode
+    mc = _MODE_CONFIG.get(mode, _MODE_CONFIG["selective"])
     if watchlist is None:
         watchlist = load_tickers()
     tickers = list(watchlist)
@@ -232,7 +266,11 @@ async def run_directional_scan(
 
     prompt = PROMPT_TEMPLATE.format(
         now_iso=now.strftime("%Y-%m-%d %H:%M UTC"),
+        mode_upper=mode.upper(),
         n=len(tickers),
+        selectivity=mc["selectivity"],
+        strike=mc["strike"],
+        exit_hint=mc["exit_hint"],
         ticker_blocks="\n\n".join(ticker_blocks),
     )
 
@@ -242,7 +280,10 @@ async def run_directional_scan(
         session_factory=factory,
     )
     decisions = _parse_decisions(response.text, tickers)
-    actionable = [d for d in decisions if d.action != "HOLD"]
+    if mode == "aggressive":
+        actionable = [d for d in decisions if d.action != "HOLD" and d.conviction == "HIGH"]
+    else:
+        actionable = [d for d in decisions if d.action != "HOLD"]
 
     # Persist one Signal row per actionable decision.
     today = now.date()
@@ -273,7 +314,7 @@ async def run_directional_scan(
                 )
                 session.add(row)
             session.commit()
-        messages = [format_directional_signal(d, today=today) for d in actionable]
+        messages = [format_directional_signal(d, today=today, mode=mode) for d in actionable]
 
     log.info(
         "directional_scan_complete",
