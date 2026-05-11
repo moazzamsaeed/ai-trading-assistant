@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     max_concurrent_positions: int = Field(default=5, gt=0)
     max_options_contracts_per_trade: int = Field(default=5, gt=0)
 
+    monthly_llm_budget_usd: Decimal = Field(default=Decimal("100"), gt=0)
+
     alpaca_api_key: SecretStr = SecretStr("")
     alpaca_api_secret: SecretStr = SecretStr("")
     alpaca_base_url: str = "https://paper-api.alpaca.markets"

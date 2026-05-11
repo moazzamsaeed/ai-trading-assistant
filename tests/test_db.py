@@ -56,7 +56,7 @@ def test_insert_agent_run_with_cost(session):
     run = AgentRun(
         task_type="pre_market_research",
         provider="google",
-        model="gemini-3.1-pro",
+        model="gemini-3.1-pro-preview",
         input_tokens=1200,
         output_tokens=400,
         cost_usd=Decimal("0.012345"),
