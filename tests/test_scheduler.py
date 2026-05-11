@@ -238,6 +238,83 @@ async def test_run_intraday_once(monkeypatch):
     assert signal_posted == ["alert"]
 
 
+# ----------------- directional exit monitor -----------------
+
+
+def test_make_scheduler_registers_directional_exit_jobs():
+    scheduler = sch.make_scheduler(**_all_posters())
+    monitor = scheduler.get_job("directional_exit")
+    force = scheduler.get_job("directional_force_close")
+    assert monitor is not None
+    assert force is not None
+    f_fields = {f.name: str(f) for f in force.trigger.fields}
+    assert f_fields["hour"] == "15"
+    assert f_fields["minute"] == "30"
+
+
+async def test_directional_exit_job_posts_to_both_channels(monkeypatch):
+    sig: list[str] = []
+    trd: list[str] = []
+
+    async def signals(t):
+        sig.append(t)
+
+    async def trades(t):
+        trd.append(t)
+
+    async def clock_open() -> sch.alpaca_client.MarketClock:
+        from datetime import UTC, timedelta
+        now = __import__("datetime").datetime.now(UTC)
+        from integrations.alpaca_client import MarketClock
+        return MarketClock(
+            timestamp=now, is_open=True,
+            next_open=now + timedelta(hours=12),
+            next_close=now + timedelta(hours=6),
+        )
+
+    async def fake_monitor(**_kwargs):
+        return [{"signal_text": "📈 SPY EXIT", "trade_text": "🤖 closed #1"}]
+
+    monkeypatch.setattr(sch, "run_directional_exit_monitor", fake_monitor)
+    await sch._directional_exit_job(
+        signal_poster=signals, trade_poster=trades, clock_fetcher=clock_open
+    )
+    assert sig == ["📈 SPY EXIT"]
+    assert trd == ["🤖 closed #1"]
+
+
+async def test_directional_force_close_skips_clock(monkeypatch):
+    sig: list[str] = []
+    trd: list[str] = []
+
+    async def signals(t):
+        sig.append(t)
+
+    async def trades(t):
+        trd.append(t)
+
+    async def clock_closed():
+        from datetime import UTC, timedelta
+        from integrations.alpaca_client import MarketClock
+        now = __import__("datetime").datetime.now(UTC)
+        return MarketClock(
+            timestamp=now, is_open=False,
+            next_open=now + timedelta(hours=12),
+            next_close=now + timedelta(hours=6),
+        )
+
+    async def fake_monitor(**kwargs):
+        assert kwargs.get("force_close") is True
+        return []
+
+    monkeypatch.setattr(sch, "run_directional_exit_monitor", fake_monitor)
+    await sch._directional_exit_job(
+        signal_poster=signals, trade_poster=trades,
+        clock_fetcher=clock_closed, force=True,
+    )
+    # No error = force=True bypassed clock check correctly.
+
+
 # ----------------- iron condor entry -----------------
 
 

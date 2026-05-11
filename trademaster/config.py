@@ -27,6 +27,7 @@ class Settings(BaseSettings):
 
     enable_iron_condor: bool = False
     directional_mode: Literal["aggressive", "selective"] = "selective"
+    directional_max_concurrent: int = Field(default=3, gt=0)
 
     # Working capital ceiling. The risk manager treats the effective
     # cash as min(account.cash, trading_capital_usd). Paper account has

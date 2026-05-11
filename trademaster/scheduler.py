@@ -19,6 +19,8 @@ from collections.abc import Awaitable, Callable
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from agents.directional.executor import execute_directional_signal
+from agents.directional.exit_monitor import run_directional_exit_monitor
 from agents.directional.intraday import run_directional_scan
 from agents.intraday.scan import run_intraday_scan
 from agents.options.exit_monitor import run_exit_monitor
@@ -96,16 +98,21 @@ async def _intraday_scan_job(
         await signal_poster(alert_text)
 
 
-# ----------------- directional intraday signals -----------------
+# ----------------- directional intraday signals + execution -----------------
 
 
 async def _directional_scan_job(
     *,
     signal_poster: Poster,
+    trade_poster: Poster,
     log_poster: Poster = _noop_poster,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
 ) -> None:
-    """Sweep watchlist every 10 min, post actionable BUY signals to #signals."""
+    """Sweep watchlist every 10 min.
+
+    - Posts BUY signals to #signals for manual trading reference.
+    - Auto-executes each signal via Alpaca; fills posted to #trades.
+    """
     if get_state().is_paused():
         log.info("directional_scan_skipped_paused")
         return
@@ -121,7 +128,7 @@ async def _directional_scan_job(
         return
 
     try:
-        _decisions, messages = await run_directional_scan()
+        decisions, messages = await run_directional_scan()
     except Exception as e:  # noqa: BLE001
         log.error(
             "directional_scan_failed",
@@ -133,8 +140,87 @@ async def _directional_scan_job(
         )
         return
 
+    # Post signals first so the user sees the alert before the fill notification.
     for msg in messages:
         await signal_poster(msg)
+
+    # Auto-execute every actionable decision.
+    mode = get_settings().directional_mode
+    to_execute = [
+        d for d in decisions
+        if d.action != "HOLD"
+        and (mode != "aggressive" or d.conviction == "HIGH")
+    ]
+    for decision in to_execute:
+        try:
+            result = await execute_directional_signal(decision, mode=mode)
+            if result.executed and result.trade_text:
+                await trade_poster(result.trade_text)
+            elif not result.executed:
+                log.info(
+                    "directional_execute_skipped",
+                    ticker=decision.ticker,
+                    reason=result.reason,
+                )
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "directional_execute_error",
+                ticker=decision.ticker,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            await log_poster(
+                f"⚠️ Directional execute failed for {decision.ticker}: "
+                f"`{type(e).__name__}: {e}`"
+            )
+
+
+# ----------------- directional exit monitor -----------------
+
+
+async def _directional_exit_job(
+    *,
+    signal_poster: Poster,
+    trade_poster: Poster,
+    log_poster: Poster = _noop_poster,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+    force: bool = False,
+) -> None:
+    """Check open directional positions; post exits to #signals and #trades."""
+    if get_state().is_paused():
+        log.info("directional_exit_skipped_paused")
+        return
+
+    if not force:
+        try:
+            clock = await clock_fetcher()
+        except Exception as e:  # noqa: BLE001
+            log.warning("directional_exit_clock_failed", error=str(e))
+            return
+        if not clock.is_open:
+            log.info("directional_exit_skipped_closed", next_open=str(clock.next_open))
+            return
+
+    try:
+        results = await run_directional_exit_monitor(force_close=force or None)
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "directional_exit_monitor_failed",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        await log_poster(
+            f"⚠️ Directional exit monitor failed: `{type(e).__name__}: {e}`"
+        )
+        return
+
+    for r in results:
+        signal_text = r.get("signal_text")
+        trade_text = r.get("trade_text")
+        if signal_text:
+            await signal_poster(signal_text)
+        if trade_text:
+            await trade_poster(trade_text)
 
 
 # ----------------- iron-condor strategist -----------------
@@ -286,8 +372,51 @@ def make_scheduler(
             minute="0,10,20,30,40,50",
             timezone=PREMARKET_TZ,
         ),
-        kwargs={"signal_poster": signal_poster, "log_poster": log_post},
+        kwargs={
+            "signal_poster": signal_poster,
+            "trade_poster": trade_poster,
+            "log_poster": log_post,
+        },
         id="directional_scan",
+        replace_existing=True,
+        misfire_grace_time=120,
+    )
+
+    # Directional exit monitor — every 5 min during RTH (10:00–15:25 ET).
+    scheduler.add_job(
+        _directional_exit_job,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour="10-15",
+            minute="0,5,10,15,20,25,30,35,40,45",
+            timezone=PREMARKET_TZ,
+        ),
+        kwargs={
+            "signal_poster": signal_poster,
+            "trade_poster": trade_poster,
+            "log_poster": log_post,
+        },
+        id="directional_exit",
+        replace_existing=True,
+        misfire_grace_time=120,
+    )
+
+    # Force-close all directional positions at 15:30 ET — 30 min before bell.
+    scheduler.add_job(
+        _directional_exit_job,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour=15,
+            minute=30,
+            timezone=PREMARKET_TZ,
+        ),
+        kwargs={
+            "signal_poster": signal_poster,
+            "trade_poster": trade_poster,
+            "log_poster": log_post,
+            "force": True,
+        },
+        id="directional_force_close",
         replace_existing=True,
         misfire_grace_time=120,
     )
@@ -383,14 +512,34 @@ async def run_intraday_once(
 
 async def run_directional_once(
     signal_poster: Poster,
+    trade_poster: Poster,
     *,
     log_poster: Poster | None = None,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
 ) -> None:
-    """Trigger the directional-intraday scan immediately."""
+    """Trigger the directional-intraday scan + execute immediately."""
     await _directional_scan_job(
         signal_poster=signal_poster,
+        trade_poster=trade_poster,
         log_poster=log_poster or _noop_poster,
+        clock_fetcher=clock_fetcher,
+    )
+
+
+async def run_directional_exit_once(
+    signal_poster: Poster,
+    trade_poster: Poster,
+    *,
+    log_poster: Poster | None = None,
+    force: bool = False,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+) -> None:
+    """Trigger the directional exit monitor immediately."""
+    await _directional_exit_job(
+        signal_poster=signal_poster,
+        trade_poster=trade_poster,
+        log_poster=log_poster or _noop_poster,
+        force=force,
         clock_fetcher=clock_fetcher,
     )
 

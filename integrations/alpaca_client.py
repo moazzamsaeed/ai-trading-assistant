@@ -257,6 +257,21 @@ _OCC_RE = re.compile(
 )
 
 
+def build_occ_symbol(
+    ticker: str,
+    expiry: date,
+    option_type: str,
+    strike: float,
+) -> str:
+    """Build an OCC option symbol, e.g. 'SPY260512C00500000'.
+
+    `option_type` is "call", "put", "BUY_CALL", or "BUY_PUT".
+    """
+    kind = "C" if "call" in option_type.lower() else "P"
+    strike_int = round(strike * 1000)
+    return f"{ticker}{expiry.strftime('%y%m%d')}{kind}{strike_int:08d}"
+
+
 def parse_occ_symbol(occ: str) -> tuple[str, date, str, Decimal]:
     """Parse an OCC option symbol like 'SPY240315P00495000'.
 
@@ -576,6 +591,89 @@ async def submit_iron_condor_close(
             status=result.status,
             qty=qty,
             limit_price=str(limit_price),
+        )
+        return result
+
+    return await asyncio.to_thread(_do)
+
+
+async def get_single_option_quote(occ_symbol: str) -> "OptionQuote | None":
+    """Fetch current bid/ask for one option contract by its OCC symbol.
+
+    Returns None when the symbol is not listed or has no live market.
+    """
+    try:
+        underlying, expiry, _opt_type, strike = parse_occ_symbol(occ_symbol)
+    except ValueError:
+        return None
+    chain = await get_options_chain(
+        underlying,
+        expiry=expiry,
+        strike_lo=strike - Decimal("0.5"),
+        strike_hi=strike + Decimal("0.5"),
+    )
+    for q in chain:
+        if q.occ_symbol == occ_symbol:
+            return q
+    return None
+
+
+async def submit_single_option_buy(
+    *,
+    qty: int,
+    occ_symbol: str,
+    limit_price: Decimal,
+) -> OrderResult:
+    """Limit buy-to-open a single-leg option at `limit_price` per share."""
+    order_req = LimitOrderRequest(
+        symbol=occ_symbol,
+        qty=qty,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        limit_price=float(limit_price),
+    )
+
+    def _do() -> OrderResult:
+        resp = _trading_client().submit_order(order_req)
+        result = _to_order_result(resp)
+        log.info(
+            "alpaca_single_option_buy_submitted",
+            occ=occ_symbol,
+            qty=qty,
+            limit=str(limit_price),
+            order_id=result.order_id,
+            status=result.status,
+        )
+        return result
+
+    return await asyncio.to_thread(_do)
+
+
+async def submit_single_option_sell(
+    *,
+    qty: int,
+    occ_symbol: str,
+    limit_price: Decimal,
+) -> OrderResult:
+    """Limit sell-to-close a single-leg option at `limit_price` per share."""
+    order_req = LimitOrderRequest(
+        symbol=occ_symbol,
+        qty=qty,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.DAY,
+        limit_price=float(limit_price),
+    )
+
+    def _do() -> OrderResult:
+        resp = _trading_client().submit_order(order_req)
+        result = _to_order_result(resp)
+        log.info(
+            "alpaca_single_option_sell_submitted",
+            occ=occ_symbol,
+            qty=qty,
+            limit=str(limit_price),
+            order_id=result.order_id,
+            status=result.status,
         )
         return result
 
