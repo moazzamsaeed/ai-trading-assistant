@@ -1,7 +1,7 @@
 """Settings loader.
 
 Loads from `.env` via pydantic-settings. The `account_type` field is locked
-to `"cash"` (D-001) — Hermes will refuse to start if anything else is set.
+to `"cash"` (D-001) — TradeMaster will refuse to start if anything else is set.
 """
 
 from __future__ import annotations
@@ -43,9 +43,9 @@ class Settings(BaseSettings):
 
     discord_bot_token: SecretStr = SecretStr("")
     discord_guild_id: str = ""
-    discord_channel_alerts: str = ""
-    discord_channel_research: str = ""
+    discord_channel_signals: str = ""
     discord_channel_trades: str = ""
+    discord_channel_research: str = ""
     discord_channel_logs: str = ""
     discord_channel_commands: str = ""
 
@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     def require_live_keys(self) -> None:
         """Fail fast if any provider key needed for runtime is missing.
 
-        Called by Hermes at startup, not by tests.
+        Called by the orchestrator at startup, not by tests.
         """
         missing = [
             name

@@ -146,23 +146,60 @@ def _parse_decision(text: str) -> tuple[str, float | None, str]:
     return decision, confidence, reasoning
 
 
-def _format_alert(plan: IronCondorPlan, signal: Signal, *, execution=None) -> str:
-    mode = get_settings().trading_mode.upper()
-    if execution is None:
-        status_line = "Status: candidate (no execution attempted)"
-    elif execution.executed:
-        status_line = f"✅ EXECUTED ({mode}) · {execution.reason} · trade #{execution.trade_id}"
-    else:
-        status_line = f"⚠️ NOT EXECUTED ({mode}) · {execution.reason}"
+def format_manual_signal(plan: IronCondorPlan, signal: Signal) -> str:
+    """Broker-ready entry instructions for #signals (manual trader).
+
+    Lists every leg with strike, expiry, call/put, side, and target price.
+    Includes net credit, max loss, and concrete exit thresholds in $/contract.
+    """
+    expiry_iso = plan.short_put.expiry.isoformat()
+    qty = plan.qty
+    # Exit thresholds in net-debit terms per contract.
+    pt_debit = (plan.credit_per_contract / Decimal("2")).quantize(Decimal("0.01"))
+    stop_debit = (plan.credit_per_contract * Decimal("3")).quantize(Decimal("0.01"))
     return (
-        f"📋 **SPY 0DTE iron-condor** ({plan.short_put.expiry})\n"
-        f"Short put: ${plan.short_put.strike} · Long put: ${plan.long_put.strike}\n"
-        f"Short call: ${plan.short_call.strike} · Long call: ${plan.long_call.strike}\n"
-        f"Credit: ${plan.credit_per_contract} · Max loss: ${plan.max_loss_per_contract} · "
-        f"qty: {plan.qty}\n"
-        f"Confidence: {signal.confidence}\n"
-        f"Reasoning: {signal.reasoning}\n"
-        f"{status_line}"
+        f"🎯 **SPY 0DTE Iron Condor — manual entry signal**\n"
+        f"Expiry: **{expiry_iso}** · qty per side: **{qty}**\n"
+        f"\n"
+        f"**Legs (open as a credit spread):**\n"
+        f"• SELL {qty} × SPY {expiry_iso} **${plan.short_put.strike} PUT**  "
+        f"@ mid ${plan.short_put.mid:.2f}\n"
+        f"• BUY  {qty} × SPY {expiry_iso} **${plan.long_put.strike} PUT**   "
+        f"@ mid ${plan.long_put.mid:.2f}\n"
+        f"• SELL {qty} × SPY {expiry_iso} **${plan.short_call.strike} CALL** "
+        f"@ mid ${plan.short_call.mid:.2f}\n"
+        f"• BUY  {qty} × SPY {expiry_iso} **${plan.long_call.strike} CALL**  "
+        f"@ mid ${plan.long_call.mid:.2f}\n"
+        f"\n"
+        f"**Target net credit:** ${plan.credit_per_contract}/contract "
+        f"(total ${plan.credit_received})\n"
+        f"**Max loss:** ${plan.max_loss_per_contract}/contract "
+        f"(total ${plan.max_loss})\n"
+        f"\n"
+        f"**Exit rules:**\n"
+        f"• Profit target: close at **≤ ${pt_debit} net debit** (50% of credit)\n"
+        f"• Stop loss: close at **≥ ${stop_debit} net debit** (loss = 2× credit)\n"
+        f"• Force close: **15:50 ET** regardless of P&L\n"
+        f"\n"
+        f"Strategist confidence: {signal.confidence} · Rationale: {signal.reasoning}"
+    )
+
+
+def format_trade_telemetry(plan: IronCondorPlan, signal: Signal, execution) -> str:
+    """Automated-execution telemetry for #trades (read-only)."""
+    mode = get_settings().trading_mode.upper()
+    if execution.executed:
+        status = f"✅ EXECUTED ({mode}) · {execution.reason} · trade #{execution.trade_id}"
+    else:
+        status = f"⚠️ NOT EXECUTED ({mode}) · {execution.reason}"
+    return (
+        f"🤖 **Iron-condor execution** ({plan.short_put.expiry})\n"
+        f"Strikes: SP ${plan.short_put.strike} / LP ${plan.long_put.strike} / "
+        f"SC ${plan.short_call.strike} / LC ${plan.long_call.strike} · qty {plan.qty}\n"
+        f"Target credit: ${plan.credit_per_contract}/contract · "
+        f"Max loss: ${plan.max_loss_per_contract}/contract\n"
+        f"{status}\n"
+        f"Strategist confidence: {signal.confidence}"
     )
 
 
@@ -180,12 +217,15 @@ async def run_iron_condor_strategist(
     chain_fetcher: Callable[..., object] = alpaca_client.get_options_chain,
     account_fetcher: Callable[[], object] | None = None,
     executor: Callable[..., object] = execute_iron_condor,
-) -> tuple[Signal, str | None]:
+) -> tuple[Signal, str | None, str | None]:
     """Run the full strategist pipeline.
 
-    Returns (signal, alert_text). `alert_text` is None when the strategist
-    decides HOLD or risk manager rejects — the scheduler skips posting in
-    those cases (we don't want HOLD alerts spamming #alerts).
+    Returns `(signal, signals_text, trade_text)`:
+      - `signals_text` is the broker-ready manual signal for #signals.
+        None when HOLD or risk-rejected (don't spam manual traders with
+        non-actionable noise).
+      - `trade_text` is the automated-execution telemetry for #trades.
+        None when HOLD or risk-rejected (no execution happened).
     """
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
@@ -212,11 +252,12 @@ async def run_iron_condor_strategist(
             wing_width=wing_width,
         )
     except IronCondorBuildError as e:
-        return await _persist_hold(
+        signal = await _persist_hold(
             factory,
             reasoning=f"plan construction failed: {e}",
             extra={"error": str(e), "spy_mid": str(spy_mid)},
-        ), None
+        )
+        return signal, None, None
 
     atm_iv = _atm_iv(chain, spy_mid)
 
@@ -247,9 +288,10 @@ async def run_iron_condor_strategist(
     }
 
     if decision == "HOLD":
-        return await _persist_hold(
+        signal = await _persist_hold(
             factory, reasoning=reasoning or "strategist declined", extra=extra_common
-        ), None
+        )
+        return signal, None, None
 
     # 5. OPEN — risk-manager gate. Failure becomes a HOLD record.
     order = plan.to_trade_order()
@@ -279,13 +321,17 @@ async def run_iron_condor_strategist(
                 row.rejection_reason = str(e)
                 s.commit()
         log.info("options_strategist_rejected_by_risk", reason=str(e))
-        return open_signal, None
+        return open_signal, None, None
 
     with factory() as s:
         row = s.get(SignalRow, persisted_id)
         if row is not None:
             row.accepted = True
             s.commit()
+
+    # Always emit the manual signal once risk approves — the user can act on
+    # it regardless of the bot's auto-execution outcome.
+    signals_text = format_manual_signal(plan, open_signal)
 
     # Paper mode auto-executes. Live mode short-circuits — Phase 2.3c will
     # post for approval instead.
@@ -296,9 +342,8 @@ async def run_iron_condor_strategist(
         reason=execution.reason,
         trade_id=execution.trade_id,
     )
-
-    alert = _format_alert(plan, open_signal, execution=execution)
-    return open_signal, alert
+    trade_text = format_trade_telemetry(plan, open_signal, execution)
+    return open_signal, signals_text, trade_text
 
 
 # ----------------- persistence helpers -----------------

@@ -1,13 +1,19 @@
 """TradeMaster orchestrator entry point.
 
-Wires the Discord bot, scheduler (pre-market 8am ET + intraday scan every
-15 min RTH Mon-Fri), and the cash-only account check on startup. Runs
-until SIGTERM/SIGINT.
+Wires the Discord bot and scheduler, and enforces the cash-only account
+check at startup. Runs until SIGTERM/SIGINT.
 
 CLI:
   python -m trademaster.orchestrator             # full daemon
   python -m trademaster.orchestrator --once      # one pre-market briefing
   python -m trademaster.orchestrator --scan-once # one intraday scan
+  python -m trademaster.orchestrator --ic-once   # one iron-condor strategist run
+
+Channel routing (see RUNBOOK):
+  #research → daily briefing
+  #signals  → broker-ready manual alerts
+  #trades   → automated bot trading activity
+  #logs     → scheduler errors / diagnostics
 """
 
 from __future__ import annotations
@@ -40,7 +46,9 @@ async def _run() -> None:
     async with TradeMasterBot() as bot:
         scheduler = make_scheduler(
             research_poster=bot.post_research,
-            alert_poster=bot.post_alert,
+            signal_poster=bot.post_signal,
+            trade_poster=bot.post_trade,
+            log_poster=bot.post_log,
         )
         scheduler.start()
         log.info("trademaster_started", trading_mode=settings.trading_mode)
@@ -66,21 +74,23 @@ async def _run_premarket_once() -> None:
     configure_logging()
     get_settings().require_live_keys()
     async with TradeMasterBot() as bot:
-        await run_premarket_once(bot.post_research)
+        await run_premarket_once(bot.post_research, log_poster=bot.post_log)
 
 
 async def _run_scan_once() -> None:
     configure_logging()
     get_settings().require_live_keys()
     async with TradeMasterBot() as bot:
-        await run_intraday_once(bot.post_alert)
+        await run_intraday_once(bot.post_signal, log_poster=bot.post_log)
 
 
 async def _run_iron_condor_once() -> None:
     configure_logging()
     get_settings().require_live_keys()
     async with TradeMasterBot() as bot:
-        await run_iron_condor_once(bot.post_alert)
+        await run_iron_condor_once(
+            bot.post_signal, bot.post_trade, log_poster=bot.post_log
+        )
 
 
 def main() -> None:

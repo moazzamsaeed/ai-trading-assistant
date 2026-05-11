@@ -2,10 +2,12 @@
 
 ## Current Phase
 
-**Phase 2.2 — iron-condor strategist live (alert-only).** The strategist
-agent pulls SPY + chain at 9:45 ET Mon-Fri, asks DeepSeek V4-Pro to confirm,
-runs the candidate through the risk manager, and posts an approved plan
-to `#alerts`. Order submission is Phase 2.3.
+**Phase 2.3 (a + b) complete — dual-channel output.** Iron-condor strategist
+runs at 9:45 ET, emits a broker-ready **manual signal** to `#signals` AND
+auto-executes in paper mode with telemetry posted to `#trades`. Exit monitor
+sweeps every 5 min with the same dual output (manual exit instructions +
+automated close telemetry), and force-closes at 15:50 ET. Scheduler errors
+route to `#logs`.
 
 ## Build Phases
 
@@ -44,9 +46,20 @@ python -m trademaster.orchestrator --ic-once     # one iron-condor strategist ru
 ```
 
 Requires `.env` populated with `ALPACA_*`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`,
-`DEEPSEEK_API_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_RESEARCH`,
-`DISCORD_CHANNEL_ALERTS`, and `DISCORD_GUILD_ID`. The daemon refuses to start
-if the Alpaca account isn't a cash account (D-001).
+`DEEPSEEK_API_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, and channel IDs:
+`DISCORD_CHANNEL_RESEARCH`, `DISCORD_CHANNEL_SIGNALS`, `DISCORD_CHANNEL_TRADES`,
+`DISCORD_CHANNEL_LOGS`. The daemon refuses to start if the Alpaca account isn't
+a cash account (D-001).
+
+## Channel Routing
+
+| Channel | Content |
+|---|---|
+| `#research` | Daily pre-market briefing (8 AM ET) |
+| `#signals` | Broker-ready manual-trading alerts — specific strikes, expiry, calls/puts, side, entry price, exit thresholds. Acts as the comparison baseline against the bot's paper performance. |
+| `#trades` | Automated bot trading activity — orders submitted, fills, exits, P&L per trade |
+| `#logs` | Scheduler errors / diagnostics |
+| `#commands` | Slash command responses (auto) |
 
 ## Discord Commands (owner-only)
 

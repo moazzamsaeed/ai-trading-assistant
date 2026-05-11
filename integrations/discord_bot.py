@@ -1,12 +1,15 @@
 """TradeMaster Discord bot.
 
-Replaces the Phase 1.3 `DiscordPoster` Client with a `commands.Bot` that
-adds slash commands. Posting helpers preserved so the scheduler keeps
-its existing `poster.post_research(text)` interface.
+Routes four kinds of output to four channels:
 
-Authorization: every slash command is bot-owner-only. Other guild members
-cannot execute them. The owner ID is auto-detected from the bot's
-application info on first ready event.
+- post_research(text) → #research — daily briefing
+- post_signal(text)   → #signals  — broker-ready alerts for MANUAL trading
+                                    (strike, expiry, call/put, side, prices)
+- post_trade(text)    → #trades   — automated bot activity (orders, fills, exits)
+- post_log(text)      → #logs     — scheduler errors, system diagnostics
+
+Every slash command is bot-owner-only via app_commands.check. Owner ID is
+auto-detected from application info on the first ready event.
 """
 
 from __future__ import annotations
@@ -67,13 +70,15 @@ class TradeMasterBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         settings = get_settings()
         self._token = settings.discord_bot_token.get_secret_value()
-        self._research_channel_id = (
-            int(settings.discord_channel_research) if settings.discord_channel_research else 0
-        )
-        self._alerts_channel_id = (
-            int(settings.discord_channel_alerts) if settings.discord_channel_alerts else 0
-        )
-        self._guild_id = int(settings.discord_guild_id) if settings.discord_guild_id else 0
+
+        def _chan(value: str) -> int:
+            return int(value) if value else 0
+
+        self._research_channel_id = _chan(settings.discord_channel_research)
+        self._signals_channel_id = _chan(settings.discord_channel_signals)
+        self._trades_channel_id = _chan(settings.discord_channel_trades)
+        self._logs_channel_id = _chan(settings.discord_channel_logs)
+        self._guild_id = _chan(settings.discord_guild_id)
         self._ready = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._register_commands()
@@ -119,8 +124,17 @@ class TradeMasterBot(commands.Bot):
     async def post_research(self, text: str) -> None:
         await self.post(self._research_channel_id, text)
 
-    async def post_alert(self, text: str) -> None:
-        await self.post(self._alerts_channel_id, text)
+    async def post_signal(self, text: str) -> None:
+        """Broker-ready manual-trading signal."""
+        await self.post(self._signals_channel_id, text)
+
+    async def post_trade(self, text: str) -> None:
+        """Automated trade activity (orders, fills, exits)."""
+        await self.post(self._trades_channel_id, text)
+
+    async def post_log(self, text: str) -> None:
+        """System-level error or diagnostic."""
+        await self.post(self._logs_channel_id, text)
 
     # ---------- slash commands ----------
 

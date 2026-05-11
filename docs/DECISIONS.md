@@ -135,3 +135,35 @@ This file captures the *why* behind architectural and tooling choices, so a V2 b
 **Implication:** Supersedes D-011's chosen name. All `traderouter.*` imports become `trademaster.*`. SQLite DB now at `data/trademaster.db`. D-002 / D-009 / D-010 / D-011 rewritten in-line to use the new name (mechanical sed) — historical record of the prior names lives in commit `e18de0d` (hermes → traderouter) and this commit (traderouter → trademaster).
 
 **When to revisit:** Not expected.
+
+---
+
+## D-013 — Dual-channel output: `#signals` for manual, `#trades` for automated
+
+**Decision:** Every strategy emits two parallel outputs:
+- `#signals` — broker-ready manual-trading instructions for the user
+  (specific strikes, expiry date, call/put, side, target prices, exit
+  rules in $/contract). The user trades these themselves through their
+  own broker if they choose to.
+- `#trades` — automated bot execution telemetry against the Alpaca
+  paper (or live) account. What the bot did, what it filled at, P&L.
+
+Same strategy logic produces both. Errors route to a separate `#logs`
+channel — never to `#signals` or `#trades` where they would create
+alert fatigue.
+
+**Why:** The user trades manually as well as letting the bot trade.
+Both following the same strategy lets us compare manual-vs-automated
+P&L at the end of the paper-trade run. If they diverge, we know whether
+it's a strategy issue (both lose) or an execution issue (only one loses).
+
+**Implication:** The renamed channel set in `.env.example` is:
+`DISCORD_CHANNEL_SIGNALS`, `DISCORD_CHANNEL_TRADES`,
+`DISCORD_CHANNEL_RESEARCH`, `DISCORD_CHANNEL_LOGS`, `DISCORD_CHANNEL_COMMANDS`.
+The legacy `DISCORD_CHANNEL_ALERTS` is removed. Strategist and exit-monitor
+return shapes changed to `(signal, signals_text, trade_text)` so the
+scheduler can route each to the right channel.
+
+**When to revisit:** If we add a second messaging surface (Telegram,
+email) later, the named-poster pattern in scheduler should accept any
+implementation — no architectural change needed.

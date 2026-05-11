@@ -207,13 +207,14 @@ async def test_strategist_hold_persists_no_alert(monkeypatch, session_factory):
 
     monkeypatch.setattr(strategist, "route_to_model", route)
 
-    signal, alert = await strategist.run_iron_condor_strategist(
+    signal, signals_text, trade_text = await strategist.run_iron_condor_strategist(
         session_factory=session_factory,
         stock_fetcher=_stock,
         chain_fetcher=_chain,
     )
     assert signal.action.value == "hold"
-    assert alert is None
+    assert signals_text is None
+    assert trade_text is None
 
     with session_factory() as s:
         row = s.query(SignalRow).one()
@@ -235,13 +236,14 @@ async def test_strategist_records_hold_on_build_error(monkeypatch, session_facto
 
     monkeypatch.setattr(strategist, "route_to_model", route)
 
-    signal, alert = await strategist.run_iron_condor_strategist(
+    signal, signals_text, trade_text = await strategist.run_iron_condor_strategist(
         session_factory=session_factory,
         stock_fetcher=_stock,
         chain_fetcher=empty_chain,
     )
     assert signal.action.value == "hold"
-    assert alert is None
+    assert signals_text is None
+    assert trade_text is None
     with session_factory() as s:
         row = s.query(SignalRow).one()
         assert "plan construction failed" in row.reasoning.lower()
@@ -269,7 +271,7 @@ async def test_strategist_open_approved_emits_alert(monkeypatch, session_factory
     monkeypatch.setattr(strategist, "route_to_model", route)
     fetch_account = await _account_fetcher(_account("10000"))
 
-    signal, alert = await strategist.run_iron_condor_strategist(
+    signal, signals_text, trade_text = await strategist.run_iron_condor_strategist(
         session_factory=session_factory,
         stock_fetcher=_stock,
         chain_fetcher=_chain,
@@ -277,12 +279,21 @@ async def test_strategist_open_approved_emits_alert(monkeypatch, session_factory
         executor=fake_executor,
     )
     assert signal.action.value == "open"
-    assert alert is not None
-    assert "iron-condor" in alert.lower()
-    assert "$495" in alert  # short put strike
-    assert "$505" in alert  # short call strike
-    assert "executed" in alert.lower()
-    assert "#42" in alert  # trade id
+
+    # Manual signal in #signals: broker-ready strikes, side, expiry, exit rules
+    assert signals_text is not None
+    assert "manual entry signal" in signals_text.lower()
+    assert "$495 PUT" in signals_text  # short put leg
+    assert "$510 CALL" in signals_text  # long call leg
+    assert "SELL" in signals_text and "BUY" in signals_text
+    assert "Profit target" in signals_text
+    assert "Stop loss" in signals_text
+    assert "15:50 ET" in signals_text
+
+    # Trade telemetry in #trades: execution status
+    assert trade_text is not None
+    assert "executed" in trade_text.lower()
+    assert "#42" in trade_text
 
     with session_factory() as s:
         rows = s.query(SignalRow).all()
@@ -312,16 +323,20 @@ async def test_strategist_open_executor_failure_still_emits_alert(
     monkeypatch.setattr(strategist, "route_to_model", route)
     fetch_account = await _account_fetcher(_account("10000"))
 
-    _signal, alert = await strategist.run_iron_condor_strategist(
+    _signal, signals_text, trade_text = await strategist.run_iron_condor_strategist(
         session_factory=session_factory,
         stock_fetcher=_stock,
         chain_fetcher=_chain,
         account_fetcher=fetch_account,
         executor=fake_executor,
     )
-    assert alert is not None
-    assert "not executed" in alert.lower()
-    assert "rejected" in alert.lower()
+    # User should still see the manual signal — they may want to trade it themselves.
+    assert signals_text is not None
+    assert "manual entry signal" in signals_text.lower()
+    # Trade telemetry must show the failure.
+    assert trade_text is not None
+    assert "not executed" in trade_text.lower()
+    assert "rejected" in trade_text.lower()
 
 
 # ----------------- pipeline: OPEN rejected by risk -----------------
@@ -337,14 +352,16 @@ async def test_strategist_open_rejected_by_risk_no_alert(monkeypatch, session_fa
     # Cash insufficient — risk manager will reject (max loss > cash).
     fetch_account = await _account_fetcher(_account("10"))
 
-    signal, alert = await strategist.run_iron_condor_strategist(
+    signal, signals_text, trade_text = await strategist.run_iron_condor_strategist(
         session_factory=session_factory,
         stock_fetcher=_stock,
         chain_fetcher=_chain,
         account_fetcher=fetch_account,
     )
     assert signal.action.value == "open"  # the agent's decision
-    assert alert is None  # but no alert because risk rejected
+    # Risk rejection blocks BOTH outputs — don't post a signal we can't back.
+    assert signals_text is None
+    assert trade_text is None
 
     with session_factory() as s:
         row = s.query(SignalRow).one()

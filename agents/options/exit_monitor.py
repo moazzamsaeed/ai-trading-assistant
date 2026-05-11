@@ -97,6 +97,59 @@ def _decide_exit(
     return False, ""
 
 
+def _format_exit_signal(trade: Trade, exit_debit: Decimal, reason: str) -> str:
+    """Broker-ready exit instructions for #signals."""
+    extra = trade.extra or {}
+    expiry = extra.get("expiry", "today")
+    qty = trade.qty
+    legs = {
+        "short_put": extra.get("short_put", "?"),
+        "long_put": extra.get("long_put", "?"),
+        "short_call": extra.get("short_call", "?"),
+        "long_call": extra.get("long_call", "?"),
+    }
+
+    def _strike(occ: str) -> str:
+        # Last 8 chars / 1000 = strike. e.g. 00495000 → 495
+        if len(occ) < 8 or not occ[-8:].isdigit():
+            return "?"
+        return str(Decimal(occ[-8:]) / Decimal("1000"))
+
+    credit = trade.entry_price
+    realized_per_contract = (Decimal(str(credit)) - exit_debit).quantize(Decimal("0.01"))
+    return (
+        f"⏰ **SPY Iron Condor EXIT signal** — trade #{trade.id}\n"
+        f"Trigger: `{reason}` · current net debit ~${exit_debit}/contract\n"
+        f"\n"
+        f"**Close (reverse each leg):**\n"
+        f"• BUY  {qty} × SPY {expiry} **${_strike(legs['short_put'])} PUT**  "
+        f"(close short)\n"
+        f"• SELL {qty} × SPY {expiry} **${_strike(legs['long_put'])} PUT**   "
+        f"(close long)\n"
+        f"• BUY  {qty} × SPY {expiry} **${_strike(legs['short_call'])} CALL** "
+        f"(close short)\n"
+        f"• SELL {qty} × SPY {expiry} **${_strike(legs['long_call'])} CALL**  "
+        f"(close long)\n"
+        f"\n"
+        f"**Estimated P&L:** ${realized_per_contract}/contract "
+        f"(entry credit ${credit} − exit debit ${exit_debit})"
+    )
+
+
+def _format_exit_telemetry(trade: Trade, *, exit_debit: Decimal, reason: str) -> str:
+    """Automated-exit telemetry for #trades."""
+    credit = Decimal(str(trade.entry_price))
+    qty = Decimal(str(trade.qty))
+    pnl_per_contract = (credit - exit_debit).quantize(Decimal("0.01"))
+    pnl_total = (pnl_per_contract * qty).quantize(Decimal("0.01"))
+    return (
+        f"🤖 **Iron-condor closed** — trade #{trade.id}\n"
+        f"Reason: `{reason}` · entry credit: ${credit}/contract · "
+        f"exit debit: ${exit_debit}/contract\n"
+        f"Realized P&L: ${pnl_per_contract}/contract · qty {qty} · total ${pnl_total}"
+    )
+
+
 def _close_trade_row(
     session: Session,
     trade: Trade,
@@ -235,6 +288,10 @@ async def run_exit_monitor(
                         order=final,
                         reason=reason,
                     )
+            signal_text = _format_exit_signal(trade, exit_debit, reason)
+            trade_text = _format_exit_telemetry(
+                trade, exit_debit=actual_debit, reason=reason
+            )
             results.append(
                 {
                     "trade_id": trade.id,
@@ -242,6 +299,8 @@ async def run_exit_monitor(
                     "reason": reason,
                     "exit_debit": str(actual_debit),
                     "realized_pnl_per_contract": str(credit - actual_debit),
+                    "signal_text": signal_text,
+                    "trade_text": trade_text,
                 }
             )
         else:
@@ -250,6 +309,10 @@ async def run_exit_monitor(
                     "trade_id": trade.id,
                     "status": f"close_order_{final.status}",
                     "reason": reason,
+                    "trade_text": (
+                        f"⚠️ Iron-condor close failed — trade #{trade.id} · "
+                        f"reason `{reason}` · order status `{final.status}`"
+                    ),
                 }
             )
 
