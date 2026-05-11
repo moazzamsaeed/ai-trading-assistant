@@ -1,8 +1,13 @@
-"""Alpaca news-client wrapper tests with mocked SDK."""
+"""Alpaca client wrapper tests with mocked SDK.
+
+Covers the news endpoint and the trading-side wrappers (account,
+positions, cancel/close) used by the risk manager and the kill switch.
+"""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 
 from integrations import alpaca_client
@@ -77,3 +82,94 @@ async def test_get_recent_news_tolerates_missing_fields(monkeypatch):
     assert articles[0].headline == "No symbols article"
     assert articles[0].summary == ""
     assert articles[0].symbols == ()
+
+
+# ----------------- trading client -----------------
+
+
+async def test_get_account_parses_snapshot(monkeypatch):
+    raw_account = SimpleNamespace(
+        account_number="A123",
+        status="ACTIVE",
+        multiplier="1",
+        cash="12345.67",
+        buying_power="12345.67",
+        equity="20000.00",
+        portfolio_value="20000.00",
+        pattern_day_trader=False,
+        trading_blocked=False,
+        account_blocked=False,
+    )
+
+    class FakeTrading:
+        def __init__(self, **_):
+            pass
+
+        def get_account(self):
+            return raw_account
+
+    monkeypatch.setattr(alpaca_client, "_trading_client", lambda: FakeTrading())
+
+    acc = await alpaca_client.get_account()
+    assert acc.multiplier == "1"
+    assert acc.cash == Decimal("12345.67")
+    assert acc.status == "ACTIVE"
+    assert acc.account_blocked is False
+
+
+async def test_get_positions_parses_list(monkeypatch):
+    raw = [
+        SimpleNamespace(
+            symbol="SPY", qty="10", avg_entry_price="450",
+            market_value="4600", unrealized_pl="100",
+            current_price="460", side="long", asset_class="us_equity",
+        ),
+        SimpleNamespace(
+            symbol="QQQ", qty="-5", avg_entry_price="400",
+            market_value="-2050", unrealized_pl="-50",
+            current_price="410", side="short", asset_class="us_equity",
+        ),
+    ]
+
+    class FakeTrading:
+        def __init__(self, **_):
+            pass
+
+        def get_all_positions(self):
+            return raw
+
+    monkeypatch.setattr(alpaca_client, "_trading_client", lambda: FakeTrading())
+
+    positions = await alpaca_client.get_positions()
+    assert len(positions) == 2
+    assert positions[0].symbol == "SPY"
+    assert positions[0].qty == Decimal("10")
+    assert positions[1].qty == Decimal("-5")
+
+
+async def test_cancel_all_orders_returns_count(monkeypatch):
+    class FakeTrading:
+        def __init__(self, **_):
+            pass
+
+        def cancel_orders(self):
+            return ["resp1", "resp2", "resp3"]
+
+    monkeypatch.setattr(alpaca_client, "_trading_client", lambda: FakeTrading())
+    assert await alpaca_client.cancel_all_orders() == 3
+
+
+async def test_close_all_positions_returns_count(monkeypatch):
+    received_kwargs: dict = {}
+
+    class FakeTrading:
+        def __init__(self, **_):
+            pass
+
+        def close_all_positions(self, cancel_orders=None):
+            received_kwargs["cancel_orders"] = cancel_orders
+            return ["closed1", "closed2"]
+
+    monkeypatch.setattr(alpaca_client, "_trading_client", lambda: FakeTrading())
+    assert await alpaca_client.close_all_positions(True) == 2
+    assert received_kwargs["cancel_orders"] is True
