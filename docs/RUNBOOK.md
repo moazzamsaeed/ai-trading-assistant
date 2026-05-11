@@ -2,28 +2,40 @@
 
 ## Current Phase
 
-**Phase 0 — Foundation and scaffolding.** Repo created, structure laid out. No agents wired yet.
+**Phase 1.3 — Pre-market research vertical slice live.** Alpaca news client,
+Gemini-driven briefing agent, APScheduler with 8am ET cron, and a minimal
+Discord poster are wired end-to-end. Risk manager + slash commands land in
+Phase 1.4.
 
 ## Build Phases
 
 | Phase | Goal | Status |
 |---|---|---|
-| 0 | Repo + scaffold | In progress |
-| 1 | TradeMaster skeleton + Alpaca MCP + Discord bot + pre-market research agent | Not started |
+| 0 | Repo + scaffold | Done (`344441e`) |
+| 1.1 | Foundation: config, db, logging, models | Done (`540d197`) |
+| 1.2 | Router + provider clients + budget enforcement | Done (`874f8e7`) |
+| 1.3 | Pre-market research vertical slice (Alpaca news, Gemini, Discord, scheduler) | Done |
+| 1.4 | Risk manager + Discord slash commands + intraday scan loop | Not started |
 | 2 | SPY 0DTE iron condor (backtest → paper) | Not started |
 | 3 | Crypto trend-follow + equity alerts | Not started |
-| 4 | Dashboard + scheduler + 30-day paper run | Not started |
+| 4 | Dashboard + 30-day paper run + Nous Hermes Agent (D-010) | Not started |
 | 5 | Live deployment review | Not started |
 
 ## How to Start the System
 
-(Stub — will be filled in once Phase 1 lands.)
-
 ```bash
 cd ~/ai-trading-assistant
 source .venv/bin/activate
+
+# Full daemon (Discord bot + scheduler firing at 8am ET Mon-Fri)
 python -m trademaster.orchestrator
+
+# Smoke test: fire one pre-market briefing now and exit
+python -m trademaster.orchestrator --once
 ```
+
+Requires `.env` populated with `ALPACA_*`, `GOOGLE_API_KEY`, `DISCORD_BOT_TOKEN`,
+and `DISCORD_CHANNEL_RESEARCH` at minimum.
 
 ## How to Stop the System
 
