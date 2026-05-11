@@ -14,8 +14,10 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from agents.options.executor import execute_approved_pending
 from integrations import alpaca_client
 from integrations.alpaca_client import AccountSnapshot, PositionSnapshot
+from trademaster import pending_orders as po
 from trademaster import risk_manager
 from trademaster.config import get_settings
 from trademaster.db import Signal, make_session_factory
@@ -171,3 +173,81 @@ async def resume() -> str:
         return "▶ Trading was not paused."
     state.paused_until = None
     return "▶ Trading resumed."
+
+
+# ----------------- /pending /approve /reject -----------------
+
+
+def _format_pending_summary(row) -> str:
+    expires_at = row.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    minutes_left = int(
+        max(0, (expires_at - datetime.now(UTC)).total_seconds() // 60)
+    )
+    return (
+        f"**Pending #{row.id}** · `{row.strategy}` · expires in {minutes_left} min\n"
+        f"{row.summary}"
+    )
+
+
+async def pending(
+    *,
+    session_factory: Callable[[], Session] | None = None,
+) -> str:
+    """List all pending live-mode trade approvals."""
+    factory = session_factory or make_session_factory()
+    with factory() as s:
+        rows = po.list_pending(s)
+    if not rows:
+        return "No pending trades."
+    blocks = [_format_pending_summary(r) for r in rows]
+    return "**Pending approvals:**\n\n" + "\n\n---\n\n".join(blocks)
+
+
+async def reject(
+    pending_id: int,
+    *,
+    user_label: str,
+    session_factory: Callable[[], Session] | None = None,
+) -> str:
+    factory = session_factory or make_session_factory()
+    with factory() as s:
+        ok = po.mark_rejected(s, pending_id, decided_by=user_label)
+    if not ok:
+        return f"❌ Pending #{pending_id} not found or not in `pending` state."
+    log.info("pending_rejected", pending_id=pending_id, decided_by=user_label)
+    return f"🛑 Rejected pending #{pending_id}."
+
+
+async def approve(
+    pending_id: int,
+    *,
+    user_label: str,
+    session_factory: Callable[[], Session] | None = None,
+    executor=execute_approved_pending,
+) -> str:
+    """Approve a pending order: reconstruct the plan and submit to Alpaca.
+
+    Returns a human-readable status string ready to post to #trades.
+    """
+    factory = session_factory or make_session_factory()
+    try:
+        result = await executor(
+            pending_id, decided_by=user_label, session_factory=factory
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "pending_approve_failed",
+            pending_id=pending_id,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        return f"⚠️ /approve {pending_id} failed: `{type(e).__name__}: {e}`"
+
+    if result.executed:
+        return (
+            f"✅ Approved pending #{pending_id} · submitted · "
+            f"{result.reason} · trade #{result.trade_id}"
+        )
+    return f"⚠️ Approved pending #{pending_id} · NOT executed · {result.reason}"

@@ -189,6 +189,39 @@ class TradeMasterBot(commands.Bot):
         async def _resume(interaction: discord.Interaction):
             await interaction.response.send_message(await discord_commands.resume())
 
+        @tree.command(name="pending", description="List trade approvals waiting (live mode)")
+        @app_commands.check(owner_only)
+        async def _pending(interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True)
+            text = await discord_commands.pending()
+            await interaction.followup.send(text)
+
+        @tree.command(
+            name="approve",
+            description="Approve a pending live-mode trade and submit it to Alpaca",
+        )
+        @app_commands.describe(pending_id="Pending order id (see /pending)")
+        @app_commands.check(owner_only)
+        async def _approve(interaction: discord.Interaction, pending_id: int):
+            await interaction.response.defer(thinking=True)
+            text = await discord_commands.approve(
+                pending_id, user_label=str(interaction.user)
+            )
+            await interaction.followup.send(text)
+
+        @tree.command(
+            name="reject",
+            description="Reject a pending live-mode trade and discard it",
+        )
+        @app_commands.describe(pending_id="Pending order id (see /pending)")
+        @app_commands.check(owner_only)
+        async def _reject(interaction: discord.Interaction, pending_id: int):
+            await interaction.response.defer(thinking=True)
+            text = await discord_commands.reject(
+                pending_id, user_label=str(interaction.user)
+            )
+            await interaction.followup.send(text)
+
         @tree.error
         async def _on_app_command_error(
             interaction: discord.Interaction, error: app_commands.AppCommandError

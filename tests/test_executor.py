@@ -69,7 +69,8 @@ def _order(status: str = "filled", filled_avg: str = "0.80") -> OrderResult:
     )
 
 
-async def test_live_mode_does_not_execute(monkeypatch, session_factory):
+async def test_live_mode_creates_pending_not_executes(monkeypatch, session_factory):
+    """Live mode must not submit to Alpaca — it creates a pending_orders row."""
     class FakeSettings:
         trading_mode = "live"
 
@@ -87,10 +88,23 @@ async def test_live_mode_does_not_execute(monkeypatch, session_factory):
         session_factory=session_factory,
         submitter=boom_submit,
         waiter=lambda *a, **k: _order(),
+        summary="📋 manual signal text",
     )
     assert result.executed is False
-    assert "live mode" in result.reason.lower()
+    assert result.pending_id is not None
+    assert "approve" in result.reason.lower()
     assert submit_called is False
+
+    # Verify the pending row landed in the DB
+    from trademaster.db import PendingOrder
+    with session_factory() as s:
+        row = s.get(PendingOrder, result.pending_id)
+        assert row is not None
+        assert row.status == "pending"
+        assert row.strategy == "spy_0dte_ic"
+        assert row.summary == "📋 manual signal text"
+        assert row.plan["short_put"]["occ_symbol"].endswith("00495000")
+        assert row.plan["long_call"]["occ_symbol"].endswith("00510000")
 
 
 async def test_paper_mode_fills_and_persists_trade(monkeypatch, session_factory):

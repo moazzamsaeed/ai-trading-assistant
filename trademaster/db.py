@@ -1,12 +1,13 @@
 """SQLite persistence via SQLAlchemy 2.0.
 
-Four tables back the system:
-  - trades        executed positions with entry/exit/P&L
-  - signals       every agent signal (for audit + retro-analysis)
-  - agent_runs    every LLM call (model, tokens, cost, duration)
-  - risk_events   every rejection/halt with reason
+Five tables back the system:
+  - trades          executed positions with entry/exit/P&L
+  - signals         every agent signal (for audit + retro-analysis)
+  - agent_runs      every LLM call (model, tokens, cost, duration)
+  - risk_events     every rejection/halt with reason
+  - pending_orders  live-mode plans awaiting /approve or /reject (D-014)
 
-Single-writer SQLite — one Hermes process. No pooling concerns.
+Single-writer SQLite — one TradeMaster process. No pooling concerns.
 """
 
 from __future__ import annotations
@@ -100,6 +101,35 @@ class RiskEvent(Base):
 
     signal_id: Mapped[int | None] = mapped_column(ForeignKey("signals.id"))
     details: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
+class PendingOrder(Base):
+    """A risk-approved plan awaiting Discord `/approve` (live mode only).
+
+    Status flow:
+      pending  → approved (user ran /approve, order submitted)
+               → rejected (user ran /reject)
+               → expired  (no decision within 15 min — market data stale)
+    """
+
+    __tablename__ = "pending_orders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    signal_id: Mapped[int | None] = mapped_column(ForeignKey("signals.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    strategy: Mapped[str] = mapped_column(String(64))
+    plan: Mapped[dict[str, Any]] = mapped_column(JSON)
+    summary: Mapped[str] = mapped_column(Text)
+
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decided_by: Mapped[str | None] = mapped_column(String(100))
+
+    alpaca_order_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    trade_id: Mapped[int | None] = mapped_column(ForeignKey("trades.id"))
+    error: Mapped[str | None] = mapped_column(Text)
 
 
 def make_engine(url: str | None = None):

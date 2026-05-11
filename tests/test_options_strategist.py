@@ -259,7 +259,7 @@ async def test_strategist_open_approved_emits_alert(monkeypatch, session_factory
             '"reasoning": "IV elevated, tight spreads"}'
         )
 
-    async def fake_executor(plan, *, session_factory):
+    async def fake_executor(plan, **_kwargs):
         from agents.options.executor import ExecutionResult
         return ExecutionResult(
             executed=True,
@@ -311,7 +311,7 @@ async def test_strategist_open_executor_failure_still_emits_alert(
             '{"decision": "OPEN", "confidence": 0.7, "reasoning": "go"}'
         )
 
-    async def fake_executor(plan, *, session_factory):
+    async def fake_executor(plan, **_kwargs):
         from agents.options.executor import ExecutionResult
         return ExecutionResult(
             executed=False,

@@ -167,3 +167,34 @@ scheduler can route each to the right channel.
 **When to revisit:** If we add a second messaging surface (Telegram,
 email) later, the named-poster pattern in scheduler should accept any
 implementation — no architectural change needed.
+
+---
+
+## D-014 — Live-mode trades require Discord `/approve`; paper auto-executes
+
+**Decision:** When `TRADING_MODE=paper`, the executor submits to Alpaca
+automatically after risk-manager approval. When `TRADING_MODE=live`, the
+executor instead persists a `pending_orders` row and posts an "awaiting
+approval" message to `#trades`. The user runs `/approve <id>` in Discord
+to submit, `/reject <id>` to discard, or `/pending` to list waiting orders.
+
+**Why:** Live trading needs a human gate. The strategist + risk manager
+are good enough for paper validation; for real capital, requiring an
+explicit decision adds a layer that catches edge cases the rule-based
+checks miss (e.g., FOMC day, a news event the agent didn't see). The
+approval window is short — pending orders expire automatically after
+15 minutes so a stale market state can't be approved hours later.
+
+**Implication:**
+- New `pending_orders` table with status `pending|approved|rejected|expired`,
+  storing the plan as JSON so `/approve` can reconstruct the submission.
+- Executor has two entry points: `execute_iron_condor` (paper auto-submit
+  OR live pending-create) and `execute_approved_pending(id)` (post-approval
+  submit). Both share `_submit_and_persist` so paper-fill and live-fill
+  produce identical `trades` rows.
+- New owner-only slash commands: `/approve N`, `/reject N`, `/pending`.
+
+**When to revisit:** If the 30-day paper run gives us strong confidence
+in the strategist, we might revisit the auto-execute gate for live mode —
+but always keep `/kill` and `/pause`. The expiry window (15 min) may
+also need tuning based on real-world response latency.

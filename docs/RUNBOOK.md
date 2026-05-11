@@ -24,7 +24,7 @@ route to `#logs`.
 | 2.2 | Options strategist agent + entry-window scheduler (alert-only) | Done |
 | 2.3a | Multi-leg order submission + paper-mode auto-execute | Done |
 | 2.3b | Exit monitor (50% PT / 2x stop / 15:50 force-close) | Done |
-| 2.3c | Live-mode approval flow (Discord /approve, /reject) | Not started |
+| 2.3c | Live-mode approval flow (Discord /approve, /reject, /pending) | Done |
 | 2.4 | Backtest harness | Not started |
 | 3 | Crypto trend-follow + equity alerts | Not started |
 | 4 | Dashboard + 30-day paper run + Nous Hermes Agent (D-010) | Not started |
@@ -73,6 +73,14 @@ All slash commands require you to be the bot owner. Synced per-guild.
 | `/kill` | Emergency flatten — cancel orders + close positions, auto-pause 24h |
 | `/pause <minutes>` | Pause new trades for N minutes |
 | `/resume` | Clear pause |
+| `/pending` | List live-mode trades awaiting approval |
+| `/approve <id>` | Submit a pending live-mode trade to Alpaca |
+| `/reject <id>` | Discard a pending live-mode trade |
+
+In paper mode, the strategist auto-executes after risk-manager approval —
+no `/approve` needed. In live mode (`TRADING_MODE=live`), the strategist
+posts an "AWAITING APPROVAL" message to `#trades` and you confirm via
+`/approve N`. Pending orders auto-expire after 15 minutes (D-014).
 
 ## How to Stop the System
 

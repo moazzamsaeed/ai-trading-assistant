@@ -188,8 +188,15 @@ def format_manual_signal(plan: IronCondorPlan, signal: Signal) -> str:
 def format_trade_telemetry(plan: IronCondorPlan, signal: Signal, execution) -> str:
     """Automated-execution telemetry for #trades (read-only)."""
     mode = get_settings().trading_mode.upper()
+    pending_id = getattr(execution, "pending_id", None)
     if execution.executed:
         status = f"✅ EXECUTED ({mode}) · {execution.reason} · trade #{execution.trade_id}"
+    elif pending_id is not None:
+        status = (
+            f"⏳ AWAITING APPROVAL ({mode}) · pending #{pending_id}\n"
+            f"Run `/approve {pending_id}` to submit · `/reject {pending_id}` to skip · "
+            f"`/pending` to list all"
+        )
     else:
         status = f"⚠️ NOT EXECUTED ({mode}) · {execution.reason}"
     return (
@@ -333,14 +340,21 @@ async def run_iron_condor_strategist(
     # it regardless of the bot's auto-execution outcome.
     signals_text = format_manual_signal(plan, open_signal)
 
-    # Paper mode auto-executes. Live mode short-circuits — Phase 2.3c will
-    # post for approval instead.
-    execution = await executor(plan, session_factory=factory)
+    # Paper mode auto-executes; live mode creates a pending_orders row
+    # awaiting Discord /approve (D-014). Either way, the executor returns
+    # an ExecutionResult that we surface to #trades.
+    execution = await executor(
+        plan,
+        session_factory=factory,
+        summary=signals_text,
+        signal_id=persisted_id,
+    )
     log.info(
         "options_strategist_execution",
         executed=execution.executed,
         reason=execution.reason,
         trade_id=execution.trade_id,
+        pending_id=getattr(execution, "pending_id", None),
     )
     trade_text = format_trade_telemetry(plan, open_signal, execution)
     return open_signal, signals_text, trade_text
