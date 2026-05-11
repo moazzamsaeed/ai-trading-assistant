@@ -15,50 +15,33 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from math import erf, exp, log, sqrt
 
 from integrations.alpaca_client import OptionQuote
+from trademaster.options_math import (
+    DEFAULT_RISK_FREE,
+    bs_call_delta,
+    bs_call_price,
+    bs_put_delta,
+    bs_put_price,
+)
 
-# Reasonable default risk-free rate for 0DTE — doesn't materially affect strikes.
-DEFAULT_RISK_FREE = 0.045
 # Default IV proxy for SPY 0DTE. Real-world 16-delta short put strikes are
 # typically ~0.5-1.0% OTM at this IV.
 DEFAULT_IV = 0.18
 # Bid/ask spread: % of mid. Conservative for liquid SPY 0DTE.
 DEFAULT_SPREAD_PCT = 0.05
 
-
-def _norm_cdf(x: float) -> float:
-    """Standard normal CDF via math.erf — avoids the scipy dependency."""
-    return 0.5 * (1 + erf(x / sqrt(2)))
-
-
-def bs_call_price(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    if T <= 0:
-        return max(0.0, S - K)
-    if sigma <= 0:
-        return max(0.0, S - K * exp(-r * T))
-    d1 = (log(S / K) + (r + sigma * sigma / 2) * T) / (sigma * sqrt(T))
-    d2 = d1 - sigma * sqrt(T)
-    return S * _norm_cdf(d1) - K * exp(-r * T) * _norm_cdf(d2)
-
-
-def bs_put_price(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    # Put–call parity: P = C − S + K·e^(−rT)
-    return bs_call_price(S, K, T, r, sigma) - S + K * exp(-r * T)
-
-
-def bs_call_delta(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    if T <= 0:
-        return 1.0 if S > K else 0.0
-    if sigma <= 0:
-        return 1.0 if S > K else 0.0
-    d1 = (log(S / K) + (r + sigma * sigma / 2) * T) / (sigma * sqrt(T))
-    return _norm_cdf(d1)
-
-
-def bs_put_delta(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    return bs_call_delta(S, K, T, r, sigma) - 1.0
+# Re-exports for backward compatibility — tests/external code may import these.
+__all__ = [
+    "DEFAULT_IV",
+    "DEFAULT_RISK_FREE",
+    "DEFAULT_SPREAD_PCT",
+    "bs_call_delta",
+    "bs_call_price",
+    "bs_put_delta",
+    "bs_put_price",
+    "generate_chain",
+]
 
 
 def _occ_symbol(

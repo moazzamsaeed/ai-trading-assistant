@@ -35,6 +35,7 @@ from trademaster.db import Signal as SignalRow
 from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
 from trademaster.models import Signal, SignalAction
+from trademaster.options_math import delta_from_market_mid
 from trademaster.risk_manager import RiskRejectionError
 from trademaster.router import TaskType, route_to_model
 
@@ -97,6 +98,63 @@ def _atm_iv(chain: list[OptionQuote], spy_mid: Decimal) -> Decimal | None:
         return None
     total = sum((q.implied_volatility for q in candidates), Decimal("0"))
     return total / Decimal(len(candidates))
+
+
+def _enrich_chain_with_bs_greeks(
+    chain: list[OptionQuote],
+    *,
+    spot: Decimal,
+    now: datetime,
+) -> list[OptionQuote]:
+    """Fill in missing IV + delta from each option's market mid via BS.
+
+    Alpaca's default (and indicative) options feed returns prices but no
+    greeks. We solve IV from the market mid for every leg, then derive
+    delta. Strikes whose mid is at the $0.01 minimum tick (no real
+    market) get skipped — their greeks stay None and the strategy code
+    treats them as untradeable.
+    """
+    spot_f = float(spot)
+    enriched: list[OptionQuote] = []
+    for q in chain:
+        if q.delta is not None and q.implied_volatility is not None:
+            enriched.append(q)
+            continue
+        # T in years from now until end-of-day on expiry (assume 4pm ET = 20:00 UTC)
+        expiry_close = datetime(
+            q.expiry.year, q.expiry.month, q.expiry.day, 20, 0, tzinfo=UTC
+        )
+        t_seconds = max((expiry_close - now).total_seconds(), 0.0)
+        t_years = t_seconds / (365 * 24 * 3600)
+        result = delta_from_market_mid(
+            market_mid=float(q.mid),
+            S=spot_f,
+            K=float(q.strike),
+            T=t_years,
+            option_type=q.option_type,
+        )
+        if result is None:
+            enriched.append(q)
+            continue
+        delta_f, iv_f = result
+        enriched.append(
+            OptionQuote(
+                occ_symbol=q.occ_symbol,
+                underlying=q.underlying,
+                strike=q.strike,
+                expiry=q.expiry,
+                option_type=q.option_type,
+                bid=q.bid,
+                ask=q.ask,
+                mid=q.mid,
+                delta=Decimal(f"{delta_f:.4f}"),
+                gamma=q.gamma,
+                theta=q.theta,
+                vega=q.vega,
+                implied_volatility=Decimal(f"{iv_f:.4f}"),
+            )
+        )
+    return enriched
 
 
 def _format_plan_for_prompt(
@@ -249,6 +307,10 @@ async def run_iron_condor_strategist(
         strike_lo=spy_mid - CHAIN_HALF_WIDTH,
         strike_hi=spy_mid + CHAIN_HALF_WIDTH,
     )
+
+    # 2b. Alpaca's indicative options feed doesn't include greeks/IV. Fill them
+    # in from BS inversion on each leg's market mid — see trademaster.options_math.
+    chain = _enrich_chain_with_bs_greeks(chain, spot=spy_mid, now=now)
 
     # 3. Build the plan. If construction fails, persist a HOLD with the error.
     try:

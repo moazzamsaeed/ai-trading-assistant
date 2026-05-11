@@ -274,3 +274,39 @@ budget impact too).
 **When to revisit:** Once Gemini 3.x emerges from preview status
 with stable production tier, swap back if benchmarks justify the
 cost delta for this task.
+
+---
+
+## D-017 — Compute option greeks in-process via Black-Scholes inversion
+
+**Decision:** The live iron-condor strategist fills in missing greeks
+(delta, IV) by solving Black-Scholes inverse on each option's market
+mid, using a shared `trademaster/options_math.py` module. We do NOT
+require the paid OPRA data feed for greeks.
+
+**Why:** First integration test against the real Alpaca options chain
+showed that the default (and indicative) data feed returns prices but
+`greeks=None` and `implied_volatility=None` for every contract. OPRA
+(real-time exchange feed) requires the signed OPRA Subscriber
+Agreement, which costs an additional monthly fee. We don't need that.
+
+Black-Scholes IV inversion is well-conditioned for liquid SPY 0DTE
+strikes (mid prices > $0.01). The strategist gets per-strike skew
+naturally because each leg's IV is solved from its own market price,
+not assumed flat. Strikes whose mid pins at the $0.01 minimum tick
+(no real market) stay with `delta=None` and are excluded from leg
+selection — the right behavior for untradeable strikes.
+
+**Implication:**
+- `trademaster/options_math.py` is the canonical home for BS math.
+  Backtest (`backtests/synthetic_options.py`) imports from there.
+- `_enrich_chain_with_bs_greeks` runs inside the strategist after
+  the chain fetch. Per-leg IV is computed via 60-iteration bisection
+  (no scipy dep).
+- Signal `extra` records the BS-derived IV so the agent_runs audit
+  shows the IV regime the strategist saw.
+
+**When to revisit:** If we upgrade to an Alpaca tier that provides
+greeks server-side, the enricher becomes a no-op (already handled —
+quotes with non-None delta pass through unchanged). Until then this
+is the path.
