@@ -9,7 +9,7 @@
 | Phase | Goal | Status |
 |---|---|---|
 | 0 | Repo + scaffold | In progress |
-| 1 | TradeRouter skeleton + Alpaca MCP + Discord bot + pre-market research agent | Not started |
+| 1 | TradeMaster skeleton + Alpaca MCP + Discord bot + pre-market research agent | Not started |
 | 2 | SPY 0DTE iron condor (backtest → paper) | Not started |
 | 3 | Crypto trend-follow + equity alerts | Not started |
 | 4 | Dashboard + scheduler + 30-day paper run | Not started |
@@ -22,14 +22,14 @@
 ```bash
 cd ~/ai-trading-assistant
 source .venv/bin/activate
-python -m traderouter.orchestrator
+python -m trademaster.orchestrator
 ```
 
 ## How to Stop the System
 
 ```bash
-# Graceful: send SIGTERM, TradeRouter flushes positions log and exits
-pkill -TERM -f "traderouter.orchestrator"
+# Graceful: send SIGTERM, TradeMaster flushes positions log and exits
+pkill -TERM -f "trademaster.orchestrator"
 ```
 
 ## Kill Switch (Emergency)
@@ -48,29 +48,29 @@ This:
 
 ## What to Do If…
 
-### TradeRouter crashes mid-trade
-- Check `data/traderouter.log` for the last action
-- Run `python -m traderouter.recover` (planned for Phase 4) — reconciles in-memory state with Alpaca
+### TradeMaster crashes mid-trade
+- Check `data/trademaster.log` for the last action
+- Run `python -m trademaster.recover` (planned for Phase 4) — reconciles in-memory state with Alpaca
 - If positions are open and you can't recover, use Alpaca dashboard to flatten manually
 
 ### Discord bot is offline
-- Check `systemctl status traderouter-discord` (if systemd-managed)
-- Bot disconnection does not stop trading — TradeRouter continues. Bot is for alerts only.
+- Check `systemctl status trademaster-discord` (if systemd-managed)
+- Bot disconnection does not stop trading — TradeMaster continues. Bot is for alerts only.
 
 ### Loss limit hit
-- TradeRouter halts automatically and posts to `#alerts`
+- TradeMaster halts automatically and posts to `#alerts`
 - All open positions are flattened
 - Trading does not resume until next trading day OR manual `/resume`
 
 ### NUC reboots
-- systemd restarts TradeRouter automatically (configured in Phase 4)
-- On startup, TradeRouter reconciles position state with Alpaca before accepting new signals
+- systemd restarts TradeMaster automatically (configured in Phase 4)
+- On startup, TradeMaster reconciles position state with Alpaca before accepting new signals
 
 ## Monitoring
 
 - **Dashboard:** http://nuc.local:3000 (or your NUC's IP)
-- **Logs:** `data/traderouter.log`
-- **DB inspection:** `sqlite3 data/traderouter.db`
+- **Logs:** `data/trademaster.log`
+- **DB inspection:** `sqlite3 data/trademaster.db`
 - **Discord:** all human-relevant events posted to channels
 
 ## Manual Overrides (Discord commands)

@@ -18,10 +18,10 @@ from tenacity import (
     wait_exponential,
 )
 
-from traderouter.config import get_settings
-from traderouter.llm.pricing import calculate_cost
-from traderouter.llm.types import AuthError, LLMResponse, ProviderError, RateLimitError
-from traderouter.logging import get_logger
+from trademaster.config import get_settings
+from trademaster.llm.pricing import calculate_cost
+from trademaster.llm.types import AuthError, LLMResponse, ProviderError, RateLimitError
+from trademaster.logging import get_logger
 
 log = get_logger(__name__)
 

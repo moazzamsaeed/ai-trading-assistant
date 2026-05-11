@@ -4,7 +4,7 @@
 
 ```
                           ┌───────────────────────────────┐
-                          │   TRADEROUTER (Opus 4.7)      │
+                          │   TRADEMASTER (Opus 4.7)      │
                           │   Orchestrator                │
                           │   Risk manager (cash-only)    │
                           │   Router → sub-agents         │
@@ -36,16 +36,16 @@
 
 ## Data Flow
 
-1. **Scheduler** (in TradeRouter) fires events: `pre_market_briefing` (8am ET), `intraday_scan` (every 10-15 min during RTH), `eod_summary` (4:15pm ET), and crypto-only ticks 24/7.
-2. TradeRouter receives the event and dispatches the appropriate sub-agent via `router.route_to_model(task_type)`.
+1. **Scheduler** (in TradeMaster) fires events: `pre_market_briefing` (8am ET), `intraday_scan` (every 10-15 min during RTH), `eod_summary` (4:15pm ET), and crypto-only ticks 24/7.
+2. TradeMaster receives the event and dispatches the appropriate sub-agent via `router.route_to_model(task_type)`.
 3. Sub-agent calls Alpaca (via `alpaca-py`) for data → reasons about it → returns a structured signal (Pydantic model).
-4. TradeRouter runs the signal through `risk_manager.validate(signal)`. Rejects on:
+4. TradeMaster runs the signal through `risk_manager.validate(signal)`. Rejects on:
    - Margin/leverage detected
    - Daily loss limit hit
    - Position size > MAX_POSITION_SIZE_USD
    - Concurrent positions > MAX_CONCURRENT_POSITIONS
    - Cash insufficient
-5. If approved, TradeRouter either:
+5. If approved, TradeMaster either:
    - Executes via `alpaca-py` (auto-mode)
    - Posts to Discord `#alerts` and waits for `/approve` (approval-mode)
    - Posts as alert only (alert-only mode for equities)
@@ -77,7 +77,7 @@ Responsibilities:
 
 ## Persistence
 
-- **SQLite** at `data/traderouter.db`
+- **SQLite** at `data/trademaster.db`
   - `trades` — executed trades with entry/exit/P&L
   - `signals` — every agent signal for audit and retro-analysis
   - `agent_runs` — every LLM call: model, tokens, cost, duration
@@ -86,7 +86,7 @@ Responsibilities:
 ## External Dependencies
 
 - **Alpaca** — official `alpaca-py` SDK (see D-009 for why we picked SDK over MCP)
-- **Anthropic API** — TradeRouter orchestration
+- **Anthropic API** — TradeMaster orchestration
 - **DeepSeek API** — sub-agents
 - **Google AI Studio API** — pre-market research
 - **Discord Developer API** — bot

@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from traderouter.models import (
+from trademaster.models import (
     AssetClass,
     OptionLeg,
     Side,

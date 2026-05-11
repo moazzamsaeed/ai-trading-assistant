@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     discord_channel_logs: str = ""
     discord_channel_commands: str = ""
 
-    database_url: str = "sqlite:///data/traderouter.db"
+    database_url: str = "sqlite:///data/trademaster.db"
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 

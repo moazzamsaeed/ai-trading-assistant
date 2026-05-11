@@ -14,14 +14,14 @@ This file captures the *why* behind architectural and tooling choices, so a V2 b
 
 ---
 
-## D-002 — TradeRouter (Opus 4.7) orchestrates, sub-agents run cheaper models
+## D-002 — TradeMaster (Opus 4.7) orchestrates, sub-agents run cheaper models
 
-**Decision:** Claude Opus 4.7 only for the TradeRouter orchestrator role. All sub-agent work (research, scans, strategy, execution) runs on cheaper models.
+**Decision:** Claude Opus 4.7 only for the TradeMaster orchestrator role. All sub-agent work (research, scans, strategy, execution) runs on cheaper models.
 
-**Why:** Opus is the strongest at multi-step orchestration and tool routing. But running it for every intraday scan would burn budget. DeepSeek V4 is "near state-of-the-art" at 1/6 the cost — sufficient for sub-agent work where TradeRouter has the final say anyway. Pre-market research is the one task where reasoning matters more than orchestration, so it gets Gemini 3.1 Pro (highest GPQA score).
+**Why:** Opus is the strongest at multi-step orchestration and tool routing. But running it for every intraday scan would burn budget. DeepSeek V4 is "near state-of-the-art" at 1/6 the cost — sufficient for sub-agent work where TradeMaster has the final say anyway. Pre-market research is the one task where reasoning matters more than orchestration, so it gets Gemini 3.1 Pro (highest GPQA score).
 
 **Alternatives considered:**
-- LiteLLM proxy for routing — rejected. TradeRouter calls each provider's SDK directly via a thin `router.route_to_model()`. One less moving part.
+- LiteLLM proxy for routing — rejected. TradeMaster calls each provider's SDK directly via a thin `router.route_to_model()`. One less moving part.
 - All-Claude stack — rejected. Cost would be 3-4× higher with no measurable quality gain on routine scans.
 - All-DeepSeek stack — rejected. Orchestration quality matters most for risk decisions, and Opus has a real edge there.
 
@@ -61,7 +61,7 @@ This file captures the *why* behind architectural and tooling choices, so a V2 b
 
 ## D-006 — SQLite, not Postgres or cloud DB
 
-**Decision:** SQLite at `data/traderouter.db` for all persistence.
+**Decision:** SQLite at `data/trademaster.db` for all persistence.
 
 **Why:** Single user, single machine, single process. Postgres adds operational overhead (backups, server management) for zero benefit at this scale. SQLite is fast, transactional, and trivially backed up (it's a file).
 
@@ -85,41 +85,53 @@ This file captures the *why* behind architectural and tooling choices, so a V2 b
 
 ---
 
-## D-009 — `alpaca-py` SDK for TradeRouter, not the Alpaca MCP server
+## D-009 — `alpaca-py` SDK for TradeMaster, not the Alpaca MCP server
 
-**Decision:** TradeRouter calls Alpaca directly via the official `alpaca-py` Python SDK. The Alpaca MCP server is not used inside the TradeRouter process.
+**Decision:** TradeMaster calls Alpaca directly via the official `alpaca-py` Python SDK. The Alpaca MCP server is not used inside the TradeMaster process.
 
-**Why:** MCP servers are designed for MCP *clients* (Claude Desktop and similar) and run as separate subprocesses, talking over stdio. Inside a long-running Python orchestrator, importing `alpaca-py` directly is simpler, faster, and removes a process boundary plus a serialization layer. The MCP server remains a useful tool for ad-hoc Claude-Desktop conversations with the account, but that workflow is independent of TradeRouter and does not need to live in the same codebase.
+**Why:** MCP servers are designed for MCP *clients* (Claude Desktop and similar) and run as separate subprocesses, talking over stdio. Inside a long-running Python orchestrator, importing `alpaca-py` directly is simpler, faster, and removes a process boundary plus a serialization layer. The MCP server remains a useful tool for ad-hoc Claude-Desktop conversations with the account, but that workflow is independent of TradeMaster and does not need to live in the same codebase.
 
 **Implication:** `integrations/alpaca_client.py` (Phase 1) wraps `alpaca-py` for data and execution. `ARCHITECTURE.md` previously showed an "Alpaca MCP Server" box in the data-flow diagram — that should be read as "Alpaca (via `alpaca-py` SDK)" until the diagram is updated.
 
-**When to revisit:** If TradeRouter itself needs to be exposed as a tool host to MCP clients, or if Alpaca ships a substantially richer surface in the MCP server than in the SDK.
+**When to revisit:** If TradeMaster itself needs to be exposed as a tool host to MCP clients, or if Alpaca ships a substantially richer surface in the MCP server than in the SDK.
 
 ---
 
 ## D-010 — Nous Hermes Agent as ecosystem-level "mission control" (deferred)
 
-**Decision:** This trading project (`traderouter`) is one component of a larger personal-projects ecosystem. The ecosystem-level orchestrator — the always-on daemon that lets the user interact remotely via Discord, modify code while away from the NUC, and coordinate across multiple unrelated projects — will be [Nous Research's Hermes Agent](https://hermes-agent.nousresearch.com/). It will be installed as a separate process on the NUC during Phase 4 (deployment).
+**Decision:** This trading project (`trademaster`) is one component of a larger personal-projects ecosystem. The ecosystem-level orchestrator — the always-on daemon that lets the user interact remotely via Discord, modify code while away from the NUC, and coordinate across multiple unrelated projects — will be [Nous Research's Hermes Agent](https://hermes-agent.nousresearch.com/). It will be installed as a separate process on the NUC during Phase 4 (deployment).
 
-**Why:** Hermes Agent is purpose-built for what the user wants at the ecosystem level: a self-hosted, always-on daemon with cross-session memory, multi-channel messaging (Discord native), and skill-learning. Building this layer ourselves on top of the trading project would tightly couple two different concerns. Keeping them separate lets `traderouter` stay narrowly focused on trading, and lets new personal projects slot into the same Hermes Agent control plane without modification.
+**Why:** Hermes Agent is purpose-built for what the user wants at the ecosystem level: a self-hosted, always-on daemon with cross-session memory, multi-channel messaging (Discord native), and skill-learning. Building this layer ourselves on top of the trading project would tightly couple two different concerns. Keeping them separate lets `trademaster` stay narrowly focused on trading, and lets new personal projects slot into the same Hermes Agent control plane without modification.
 
 **Alternatives considered:**
-- **Build remote-control into TradeRouter** — rejected. Couples dev/admin concerns to the trading core, expanding the safety-critical surface unnecessarily.
+- **Build remote-control into TradeMaster** — rejected. Couples dev/admin concerns to the trading core, expanding the safety-critical surface unnecessarily.
 - **Claude Code remote control (claude.ai/code)** — rejected as the primary surface. Strong UX for code edits, but the channel is the web app, not Discord. Stays available as a backup admin path.
 - **OpenClaw** — rejected. Multi-channel routing is valuable but Discord-only is fine; OpenClaw's strength (many messaging channels) is not load-bearing here.
 
-**Implication:** TradeRouter's Discord bot handles trading-specific commands only (`/approve`, `/kill`, `/status`, `/positions`, `/cash`). Anything outside that scope — code edits, log reads, agent-prompt tweaks, cross-project queries — is the responsibility of the Hermes Agent layer, which we will add when the trading project is operationally stable.
+**Implication:** TradeMaster's Discord bot handles trading-specific commands only (`/approve`, `/kill`, `/status`, `/positions`, `/cash`). Anything outside that scope — code edits, log reads, agent-prompt tweaks, cross-project queries — is the responsibility of the Hermes Agent layer, which we will add when the trading project is operationally stable.
 
-**When to revisit / implement:** After Phase 4 (dashboard + 30-day paper run) is stable, OR when a second personal project needs the same kind of remote-control surface. Should not introduce changes that would force a rewrite of `traderouter/`.
+**When to revisit / implement:** After Phase 4 (dashboard + 30-day paper run) is stable, OR when a second personal project needs the same kind of remote-control surface. Should not introduce changes that would force a rewrite of `trademaster/`.
 
 ---
 
-## D-011 — Internal package renamed `hermes/` → `traderouter/`
+## D-011 — Internal package renamed `hermes/` → `trademaster/`
 
-**Decision:** The orchestrator package is named `traderouter/` (Python module: `traderouter`), not `hermes/`. The component is referred to as "TradeRouter" in prose.
+**Decision:** The orchestrator package is named `trademaster/` (Python module: `trademaster`), not `hermes/`. The component is referred to as "TradeMaster" in prose.
 
-**Why:** The original name `hermes/` collided with [Nous Research's Hermes Agent](https://hermes-agent.nousresearch.com/) — which D-010 commits to using at the ecosystem layer. Keeping both names in the same conversation would create durable confusion. "TradeRouter" makes the component's role explicit: it routes trades (and the agent calls that produce them).
+**Why:** The original name `hermes/` collided with [Nous Research's Hermes Agent](https://hermes-agent.nousresearch.com/) — which D-010 commits to using at the ecosystem layer. Keeping both names in the same conversation would create durable confusion. "TradeMaster" makes the component's role explicit: it routes trades (and the agent calls that produce them).
 
-**Implication:** All imports use `traderouter.*`. The SQLite DB is at `data/traderouter.db`. ASCII diagrams and prose refer to "TradeRouter" or "TRADEROUTER" where the orchestrator role is meant.
+**Implication:** All imports use `trademaster.*`. The SQLite DB is at `data/trademaster.db`. ASCII diagrams and prose refer to "TradeMaster" or "TRADEMASTER" where the orchestrator role is meant.
 
 **When to revisit:** Not expected. The rename is mechanical; it does not bind any future architectural choice.
+
+---
+
+## D-012 — Renamed `traderouter/` → `trademaster/`
+
+**Decision:** The orchestrator package is renamed once more, to `trademaster/`. Module name `trademaster`; prose name "TradeMaster".
+
+**Why:** User preference. "TradeRouter" emphasized routing (one slice of what the component does); "TradeMaster" better captures the orchestrator role across research, strategy, execution, and risk management. Same character count as TRADEROUTER (11) so ASCII diagrams remain aligned.
+
+**Implication:** Supersedes D-011's chosen name. All `traderouter.*` imports become `trademaster.*`. SQLite DB now at `data/trademaster.db`. D-002 / D-009 / D-010 / D-011 rewritten in-line to use the new name (mechanical sed) — historical record of the prior names lives in commit `e18de0d` (hermes → traderouter) and this commit (traderouter → trademaster).
+
+**When to revisit:** Not expected.

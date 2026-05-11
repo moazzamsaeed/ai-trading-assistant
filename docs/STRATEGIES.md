@@ -86,4 +86,4 @@ Run by Gemini 3.1 Pro at 8 AM ET, posts to Discord `#research` channel:
 - Macro events for the day (FOMC, CPI, NFP, etc.)
 - Futures action and gap analysis on watchlist tickers
 - Sector rotation signals
-- One-paragraph synthesis: "What does today look like, and what should TradeRouter pay attention to?"
+- One-paragraph synthesis: "What does today look like, and what should TradeMaster pay attention to?"

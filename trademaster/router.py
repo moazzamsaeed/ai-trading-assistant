@@ -20,11 +20,11 @@ from enum import StrEnum
 
 from sqlalchemy.orm import Session
 
-from traderouter.db import AgentRun, make_session_factory
-from traderouter.llm import anthropic_client, deepseek_client, google_client
-from traderouter.llm.budget import check_budget
-from traderouter.llm.types import LLMResponse, ProviderError, RouterError
-from traderouter.logging import get_logger
+from trademaster.db import AgentRun, make_session_factory
+from trademaster.llm import anthropic_client, deepseek_client, google_client
+from trademaster.llm.budget import check_budget
+from trademaster.llm.types import LLMResponse, ProviderError, RouterError
+from trademaster.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -171,6 +171,6 @@ async def route_to_model(
 
 def estimated_cost(model: str, input_tokens: int, output_tokens: int) -> Decimal:
     """Convenience for cost previews outside of an active call."""
-    from traderouter.llm.pricing import calculate_cost
+    from trademaster.llm.pricing import calculate_cost
 
     return calculate_cost(model, input_tokens, output_tokens)

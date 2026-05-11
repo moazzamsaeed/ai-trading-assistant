@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 
-from traderouter.db import (
+from trademaster.db import (
     AgentRun,
     Base,
     RiskEvent,

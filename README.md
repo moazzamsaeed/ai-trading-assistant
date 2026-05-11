@@ -1,12 +1,12 @@
 # AI Trading Assistant
 
-TradeRouter-orchestrated multi-agent trading and alert system. Runs on a local NUC, executes paper-then-live trades on Alpaca, and pushes alerts to Discord.
+TradeMaster-orchestrated multi-agent trading and alert system. Runs on a local NUC, executes paper-then-live trades on Alpaca, and pushes alerts to Discord.
 
 ## Critical Constraints
 
 > **Cash account only. No margin. No leverage. Ever.**
 >
-> TradeRouter enforces this in code — every order is rejected unless backed by available cash. Defined-risk options structures only (iron condors, spreads). No naked options. No borrowed capital.
+> TradeMaster enforces this in code — every order is rejected unless backed by available cash. Defined-risk options structures only (iron condors, spreads). No naked options. No borrowed capital.
 
 ## Hardware
 
@@ -16,7 +16,7 @@ TradeRouter-orchestrated multi-agent trading and alert system. Runs on a local N
 
 ## Architecture (one-line summary)
 
-TradeRouter (Claude Opus 4.7) orchestrates specialized sub-agents (Gemini 3.1 Pro for pre-market research, DeepSeek V4-Pro for strategy decisions, DeepSeek V4-Flash for high-frequency scans), each calling the Alpaca MCP for data and execution, with results routed to a Discord bot for alerts and a Next.js dashboard for performance tracking.
+TradeMaster (Claude Opus 4.7) orchestrates specialized sub-agents (Gemini 3.1 Pro for pre-market research, DeepSeek V4-Pro for strategy decisions, DeepSeek V4-Flash for high-frequency scans), each calling the Alpaca MCP for data and execution, with results routed to a Discord bot for alerts and a Next.js dashboard for performance tracking.
 
 See `docs/ARCHITECTURE.md` for the full diagram and data flow.
 
@@ -46,7 +46,7 @@ See `docs/RUNBOOK.md` for full operational instructions.
 ## Repo Layout
 
 ```
-traderouter/          # Orchestrator + risk manager + router + scheduler
+trademaster/          # Orchestrator + risk manager + router + scheduler
 agents/          # Sub-agents (research, options, crypto, equity_alerts)
 strategies/      # Pure strategy logic (independently testable)
 integrations/    # Alpaca client, Discord bot, LLM clients

@@ -11,7 +11,7 @@ import sys
 
 import structlog
 
-from traderouter.config import get_settings
+from trademaster.config import get_settings
 
 
 def configure_logging() -> None:

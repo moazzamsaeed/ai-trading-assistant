@@ -30,7 +30,7 @@ def _fresh_settings(monkeypatch, **env):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
 
-    import traderouter.config as cfg
+    import trademaster.config as cfg
 
     importlib.reload(cfg)
     cfg.get_settings.cache_clear()

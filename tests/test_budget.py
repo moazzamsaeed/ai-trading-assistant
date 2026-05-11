@@ -7,10 +7,10 @@ from decimal import Decimal
 
 import pytest
 
-from traderouter.config import get_settings
-from traderouter.db import AgentRun, Base, make_engine, make_session_factory
-from traderouter.llm.budget import check_budget, current_month_spend_usd
-from traderouter.llm.types import BudgetExceededError
+from trademaster.config import get_settings
+from trademaster.db import AgentRun, Base, make_engine, make_session_factory
+from trademaster.llm.budget import check_budget, current_month_spend_usd
+from trademaster.llm.types import BudgetExceededError
 
 
 @pytest.fixture

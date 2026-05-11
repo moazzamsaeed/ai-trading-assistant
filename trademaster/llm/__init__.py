@@ -1,6 +1,6 @@
 """LLM provider clients and routing."""
 
-from traderouter.llm.types import (
+from trademaster.llm.types import (
     AuthError,
     BudgetExceededError,
     LLMResponse,

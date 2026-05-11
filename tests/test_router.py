@@ -7,10 +7,10 @@ from decimal import Decimal
 
 import pytest
 
-from traderouter import router
-from traderouter.config import get_settings
-from traderouter.db import AgentRun, Base, make_engine, make_session_factory
-from traderouter.llm.types import AuthError, BudgetExceededError, LLMResponse
+from trademaster import router
+from trademaster.config import get_settings
+from trademaster.db import AgentRun, Base, make_engine, make_session_factory
+from trademaster.llm.types import AuthError, BudgetExceededError, LLMResponse
 
 
 @pytest.fixture
