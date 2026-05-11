@@ -11,12 +11,14 @@ Phase 2 trade execution. Every write call logs structured event lines.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from alpaca.data.historical.news import NewsClient
-from alpaca.data.requests import NewsRequest
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.requests import NewsRequest, OptionChainRequest
 from alpaca.trading.client import TradingClient
 
 from trademaster.config import get_settings
@@ -218,5 +220,140 @@ async def get_recent_news(
         else:
             items = raw
         return [_to_article(a) for a in items]
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ====================================================================
+# Options
+# ====================================================================
+
+
+_OCC_RE = re.compile(
+    r"^(?P<root>[A-Z]+)(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})"
+    r"(?P<kind>[CP])(?P<strike>\d{8})$"
+)
+
+
+def parse_occ_symbol(occ: str) -> tuple[str, date, str, Decimal]:
+    """Parse an OCC option symbol like 'SPY240315P00495000'.
+
+    Returns (underlying, expiry, option_type, strike). Raises ValueError if
+    the symbol does not match the OCC 21-char format.
+    """
+    m = _OCC_RE.match(occ.strip())
+    if not m:
+        raise ValueError(f"not a valid OCC symbol: {occ!r}")
+    yy, mm, dd = int(m["yy"]), int(m["mm"]), int(m["dd"])
+    year = 2000 + yy
+    expiry = date(year, mm, dd)
+    option_type = "call" if m["kind"] == "C" else "put"
+    strike = Decimal(m["strike"]) / Decimal("1000")
+    return m["root"], expiry, option_type, strike
+
+
+def _options_client() -> OptionHistoricalDataClient:
+    settings = get_settings()
+    return OptionHistoricalDataClient(
+        api_key=settings.alpaca_api_key.get_secret_value(),
+        secret_key=settings.alpaca_api_secret.get_secret_value(),
+    )
+
+
+@dataclass(frozen=True)
+class OptionQuote:
+    """Normalized snapshot for one option contract."""
+
+    occ_symbol: str
+    underlying: str
+    strike: Decimal
+    expiry: date
+    option_type: str  # "call" or "put"
+    bid: Decimal
+    ask: Decimal
+    mid: Decimal
+    delta: Decimal | None
+    gamma: Decimal | None
+    theta: Decimal | None
+    vega: Decimal | None
+    implied_volatility: Decimal | None
+
+    @property
+    def spread(self) -> Decimal:
+        return self.ask - self.bid
+
+
+def _to_decimal(v) -> Decimal | None:
+    if v is None:
+        return None
+    try:
+        return Decimal(str(v))
+    except (ValueError, ArithmeticError):
+        return None
+
+
+def _snapshot_to_quote(occ_symbol: str, snap) -> OptionQuote | None:
+    """Convert an alpaca-py OptionsSnapshot to OptionQuote. Skips malformed entries."""
+    try:
+        underlying, expiry, option_type, strike = parse_occ_symbol(occ_symbol)
+    except ValueError:
+        return None
+
+    quote = getattr(snap, "latest_quote", None)
+    bid = _to_decimal(getattr(quote, "bid_price", None)) or Decimal("0")
+    ask = _to_decimal(getattr(quote, "ask_price", None)) or Decimal("0")
+    if bid <= 0 and ask <= 0:
+        return None  # no live market
+
+    greeks = getattr(snap, "greeks", None)
+    return OptionQuote(
+        occ_symbol=occ_symbol,
+        underlying=underlying,
+        strike=strike,
+        expiry=expiry,
+        option_type=option_type,
+        bid=bid,
+        ask=ask,
+        mid=(bid + ask) / 2,
+        delta=_to_decimal(getattr(greeks, "delta", None)) if greeks else None,
+        gamma=_to_decimal(getattr(greeks, "gamma", None)) if greeks else None,
+        theta=_to_decimal(getattr(greeks, "theta", None)) if greeks else None,
+        vega=_to_decimal(getattr(greeks, "vega", None)) if greeks else None,
+        implied_volatility=_to_decimal(getattr(snap, "implied_volatility", None)),
+    )
+
+
+async def get_options_chain(
+    underlying: str,
+    *,
+    expiry: date | None = None,
+    strike_lo: Decimal | None = None,
+    strike_hi: Decimal | None = None,
+) -> list[OptionQuote]:
+    """Fetch the option chain for `underlying`, optionally filtered.
+
+    `expiry` filters to a single expiration date (used for 0DTE: today).
+    `strike_lo`/`strike_hi` clamp the strike range to keep the response small.
+    Returns options with at least one quoted side. Sorted by (option_type, strike).
+    """
+
+    def _fetch() -> list[OptionQuote]:
+        kwargs: dict = {"underlying_symbol": underlying}
+        if expiry is not None:
+            kwargs["expiration_date"] = expiry
+        if strike_lo is not None:
+            kwargs["strike_price_gte"] = float(strike_lo)
+        if strike_hi is not None:
+            kwargs["strike_price_lte"] = float(strike_hi)
+        req = OptionChainRequest(**kwargs)
+        snapshots = _options_client().get_option_chain(req)
+        # snapshots is dict[occ_symbol -> OptionsSnapshot]
+        quotes: list[OptionQuote] = []
+        for occ, snap in (snapshots or {}).items():
+            q = _snapshot_to_quote(occ, snap)
+            if q is not None:
+                quotes.append(q)
+        quotes.sort(key=lambda q: (q.option_type, q.strike))
+        return quotes
 
     return await asyncio.to_thread(_fetch)
