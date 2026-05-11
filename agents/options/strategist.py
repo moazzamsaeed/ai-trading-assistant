@@ -205,41 +205,30 @@ def _parse_decision(text: str) -> tuple[str, float | None, str]:
 
 
 def format_manual_signal(plan: IronCondorPlan, signal: Signal) -> str:
-    """Broker-ready entry instructions for #signals (manual trader).
+    """Plain-language manual-trading signal for #signals.
 
-    Lists every leg with strike, expiry, call/put, side, and target price.
-    Includes net credit, max loss, and concrete exit thresholds in $/contract.
+    No options jargon. Just the four broker-ready buy/sell actions, the
+    cash impact in dollars, and a one-line hold rule.
     """
-    expiry_iso = plan.short_put.expiry.isoformat()
     qty = plan.qty
-    # Exit thresholds in net-debit terms per contract.
-    pt_debit = (plan.credit_per_contract / Decimal("2")).quantize(Decimal("0.01"))
-    stop_debit = (plan.credit_per_contract * Decimal("3")).quantize(Decimal("0.01"))
+    qty_text = f"{qty}× " if qty != 1 else ""
     return (
-        f"🎯 **SPY 0DTE Iron Condor — manual entry signal**\n"
-        f"Expiry: **{expiry_iso}** · qty per side: **{qty}**\n"
+        f"🎯 **SPY signals — today's expiry (0DTE)**\n"
         f"\n"
-        f"**Legs (open as a credit spread):**\n"
-        f"• SELL {qty} × SPY {expiry_iso} **${plan.short_put.strike} PUT**  "
-        f"@ mid ${plan.short_put.mid:.2f}\n"
-        f"• BUY  {qty} × SPY {expiry_iso} **${plan.long_put.strike} PUT**   "
-        f"@ mid ${plan.long_put.mid:.2f}\n"
-        f"• SELL {qty} × SPY {expiry_iso} **${plan.short_call.strike} CALL** "
-        f"@ mid ${plan.short_call.mid:.2f}\n"
-        f"• BUY  {qty} × SPY {expiry_iso} **${plan.long_call.strike} CALL**  "
-        f"@ mid ${plan.long_call.mid:.2f}\n"
+        f"1. **Sell** {qty_text}**SPY ${plan.short_put.strike} PUT** "
+        f"(about ${plan.short_put.mid:.2f})\n"
+        f"2. **Buy** {qty_text}**SPY ${plan.long_put.strike} PUT** "
+        f"(about ${plan.long_put.mid:.2f})\n"
+        f"3. **Sell** {qty_text}**SPY ${plan.short_call.strike} CALL** "
+        f"(about ${plan.short_call.mid:.2f})\n"
+        f"4. **Buy** {qty_text}**SPY ${plan.long_call.strike} CALL** "
+        f"(about ${plan.long_call.mid:.2f})\n"
         f"\n"
-        f"**Target net credit:** ${plan.credit_per_contract}/contract "
-        f"(total ${plan.credit_received})\n"
-        f"**Max loss:** ${plan.max_loss_per_contract}/contract "
-        f"(total ${plan.max_loss})\n"
+        f"You'll **collect about ${plan.credit_received}** cash. About "
+        f"**${plan.max_loss}** of your cash gets tied up until you close.\n"
         f"\n"
-        f"**Exit rules:**\n"
-        f"• Profit target: close at **≤ ${pt_debit} net debit** (50% of credit)\n"
-        f"• Stop loss: close at **≥ ${stop_debit} net debit** (loss = 2× credit)\n"
-        f"• Force close: **15:50 ET** regardless of P&L\n"
-        f"\n"
-        f"Strategist confidence: {signal.confidence} · Rationale: {signal.reasoning}"
+        f"Hold all four until you see an EXIT message here, or close everything "
+        f"by **15:50 ET** (10 min before market close)."
     )
 
 

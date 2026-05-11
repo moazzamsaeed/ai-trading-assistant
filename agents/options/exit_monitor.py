@@ -100,7 +100,6 @@ def _decide_exit(
 def _format_exit_signal(trade: Trade, exit_debit: Decimal, reason: str) -> str:
     """Broker-ready exit instructions for #signals."""
     extra = trade.extra or {}
-    expiry = extra.get("expiry", "today")
     qty = trade.qty
     legs = {
         "short_put": extra.get("short_put", "?"),
@@ -117,22 +116,28 @@ def _format_exit_signal(trade: Trade, exit_debit: Decimal, reason: str) -> str:
 
     credit = trade.entry_price
     realized_per_contract = (Decimal(str(credit)) - exit_debit).quantize(Decimal("0.01"))
+    qty_text = f"{qty}× " if qty != 1 else ""
+
+    # Plain-language reason mapping.
+    reason_text = {
+        "profit_target_50pct": "✅ profit target hit",
+        "stop_loss_2x": "🛑 stop loss — cap the loss now",
+        "force_close": "⏰ closing before market close",
+    }.get(reason, f"closing ({reason})")
+
+    pnl_word = "profit" if realized_per_contract >= 0 else "loss"
+    pnl_amount = abs(realized_per_contract)
+
     return (
-        f"⏰ **SPY Iron Condor EXIT signal** — trade #{trade.id}\n"
-        f"Trigger: `{reason}` · current net debit ~${exit_debit}/contract\n"
+        f"🚨 **SPY EXIT now — {reason_text}** (trade #{trade.id})\n"
         f"\n"
-        f"**Close (reverse each leg):**\n"
-        f"• BUY  {qty} × SPY {expiry} **${_strike(legs['short_put'])} PUT**  "
-        f"(close short)\n"
-        f"• SELL {qty} × SPY {expiry} **${_strike(legs['long_put'])} PUT**   "
-        f"(close long)\n"
-        f"• BUY  {qty} × SPY {expiry} **${_strike(legs['short_call'])} CALL** "
-        f"(close short)\n"
-        f"• SELL {qty} × SPY {expiry} **${_strike(legs['long_call'])} CALL**  "
-        f"(close long)\n"
+        f"1. **Buy back** {qty_text}**SPY ${_strike(legs['short_put'])} PUT**\n"
+        f"2. **Sell** {qty_text}**SPY ${_strike(legs['long_put'])} PUT**\n"
+        f"3. **Buy back** {qty_text}**SPY ${_strike(legs['short_call'])} CALL**\n"
+        f"4. **Sell** {qty_text}**SPY ${_strike(legs['long_call'])} CALL**\n"
         f"\n"
-        f"**Estimated P&L:** ${realized_per_contract}/contract "
-        f"(entry credit ${credit} − exit debit ${exit_debit})"
+        f"You'll pay about **${exit_debit}** to close. "
+        f"Expected {pnl_word}: **${pnl_amount}**."
     )
 
 

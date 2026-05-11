@@ -280,14 +280,17 @@ async def test_strategist_open_approved_emits_alert(monkeypatch, session_factory
     )
     assert signal.action.value == "open"
 
-    # Manual signal in #signals: broker-ready strikes, side, expiry, exit rules
+    # Manual signal in #signals: plain-language buy/sell instructions, no jargon
     assert signals_text is not None
-    assert "manual entry signal" in signals_text.lower()
-    assert "$495 PUT" in signals_text  # short put leg
-    assert "$510 CALL" in signals_text  # long call leg
-    assert "SELL" in signals_text and "BUY" in signals_text
-    assert "Profit target" in signals_text
-    assert "Stop loss" in signals_text
+    assert "spy signals" in signals_text.lower() or "spy" in signals_text.lower()
+    assert "$495 PUT" in signals_text  # short put strike
+    assert "$510 CALL" in signals_text  # long call strike
+    # Plain-language verbs, not "SELL_TO_OPEN" type jargon
+    assert "Sell" in signals_text and "Buy" in signals_text
+    # No iron-condor / credit-spread / profit-target jargon
+    assert "iron condor" not in signals_text.lower()
+    assert "credit spread" not in signals_text.lower()
+    # Hold rule + close-by time in plain English
     assert "15:50 ET" in signals_text
 
     # Trade telemetry in #trades: execution status
@@ -332,7 +335,8 @@ async def test_strategist_open_executor_failure_still_emits_alert(
     )
     # User should still see the manual signal — they may want to trade it themselves.
     assert signals_text is not None
-    assert "manual entry signal" in signals_text.lower()
+    assert "spy" in signals_text.lower()
+    assert "Sell" in signals_text  # plain-language buy/sell instructions
     # Trade telemetry must show the failure.
     assert trade_text is not None
     assert "not executed" in trade_text.lower()
