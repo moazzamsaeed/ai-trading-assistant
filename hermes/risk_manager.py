@@ -7,7 +7,7 @@ The LLM proposes; the risk manager disposes.
 from __future__ import annotations
 
 
-class RiskRejection(Exception):
+class RiskRejectionError(Exception):
     """Raised when an agent signal violates a hard risk constraint."""
 
 

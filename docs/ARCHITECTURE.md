@@ -22,7 +22,7 @@
             └────────┬────────┴────────┬────────┴────────┬────────┘
                      │                 │                 │
               ┌──────▼──────────────────▼─────────────────▼──────┐
-              │            Alpaca MCP Server                     │
+              │     Alpaca (via `alpaca-py` SDK — see D-009)     │
               │   data + news + execution + portfolio + crypto   │
               └──────────────────────────────────────────────────┘
                                     │
@@ -38,7 +38,7 @@
 
 1. **Scheduler** (in Hermes) fires events: `pre_market_briefing` (8am ET), `intraday_scan` (every 10-15 min during RTH), `eod_summary` (4:15pm ET), and crypto-only ticks 24/7.
 2. Hermes receives the event and dispatches the appropriate sub-agent via `router.route_to_model(task_type)`.
-3. Sub-agent calls Alpaca MCP for data → reasons about it → returns a structured signal (Pydantic model).
+3. Sub-agent calls Alpaca (via `alpaca-py`) for data → reasons about it → returns a structured signal (Pydantic model).
 4. Hermes runs the signal through `risk_manager.validate(signal)`. Rejects on:
    - Margin/leverage detected
    - Daily loss limit hit
@@ -46,7 +46,7 @@
    - Concurrent positions > MAX_CONCURRENT_POSITIONS
    - Cash insufficient
 5. If approved, Hermes either:
-   - Executes via Alpaca MCP (auto-mode)
+   - Executes via `alpaca-py` (auto-mode)
    - Posts to Discord `#alerts` and waits for `/approve` (approval-mode)
    - Posts as alert only (alert-only mode for equities)
 6. Trade outcome logged to SQLite. Dashboard reads from SQLite.
@@ -85,7 +85,7 @@ Responsibilities:
 
 ## External Dependencies
 
-- **Alpaca MCP server** — `alpacahq/alpaca-mcp-server` (official)
+- **Alpaca** — official `alpaca-py` SDK (see D-009 for why we picked SDK over MCP)
 - **Anthropic API** — Hermes orchestration
 - **DeepSeek API** — sub-agents
 - **Google AI Studio API** — pre-market research

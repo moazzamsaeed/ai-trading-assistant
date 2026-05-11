@@ -82,3 +82,15 @@ This file captures the *why* behind architectural and tooling choices, so a V2 b
 **Decision:** Project requires Python ≥3.11. NUC runs 3.14 (Ubuntu default). `uv` manages the interpreter.
 
 **Why:** 3.11 is widely supported and includes faster startup. Pinning ≥3.11 (not exactly 3.14) keeps V2 portability if future hardware ships with a slightly older Python.
+
+---
+
+## D-009 — `alpaca-py` SDK for Hermes, not the Alpaca MCP server
+
+**Decision:** Hermes calls Alpaca directly via the official `alpaca-py` Python SDK. The Alpaca MCP server is not used inside the Hermes process.
+
+**Why:** MCP servers are designed for MCP *clients* (Claude Desktop and similar) and run as separate subprocesses, talking over stdio. Inside a long-running Python orchestrator, importing `alpaca-py` directly is simpler, faster, and removes a process boundary plus a serialization layer. The MCP server remains a useful tool for ad-hoc Claude-Desktop conversations with the account, but that workflow is independent of Hermes and does not need to live in the same codebase.
+
+**Implication:** `integrations/alpaca_client.py` (Phase 1) wraps `alpaca-py` for data and execution. `ARCHITECTURE.md` previously showed an "Alpaca MCP Server" box in the data-flow diagram — that should be read as "Alpaca (via `alpaca-py` SDK)" until the diagram is updated.
+
+**When to revisit:** If Hermes itself needs to be exposed as a tool host to MCP clients, or if Alpaca ships a substantially richer surface in the MCP server than in the SDK.
