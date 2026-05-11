@@ -120,6 +120,29 @@ async def get_account() -> AccountSnapshot:
     return await asyncio.to_thread(_fetch)
 
 
+@dataclass(frozen=True)
+class MarketClock:
+    timestamp: datetime
+    is_open: bool
+    next_open: datetime
+    next_close: datetime
+
+
+async def get_market_clock() -> MarketClock:
+    """Authoritative market-open check (handles holidays)."""
+
+    def _fetch() -> MarketClock:
+        c = _trading_client().get_clock()
+        return MarketClock(
+            timestamp=getattr(c, "timestamp", datetime.now(UTC)),
+            is_open=bool(getattr(c, "is_open", False)),
+            next_open=getattr(c, "next_open", datetime.now(UTC)),
+            next_close=getattr(c, "next_close", datetime.now(UTC)),
+        )
+
+    return await asyncio.to_thread(_fetch)
+
+
 async def get_positions() -> list[PositionSnapshot]:
     """List all open positions."""
 

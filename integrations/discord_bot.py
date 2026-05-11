@@ -70,6 +70,9 @@ class TradeMasterBot(commands.Bot):
         self._research_channel_id = (
             int(settings.discord_channel_research) if settings.discord_channel_research else 0
         )
+        self._alerts_channel_id = (
+            int(settings.discord_channel_alerts) if settings.discord_channel_alerts else 0
+        )
         self._guild_id = int(settings.discord_guild_id) if settings.discord_guild_id else 0
         self._ready = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -115,6 +118,9 @@ class TradeMasterBot(commands.Bot):
 
     async def post_research(self, text: str) -> None:
         await self.post(self._research_channel_id, text)
+
+    async def post_alert(self, text: str) -> None:
+        await self.post(self._alerts_channel_id, text)
 
     # ---------- slash commands ----------
 

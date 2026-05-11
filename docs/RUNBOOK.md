@@ -2,20 +2,21 @@
 
 ## Current Phase
 
-**Phase 1.3 — Pre-market research vertical slice live.** Alpaca news client,
-Gemini-driven briefing agent, APScheduler with 8am ET cron, and a minimal
-Discord poster are wired end-to-end. Risk manager + slash commands land in
-Phase 1.4.
+**Phase 1 complete.** Foundation, router with budget, pre-market briefing,
+risk manager, Discord slash commands, and intraday scan loop are all wired
+end-to-end. Trade execution (iron condors) is Phase 2.
 
 ## Build Phases
 
 | Phase | Goal | Status |
 |---|---|---|
-| 0 | Repo + scaffold | Done (`344441e`) |
-| 1.1 | Foundation: config, db, logging, models | Done (`540d197`) |
-| 1.2 | Router + provider clients + budget enforcement | Done (`874f8e7`) |
+| 0 | Repo + scaffold | Done |
+| 1.1 | Foundation: config, db, logging, models | Done |
+| 1.2 | Router + provider clients + budget enforcement | Done |
 | 1.3 | Pre-market research vertical slice (Alpaca news, Gemini, Discord, scheduler) | Done |
-| 1.4 | Risk manager + Discord slash commands + intraday scan loop | Not started |
+| 1.4a | Risk manager (cash-only, defined-risk, daily loss, max position, kill switch) | Done |
+| 1.4b | Discord slash commands (/status /positions /cash /kill /pause /resume) | Done |
+| 1.4c | Intraday scan loop (DeepSeek V4-Flash, every 15 min RTH, alert-only) | Done |
 | 2 | SPY 0DTE iron condor (backtest → paper) | Not started |
 | 3 | Crypto trend-follow + equity alerts | Not started |
 | 4 | Dashboard + 30-day paper run + Nous Hermes Agent (D-010) | Not started |
@@ -27,15 +28,31 @@ Phase 1.4.
 cd ~/ai-trading-assistant
 source .venv/bin/activate
 
-# Full daemon (Discord bot + scheduler firing at 8am ET Mon-Fri)
+# Full daemon — Discord bot + scheduler (premarket 08:00 ET, intraday every 15 min RTH)
 python -m trademaster.orchestrator
 
-# Smoke test: fire one pre-market briefing now and exit
-python -m trademaster.orchestrator --once
+# Smoke tests
+python -m trademaster.orchestrator --once        # one premarket briefing
+python -m trademaster.orchestrator --scan-once   # one intraday scan
 ```
 
-Requires `.env` populated with `ALPACA_*`, `GOOGLE_API_KEY`, `DISCORD_BOT_TOKEN`,
-and `DISCORD_CHANNEL_RESEARCH` at minimum.
+Requires `.env` populated with `ALPACA_*`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`,
+`DEEPSEEK_API_KEY`, `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_RESEARCH`,
+`DISCORD_CHANNEL_ALERTS`, and `DISCORD_GUILD_ID`. The daemon refuses to start
+if the Alpaca account isn't a cash account (D-001).
+
+## Discord Commands (owner-only)
+
+All slash commands require you to be the bot owner. Synced per-guild.
+
+| Command | What it does |
+|---|---|
+| `/status` | Trading mode, paused state, account snapshot, today's signals + P&L |
+| `/positions` | Open Alpaca positions |
+| `/cash` | Cash, buying power, equity, portfolio value |
+| `/kill` | Emergency flatten — cancel orders + close positions, auto-pause 24h |
+| `/pause <minutes>` | Pause new trades for N minutes |
+| `/resume` | Clear pause |
 
 ## How to Stop the System
 
