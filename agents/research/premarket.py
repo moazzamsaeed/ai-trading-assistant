@@ -13,12 +13,13 @@ from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
-from integrations.alpaca_client import DEFAULT_WATCHLIST, NewsArticle, get_recent_news
+from integrations.alpaca_client import NewsArticle, get_recent_news
 from trademaster.db import Signal as SignalRow
 from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
 from trademaster.models import Signal, SignalAction
 from trademaster.router import TaskType, route_to_model
+from trademaster.watchlist import load_tickers
 
 log = get_logger(__name__)
 
@@ -64,7 +65,7 @@ def _format_news_block(articles: list[NewsArticle]) -> str:
 
 async def run_premarket_briefing(
     *,
-    watchlist: tuple[str, ...] = DEFAULT_WATCHLIST,
+    watchlist: tuple[str, ...] | None = None,
     hours_back: int = 18,
     news_limit: int = 50,
     now: datetime | None = None,
@@ -77,6 +78,8 @@ async def run_premarket_briefing(
     """
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
+    if watchlist is None:
+        watchlist = load_tickers()
 
     articles = await news_fetcher(watchlist, hours_back=hours_back, limit=news_limit)
     log.info(

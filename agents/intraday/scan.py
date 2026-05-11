@@ -17,12 +17,13 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
-from integrations.alpaca_client import DEFAULT_WATCHLIST, NewsArticle, get_recent_news
+from integrations.alpaca_client import NewsArticle, get_recent_news
 from trademaster.db import Signal as SignalRow
 from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
 from trademaster.models import Signal, SignalAction
 from trademaster.router import TaskType, route_to_model
+from trademaster.watchlist import load_tickers
 
 log = get_logger(__name__)
 
@@ -67,7 +68,7 @@ def _format_news(articles: list[NewsArticle]) -> str:
 
 async def run_intraday_scan(
     *,
-    watchlist: tuple[str, ...] = DEFAULT_WATCHLIST,
+    watchlist: tuple[str, ...] | None = None,
     minutes_back: int = 30,
     news_limit: int = 30,
     now: datetime | None = None,
@@ -81,6 +82,8 @@ async def run_intraday_scan(
     """
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
+    if watchlist is None:
+        watchlist = load_tickers()
     hours_back = max(1, (minutes_back + 59) // 60)
 
     articles = await news_fetcher(watchlist, hours_back=hours_back, limit=news_limit)

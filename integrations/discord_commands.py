@@ -18,7 +18,7 @@ from agents.options.executor import execute_approved_pending
 from integrations import alpaca_client
 from integrations.alpaca_client import AccountSnapshot, PositionSnapshot
 from trademaster import pending_orders as po
-from trademaster import risk_manager
+from trademaster import risk_manager, watchlist
 from trademaster.config import get_settings
 from trademaster.db import Signal, make_session_factory
 from trademaster.logging import get_logger
@@ -273,3 +273,39 @@ async def approve(
             f"{result.reason} · trade #{result.trade_id}"
         )
     return f"⚠️ Approved pending #{pending_id} · NOT executed · {result.reason}"
+
+
+# ----------------- /watchlist /watchlist_add /watchlist_remove -----------------
+
+
+def _format_watchlist(tickers: list[str]) -> str:
+    if not tickers:
+        return "**Watchlist:** _(empty)_"
+    return f"**Watchlist ({len(tickers)}):** " + " · ".join(f"`{t}`" for t in tickers)
+
+
+async def watchlist_show() -> str:
+    """`/watchlist` — list current tickers."""
+    return _format_watchlist(watchlist.list_tickers())
+
+
+async def watchlist_add(ticker: str) -> tuple[str, list[str], bool]:
+    """`/watchlist_add SYM` — returns (reply_text, current_list, was_added)."""
+    try:
+        listing, added = watchlist.add_ticker(ticker)
+    except ValueError as e:
+        return f"❌ {e}", watchlist.list_tickers(), False
+    if added:
+        return f"✅ Added `{ticker.upper()}`.\n" + _format_watchlist(listing), listing, True
+    return f"ℹ️ `{ticker.upper()}` was already in the watchlist.", listing, False
+
+
+async def watchlist_remove(ticker: str) -> tuple[str, list[str], bool]:
+    """`/watchlist_remove SYM` — returns (reply_text, current_list, was_removed)."""
+    try:
+        listing, removed = watchlist.remove_ticker(ticker)
+    except ValueError as e:
+        return f"❌ {e}", watchlist.list_tickers(), False
+    if removed:
+        return f"✅ Removed `{ticker.upper()}`.\n" + _format_watchlist(listing), listing, True
+    return f"ℹ️ `{ticker.upper()}` was not in the watchlist.", listing, False

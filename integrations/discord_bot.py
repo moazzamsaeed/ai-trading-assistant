@@ -78,6 +78,7 @@ class TradeMasterBot(commands.Bot):
         self._signals_channel_id = _chan(settings.discord_channel_signals)
         self._trades_channel_id = _chan(settings.discord_channel_trades)
         self._logs_channel_id = _chan(settings.discord_channel_logs)
+        self._watchlist_channel_id = _chan(settings.discord_channel_watchlist)
         self._guild_id = _chan(settings.discord_guild_id)
         self._app_ready = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -135,6 +136,10 @@ class TradeMasterBot(commands.Bot):
     async def post_log(self, text: str) -> None:
         """System-level error or diagnostic."""
         await self.post(self._logs_channel_id, text)
+
+    async def post_watchlist(self, text: str) -> None:
+        """Current watchlist snapshot — posted on add/remove/seed."""
+        await self.post(self._watchlist_channel_id, text)
 
     # ---------- slash commands ----------
 
@@ -221,6 +226,45 @@ class TradeMasterBot(commands.Bot):
                 pending_id, user_label=str(interaction.user)
             )
             await interaction.followup.send(text)
+
+        @tree.command(
+            name="watchlist",
+            description="Show the current ticker watchlist",
+        )
+        @app_commands.check(owner_only)
+        async def _watchlist(interaction: discord.Interaction):
+            text = await discord_commands.watchlist_show()
+            await interaction.response.send_message(text)
+
+        @tree.command(
+            name="watchlist_add",
+            description="Add a ticker to the watchlist",
+        )
+        @app_commands.describe(ticker="Symbol to add (e.g. NVDA, BRK.B)")
+        @app_commands.check(owner_only)
+        async def _watchlist_add(interaction: discord.Interaction, ticker: str):
+            reply, current, changed = await discord_commands.watchlist_add(ticker)
+            await interaction.response.send_message(reply)
+            if changed:
+                await self.post_watchlist(
+                    discord_commands._format_watchlist(current)
+                    + f"\n_changed by {interaction.user}_"
+                )
+
+        @tree.command(
+            name="watchlist_remove",
+            description="Remove a ticker from the watchlist",
+        )
+        @app_commands.describe(ticker="Symbol to remove")
+        @app_commands.check(owner_only)
+        async def _watchlist_remove(interaction: discord.Interaction, ticker: str):
+            reply, current, changed = await discord_commands.watchlist_remove(ticker)
+            await interaction.response.send_message(reply)
+            if changed:
+                await self.post_watchlist(
+                    discord_commands._format_watchlist(current)
+                    + f"\n_changed by {interaction.user}_"
+                )
 
         @tree.error
         async def _on_app_command_error(

@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     discord_channel_research: str = ""
     discord_channel_logs: str = ""
     discord_channel_commands: str = ""
+    discord_channel_watchlist: str = ""
 
     database_url: str = "sqlite:///data/trademaster.db"
 
