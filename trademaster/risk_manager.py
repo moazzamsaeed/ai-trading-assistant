@@ -85,6 +85,27 @@ def count_open_positions(session: Session) -> int:
     return int(session.execute(stmt).scalar_one())
 
 
+def _deployed_capital_usd(session: Session) -> Decimal:
+    """Sum of max-loss × qty across all open trades.
+
+    For defined-risk options spreads (D-001), max_loss_per_contract is
+    stored in `trades.extra` at entry. For equities the notional is the
+    entry cost. Returns Decimal(0) when nothing is open.
+    """
+    stmt = select(Trade).where(Trade.closed_at.is_(None))
+    rows = list(session.execute(stmt).scalars())
+    total = Decimal("0")
+    for row in rows:
+        extra = row.extra or {}
+        if extra.get("structure") == "iron_condor":
+            max_loss_pc = Decimal(str(extra.get("max_loss_per_contract", "0")))
+            total += max_loss_pc * Decimal(str(row.qty))
+        else:
+            # Equities / spot crypto: notional = qty × entry_price
+            total += Decimal(str(row.qty)) * Decimal(str(row.entry_price))
+    return total
+
+
 # ----------------------- defined-risk check -----------------------
 
 
@@ -293,10 +314,29 @@ async def validate_signal(
                 "trading_blocked": account.trading_blocked,
             },
         )
-    if account.cash < order.notional_usd:
+    # 9a. Effective cash is capped at the configured working-capital ceiling
+    # so paper-trade results map 1:1 to a real live account of that size.
+    effective_cash = min(account.cash, settings.trading_capital_usd)
+
+    # 9b. Deployed capital — sum of open trades' notional. The cap applies
+    # against (effective_cash - deployed) so we never over-allocate the
+    # working capital.
+    with factory() as session:
+        deployed = _deployed_capital_usd(session)
+    available = effective_cash - deployed
+
+    if available < order.notional_usd:
         _reject(
-            f"cash ${account.cash} < notional ${order.notional_usd}",
-            {"cash": str(account.cash), "notional_usd": str(order.notional_usd)},
+            f"available capital ${available} < notional ${order.notional_usd} "
+            f"(effective_cash=${effective_cash}, deployed=${deployed}, "
+            f"cap=${settings.trading_capital_usd})",
+            {
+                "account_cash": str(account.cash),
+                "effective_cash": str(effective_cash),
+                "deployed": str(deployed),
+                "available": str(available),
+                "notional_usd": str(order.notional_usd),
+            },
         )
 
     # All checks passed — record approval for audit.

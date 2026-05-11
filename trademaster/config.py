@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     trading_mode: Literal["paper", "live"] = "paper"
     account_type: Literal["cash"] = "cash"
 
+    # Working capital ceiling. The risk manager treats the effective
+    # cash as min(account.cash, trading_capital_usd). Paper account has
+    # $100k but we cap at $5k so paper-trade results map to a real $5k
+    # live account 1:1.
+    trading_capital_usd: Decimal = Field(default=Decimal("5000"), gt=0)
+
     daily_loss_limit_usd: Decimal = Field(default=Decimal("500"), gt=0)
     max_position_size_usd: Decimal = Field(default=Decimal("2000"), gt=0)
     max_concurrent_positions: int = Field(default=5, gt=0)

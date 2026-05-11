@@ -410,7 +410,47 @@ async def test_reject_when_cash_insufficient(session_factory):
             account_fetcher=await _fetch(_account(cash="100")),
             session_factory=session_factory,
         )
-    assert "cash" in str(exc.value).lower()
+    assert "available capital" in str(exc.value).lower()
+
+
+async def test_within_cap_with_huge_alpaca_balance_passes(session_factory):
+    """$100k Alpaca cash + $1500 order + cap $5000 + nothing deployed → approved."""
+    await validate_signal(
+        _open_signal(_equity_order(notional="1500")),
+        account_fetcher=await _fetch(_account(cash="100000")),
+        session_factory=session_factory,
+    )
+    # No raise means success.
+
+
+async def test_trading_capital_cap_rejects_when_deployed_plus_order_exceeds(
+    session_factory,
+):
+    """Cap fires when (deployed + new order) > trading_capital_usd, even with
+    $100k of real cash sitting in the Alpaca account."""
+    # One open IC: 1 contract × $4200 max loss = $4200 deployed.
+    from trademaster.db import Trade
+    with session_factory() as s:
+        s.add(
+            Trade(
+                symbol="SPY", asset_class="option", side="sell",
+                strategy="spy_0dte_ic", qty=Decimal("1"),
+                entry_price=Decimal("80"),
+                extra={"structure": "iron_condor", "max_loss_per_contract": "4200"},
+            )
+        )
+        s.commit()
+
+    # $4200 deployed + $1900 new = $6100 > $5000 cap → reject.
+    with pytest.raises(RiskRejectionError) as exc:
+        await validate_signal(
+            _open_signal(_equity_order(notional="1900")),
+            account_fetcher=await _fetch(_account(cash="100000")),
+            session_factory=session_factory,
+        )
+    msg = str(exc.value).lower()
+    assert "available capital" in msg
+    assert "deployed" in msg
 
 
 # ----------------- validate_signal: approval path -----------------

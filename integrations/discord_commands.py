@@ -66,19 +66,26 @@ async def status(
             f"cash=${account.cash} · buying_power=${account.buying_power} · "
             f"equity=${account.equity} · multiplier={account.multiplier}"
         )
+        effective_cash = min(account.cash, settings.trading_capital_usd)
     except Exception as e:  # noqa: BLE001
         log.warning("status_account_fetch_failed", error=str(e))
         account_line = f"(account fetch failed: {type(e).__name__})"
+        effective_cash = settings.trading_capital_usd
 
     with factory() as session:
         signals_today = _today_signals_count(session)
-        pnl_today = _today_realized_pnl(session)
+        pnl_today = _today_realized_pnl(session).quantize(Decimal("0.01"))
         open_positions = risk_manager.count_open_positions(session)
+        deployed = risk_manager._deployed_capital_usd(session).quantize(Decimal("0.01"))
+
+    available = (effective_cash - deployed).quantize(Decimal("0.01"))
 
     return (
         f"**TradeMaster status** · {paused_text}\n"
         f"mode: `{settings.trading_mode}` · account_type: `{settings.account_type}`\n"
         f"{account_line}\n"
+        f"**working capital:** cap=${settings.trading_capital_usd} · "
+        f"deployed=${deployed} · available=${available}\n"
         f"today: {signals_today} signals · realized P&L: ${pnl_today}\n"
         f"open positions (db): {open_positions} / max {settings.max_concurrent_positions}"
     )
@@ -116,17 +123,32 @@ async def positions(
 async def cash(
     *,
     account_fetcher: AccountFetcher = alpaca_client.get_account,
+    session_factory: Callable[[], Session] | None = None,
 ) -> str:
+    settings = get_settings()
     try:
         a = await account_fetcher()
     except Exception as e:  # noqa: BLE001
         log.warning("cash_fetch_failed", error=str(e))
         return f"⚠️ Failed to fetch account: `{type(e).__name__}: {e}`"
+
+    factory = session_factory or make_session_factory()
+    with factory() as session:
+        deployed = risk_manager._deployed_capital_usd(session).quantize(Decimal("0.01"))
+    effective_cash = min(a.cash, settings.trading_capital_usd)
+    available = (effective_cash - deployed).quantize(Decimal("0.01"))
+
     return (
-        f"**Cash:** ${a.cash}\n"
-        f"**Buying power:** ${a.buying_power}\n"
-        f"**Equity:** ${a.equity}\n"
-        f"**Portfolio value:** ${a.portfolio_value}"
+        f"**Account (Alpaca):**\n"
+        f"• Cash: ${a.cash}\n"
+        f"• Buying power: ${a.buying_power}\n"
+        f"• Equity: ${a.equity}\n"
+        f"• Portfolio value: ${a.portfolio_value}\n"
+        f"\n"
+        f"**Working capital (TradeMaster cap):**\n"
+        f"• Cap: ${settings.trading_capital_usd}\n"
+        f"• Deployed: ${deployed}\n"
+        f"• Available for new trades: ${available}"
     )
 
 
