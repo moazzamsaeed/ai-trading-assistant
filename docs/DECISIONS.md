@@ -198,3 +198,41 @@ approval window is short — pending orders expire automatically after
 in the strategist, we might revisit the auto-execute gate for live mode —
 but always keep `/kill` and `/pause`. The expiry window (15 min) may
 also need tuning based on real-world response latency.
+
+---
+
+## D-015 — Backtest harness uses synthetic data (BS + GBM), not historical Alpaca options
+
+**Decision:** Phase 2.4's backtest harness generates intraday SPY price
+paths via Geometric Brownian Motion and synthesizes option chains
+from Black-Scholes (using `math.erf`, no scipy dependency). Real
+historical 0DTE chains from Alpaca will be added in a later phase as
+a drop-in `price_paths` source — the rest of the simulator code
+(`build_iron_condor`, exit policy, P&L math) stays identical.
+
+**Why:** Three reasons:
+1. **Speed of iteration.** Synthetic data runs locally with no rate
+   limits — a full year sims in seconds. We can sweep parameters
+   (target delta, wing width, IV regime) without API budget concerns.
+2. **Strategy-code coverage.** The backtest reuses `build_iron_condor`
+   from `strategies/`, so refactors to leg selection or credit math
+   are caught immediately. The backtest IS a regression suite.
+3. **Realistic-enough first cut.** GBM + BS doesn't model pin risk,
+   vol skew, or intraday IV shocks, but it's adequate for stress-
+   testing the exit logic (50% PT / 2× stop / 15:50 force-close)
+   and getting an order-of-magnitude win-rate estimate.
+
+**Implication:**
+- `backtests/` package is self-contained: synthetic_options.py
+  (BS math + chain), price_paths.py (GBM), simulator.py (one-day),
+  runner.py (multi-day + stats), cli.py (entry point).
+- Per-file ruff override allows quant-convention single-letter
+  variable names (S, K, T, sigma) in BS math.
+- The backtest's win-rate / expectancy numbers should NOT be used
+  for live position sizing — only the 30-day paper run informs that
+  (D-005).
+
+**When to revisit:** Once Alpaca historical-options access is
+available, add a `from_alpaca_history(date_range)` price-path source
+that pulls real chain snapshots. Compare backtest results between
+synthetic and real to calibrate the synthetic IV assumption.

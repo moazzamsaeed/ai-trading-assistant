@@ -25,7 +25,7 @@ route to `#logs`.
 | 2.3a | Multi-leg order submission + paper-mode auto-execute | Done |
 | 2.3b | Exit monitor (50% PT / 2x stop / 15:50 force-close) | Done |
 | 2.3c | Live-mode approval flow (Discord /approve, /reject, /pending) | Done |
-| 2.4 | Backtest harness | Not started |
+| 2.4 | Backtest harness (BS pricing + GBM paths) | Done |
 | 3 | Crypto trend-follow + equity alerts | Not started |
 | 4 | Dashboard + 30-day paper run + Nous Hermes Agent (D-010) | Not started |
 | 5 | Live deployment review | Not started |
@@ -81,6 +81,28 @@ In paper mode, the strategist auto-executes after risk-manager approval —
 no `/approve` needed. In live mode (`TRADING_MODE=live`), the strategist
 posts an "AWAITING APPROVAL" message to `#trades` and you confirm via
 `/approve N`. Pending orders auto-expire after 15 minutes (D-014).
+
+## Backtesting
+
+The iron-condor strategy can be backtested against synthetic data
+(GBM price paths + Black-Scholes option chains) using `python -m backtests.cli`:
+
+```bash
+python -m backtests.cli --start 2025-01-01 --end 2025-12-31 \
+    --spy 500 --vol 0.15 --iv 0.18 --seed 42 \
+    --csv backtests/results/2025_annual.csv
+```
+
+Outputs summary stats (win rate, expectancy, max drawdown, exit-reason
+breakdown) to stdout and per-day P&L to the CSV. The same
+`build_iron_condor` strategy code that runs in live mode is exercised,
+so backtest results reflect actual production logic.
+
+**Caveat (D-015):** the BS + GBM model is a first cut. Real SPY 0DTE
+chains exhibit pin risk, volatility skew, and intraday IV shifts that
+this synthetic generator doesn't model. Use the backtest to validate
+the exit logic and parameter sensitivity, not to set live capital
+sizing — that comes from the 30-day paper-trade.
 
 ## How to Stop the System
 
