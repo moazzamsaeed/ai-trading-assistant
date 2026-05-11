@@ -12,8 +12,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hermes.llm import anthropic_client, deepseek_client, google_client
-from hermes.llm.types import AuthError, ProviderError, RateLimitError
+from traderouter.llm import anthropic_client, deepseek_client, google_client
+from traderouter.llm.types import AuthError, ProviderError, RateLimitError
 
 # ---------- Anthropic ----------
 

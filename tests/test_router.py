@@ -7,10 +7,10 @@ from decimal import Decimal
 
 import pytest
 
-from hermes import router
-from hermes.config import get_settings
-from hermes.db import AgentRun, Base, make_engine, make_session_factory
-from hermes.llm.types import AuthError, BudgetExceededError, LLMResponse
+from traderouter import router
+from traderouter.config import get_settings
+from traderouter.db import AgentRun, Base, make_engine, make_session_factory
+from traderouter.llm.types import AuthError, BudgetExceededError, LLMResponse
 
 
 @pytest.fixture

@@ -18,7 +18,7 @@ from typing import Any
 from sqlalchemy import JSON, DateTime, ForeignKey, Numeric, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-from hermes.config import get_settings
+from traderouter.config import get_settings
 
 
 def _utcnow() -> datetime:

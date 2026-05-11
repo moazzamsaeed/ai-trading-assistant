@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from hermes.llm.pricing import PRICING, calculate_cost
-from hermes.router import MODEL_MAP
+from traderouter.llm.pricing import PRICING, calculate_cost
+from traderouter.router import MODEL_MAP
 
 
 def test_every_routed_model_has_pricing():

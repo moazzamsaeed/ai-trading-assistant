@@ -9,7 +9,7 @@
 | Phase | Goal | Status |
 |---|---|---|
 | 0 | Repo + scaffold | In progress |
-| 1 | Hermes skeleton + Alpaca MCP + Discord bot + pre-market research agent | Not started |
+| 1 | TradeRouter skeleton + Alpaca MCP + Discord bot + pre-market research agent | Not started |
 | 2 | SPY 0DTE iron condor (backtest → paper) | Not started |
 | 3 | Crypto trend-follow + equity alerts | Not started |
 | 4 | Dashboard + scheduler + 30-day paper run | Not started |
@@ -22,14 +22,14 @@
 ```bash
 cd ~/ai-trading-assistant
 source .venv/bin/activate
-python -m hermes.orchestrator
+python -m traderouter.orchestrator
 ```
 
 ## How to Stop the System
 
 ```bash
-# Graceful: send SIGTERM, Hermes flushes positions log and exits
-pkill -TERM -f "hermes.orchestrator"
+# Graceful: send SIGTERM, TradeRouter flushes positions log and exits
+pkill -TERM -f "traderouter.orchestrator"
 ```
 
 ## Kill Switch (Emergency)
@@ -48,29 +48,29 @@ This:
 
 ## What to Do If…
 
-### Hermes crashes mid-trade
-- Check `data/hermes.log` for the last action
-- Run `python -m hermes.recover` (planned for Phase 4) — reconciles in-memory state with Alpaca
+### TradeRouter crashes mid-trade
+- Check `data/traderouter.log` for the last action
+- Run `python -m traderouter.recover` (planned for Phase 4) — reconciles in-memory state with Alpaca
 - If positions are open and you can't recover, use Alpaca dashboard to flatten manually
 
 ### Discord bot is offline
-- Check `systemctl status hermes-discord` (if systemd-managed)
-- Bot disconnection does not stop trading — Hermes continues. Bot is for alerts only.
+- Check `systemctl status traderouter-discord` (if systemd-managed)
+- Bot disconnection does not stop trading — TradeRouter continues. Bot is for alerts only.
 
 ### Loss limit hit
-- Hermes halts automatically and posts to `#alerts`
+- TradeRouter halts automatically and posts to `#alerts`
 - All open positions are flattened
 - Trading does not resume until next trading day OR manual `/resume`
 
 ### NUC reboots
-- systemd restarts Hermes automatically (configured in Phase 4)
-- On startup, Hermes reconciles position state with Alpaca before accepting new signals
+- systemd restarts TradeRouter automatically (configured in Phase 4)
+- On startup, TradeRouter reconciles position state with Alpaca before accepting new signals
 
 ## Monitoring
 
 - **Dashboard:** http://nuc.local:3000 (or your NUC's IP)
-- **Logs:** `data/hermes.log`
-- **DB inspection:** `sqlite3 data/hermes.db`
+- **Logs:** `data/traderouter.log`
+- **DB inspection:** `sqlite3 data/traderouter.db`
 - **Discord:** all human-relevant events posted to channels
 
 ## Manual Overrides (Discord commands)

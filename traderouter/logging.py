@@ -11,7 +11,7 @@ import sys
 
 import structlog
 
-from hermes.config import get_settings
+from traderouter.config import get_settings
 
 
 def configure_logging() -> None:

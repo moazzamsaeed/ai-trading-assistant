@@ -18,10 +18,10 @@ from tenacity import (
     wait_exponential,
 )
 
-from hermes.config import get_settings
-from hermes.llm.pricing import calculate_cost
-from hermes.llm.types import AuthError, LLMResponse, ProviderError, RateLimitError
-from hermes.logging import get_logger
+from traderouter.config import get_settings
+from traderouter.llm.pricing import calculate_cost
+from traderouter.llm.types import AuthError, LLMResponse, ProviderError, RateLimitError
+from traderouter.logging import get_logger
 
 log = get_logger(__name__)
 

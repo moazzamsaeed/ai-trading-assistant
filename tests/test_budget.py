@@ -7,10 +7,10 @@ from decimal import Decimal
 
 import pytest
 
-from hermes.config import get_settings
-from hermes.db import AgentRun, Base, make_engine, make_session_factory
-from hermes.llm.budget import check_budget, current_month_spend_usd
-from hermes.llm.types import BudgetExceededError
+from traderouter.config import get_settings
+from traderouter.db import AgentRun, Base, make_engine, make_session_factory
+from traderouter.llm.budget import check_budget, current_month_spend_usd
+from traderouter.llm.types import BudgetExceededError
 
 
 @pytest.fixture
