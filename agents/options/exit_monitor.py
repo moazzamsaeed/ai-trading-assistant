@@ -273,7 +273,10 @@ async def run_exit_monitor(
 
         actual_debit = exit_debit
         if final.filled_avg_price is not None:
-            actual_debit = (final.filled_avg_price * Decimal("100")).quantize(
+            # Closing an IC is a net DEBIT (buying back the spread). Alpaca
+            # returns a positive per-share price for debit fills; take abs as
+            # a safety net in case the sign convention varies.
+            actual_debit = abs(final.filled_avg_price * Decimal("100")).quantize(
                 Decimal("0.01")
             )
 

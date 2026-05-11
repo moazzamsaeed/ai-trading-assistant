@@ -55,10 +55,15 @@ class ExecutionResult:
 def _net_credit_per_contract_at_fill(
     plan_credit_per_contract: Decimal, filled_avg_price: Decimal | None
 ) -> Decimal:
-    """Convert Alpaca's per-share fill price back to per-contract credit ($)."""
+    """Convert Alpaca's per-share fill price back to per-contract credit ($).
+
+    Alpaca returns a NEGATIVE per-share price for credit fills (e.g. -0.18
+    for an $18-per-contract credit) since the order is "buy" the spread at
+    a negative net price. We always want the positive credit value here.
+    """
     if filled_avg_price is None:
         return plan_credit_per_contract
-    return (filled_avg_price * Decimal("100")).quantize(Decimal("0.01"))
+    return abs(filled_avg_price * Decimal("100")).quantize(Decimal("0.01"))
 
 
 def _persist_trade(

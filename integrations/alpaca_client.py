@@ -453,13 +453,14 @@ class OrderResult:
 
 
 def _to_order_result(raw) -> OrderResult:
+    raw_status_field = getattr(raw, "status", "")
     return OrderResult(
         order_id=str(getattr(raw, "id", "")),
-        status=str(getattr(raw, "status", "")).lower(),
+        status=_enum_str(raw_status_field).lower(),
         filled_avg_price=_to_decimal(getattr(raw, "filled_avg_price", None)),
         filled_qty=_to_decimal(getattr(raw, "filled_qty", 0)) or Decimal("0"),
         submitted_at=getattr(raw, "submitted_at", datetime.now(UTC)),
-        raw_status=str(getattr(raw, "status", "")),
+        raw_status=_enum_str(raw_status_field),
     )
 
 
