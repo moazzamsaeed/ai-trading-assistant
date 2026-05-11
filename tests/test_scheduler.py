@@ -336,3 +336,102 @@ async def test_run_iron_condor_once(monkeypatch):
     monkeypatch.setattr(sch, "run_iron_condor_strategist", fake_strat)
     await sch.run_iron_condor_once(poster, clock_fetcher=clock_open)
     assert posted == ["alert"]
+
+
+# ----------------- exit monitor -----------------
+
+
+def test_scheduler_registers_exit_jobs():
+    scheduler = sch.make_scheduler(_noop_poster, _noop_poster)
+    monitor = scheduler.get_job("iron_condor_exit")
+    force = scheduler.get_job("iron_condor_force_close")
+    assert monitor is not None
+    assert force is not None
+    f_fields = {f.name: str(f) for f in force.trigger.fields}
+    assert f_fields["hour"] == "15"
+    assert f_fields["minute"] == "50"
+
+
+async def test_exit_job_posts_when_trades_closed(monkeypatch):
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def fake_monitor(**_kwargs):
+        return [
+            {
+                "trade_id": 1,
+                "status": "closed",
+                "reason": "profit_target_50pct",
+                "exit_debit": "40.00",
+                "realized_pnl_per_contract": "40.00",
+            }
+        ]
+
+    monkeypatch.setattr(sch, "run_exit_monitor", fake_monitor)
+    await sch._iron_condor_exit_job(alert_poster=poster, clock_fetcher=clock_open)
+    assert len(posted) == 1
+    assert "trade #1" in posted[0]
+    assert "profit_target_50pct" in posted[0]
+
+
+async def test_exit_job_silent_when_nothing_closed(monkeypatch):
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def fake_monitor(**_kwargs):
+        return [{"trade_id": 1, "status": "hold"}]
+
+    monkeypatch.setattr(sch, "run_exit_monitor", fake_monitor)
+    await sch._iron_condor_exit_job(alert_poster=poster, clock_fetcher=clock_open)
+    assert posted == []
+
+
+async def test_force_close_skips_clock_check(monkeypatch):
+    """force=True must work even when market is closed (e.g., after-hours sweep)."""
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    async def clock_closed() -> MarketClock:
+        return _clock(False)
+
+    async def fake_monitor(**kwargs):
+        # force_close should be passed True.
+        assert kwargs.get("force_close") is True
+        return []
+
+    monkeypatch.setattr(sch, "run_exit_monitor", fake_monitor)
+    await sch._iron_condor_exit_job(
+        alert_poster=poster, clock_fetcher=clock_closed, force=True
+    )
+    # no closures → no message
+    assert posted == []
+
+
+async def test_exit_job_swallows_exception(monkeypatch):
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def boom(**_kwargs):
+        raise RuntimeError("alpaca quotes down")
+
+    monkeypatch.setattr(sch, "run_exit_monitor", boom)
+    await sch._iron_condor_exit_job(alert_poster=poster, clock_fetcher=clock_open)
+    assert len(posted) == 1
+    assert "failed" in posted[0].lower()

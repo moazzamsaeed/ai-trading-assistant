@@ -20,7 +20,9 @@ to `#alerts`. Order submission is Phase 2.3.
 | 1.4c | Intraday scan loop (DeepSeek V4-Flash, every 15 min RTH, alert-only) | Done |
 | 2.1 | Options chain wrapper + iron-condor leg construction | Done |
 | 2.2 | Options strategist agent + entry-window scheduler (alert-only) | Done |
-| 2.3 | Multi-leg order submission + exit monitor + paper-mode auto-execute | Not started |
+| 2.3a | Multi-leg order submission + paper-mode auto-execute | Done |
+| 2.3b | Exit monitor (50% PT / 2x stop / 15:50 force-close) | Done |
+| 2.3c | Live-mode approval flow (Discord /approve, /reject) | Not started |
 | 2.4 | Backtest harness | Not started |
 | 3 | Crypto trend-follow + equity alerts | Not started |
 | 4 | Dashboard + 30-day paper run + Nous Hermes Agent (D-010) | Not started |
