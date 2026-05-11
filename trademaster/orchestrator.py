@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import signal
 
-from integrations.discord_bot import DiscordPoster
+from integrations.discord_bot import TradeMasterBot
 from trademaster.config import get_settings
 from trademaster.logging import configure_logging, get_logger
 from trademaster.scheduler import make_scheduler, run_premarket_once
@@ -27,7 +27,7 @@ async def _run() -> None:
     settings = get_settings()
     settings.require_live_keys()
 
-    async with DiscordPoster() as poster:
+    async with TradeMasterBot() as poster:
         scheduler = make_scheduler(poster.post_research)
         scheduler.start()
         log.info("trademaster_started", trading_mode=settings.trading_mode)
@@ -56,7 +56,7 @@ async def _run_once() -> None:
     """
     configure_logging()
     get_settings().require_live_keys()
-    async with DiscordPoster() as poster:
+    async with TradeMasterBot() as poster:
         await run_premarket_once(poster.post_research)
 
 

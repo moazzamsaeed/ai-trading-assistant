@@ -1,11 +1,12 @@
-"""Minimal Discord bot.
+"""TradeMaster Discord bot.
 
-Phase 1.3 scope: connect to Discord, post a long-form message to
-#research when called. Slash commands (`/kill`, `/approve`, `/status`,
-etc.) land in Phase 1.4 alongside the risk-manager wiring.
+Replaces the Phase 1.3 `DiscordPoster` Client with a `commands.Bot` that
+adds slash commands. Posting helpers preserved so the scheduler keeps
+its existing `poster.post_research(text)` interface.
 
-Discord limits a single message to 2000 chars; long briefings are split
-on paragraph boundaries.
+Authorization: every slash command is bot-owner-only. Other guild members
+cannot execute them. The owner ID is auto-detected from the bot's
+application info on first ready event.
 """
 
 from __future__ import annotations
@@ -14,7 +15,10 @@ import asyncio
 import contextlib
 
 import discord
+from discord import app_commands
+from discord.ext import commands
 
+from integrations import discord_commands
 from trademaster.config import get_settings
 from trademaster.logging import get_logger
 
@@ -38,7 +42,6 @@ def _split_for_discord(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
         if buf:
             chunks.append(buf)
             buf = ""
-        # Single paragraph longer than limit — hard split.
         while len(para) > limit:
             chunks.append(para[:limit])
             para = para[limit:]
@@ -48,53 +51,134 @@ def _split_for_discord(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
-class DiscordPoster:
-    """Thin async client that connects to Discord and exposes `post(channel, text)`.
+class TradeMasterBot(commands.Bot):
+    """Bot with slash commands + post helpers.
 
-    Designed to share an event loop with the scheduler. Use `async with`:
+    Use as an async context manager so the asyncio loop drives the
+    underlying client lifecycle:
 
-        async with DiscordPoster() as poster:
-            await poster.post_research("hello")
+        async with TradeMasterBot() as bot:
+            await bot.post_research("hello")
             ...
     """
 
-    def __init__(self, token: str | None = None) -> None:
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        super().__init__(command_prefix="!", intents=intents)
         settings = get_settings()
-        self._token = token or settings.discord_bot_token.get_secret_value()
+        self._token = settings.discord_bot_token.get_secret_value()
         self._research_channel_id = (
             int(settings.discord_channel_research) if settings.discord_channel_research else 0
         )
-        intents = discord.Intents.default()
-        self._client = discord.Client(intents=intents)
+        self._guild_id = int(settings.discord_guild_id) if settings.discord_guild_id else 0
         self._ready = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self._register_commands()
 
-        @self._client.event
-        async def on_ready() -> None:
-            log.info("discord_ready", user=str(self._client.user))
-            self._ready.set()
+    async def on_ready(self) -> None:
+        log.info("discord_ready", user=str(self.user))
+        # Sync slash commands. Per-guild sync is fast; global takes up to an hour.
+        if self._guild_id:
+            guild = discord.Object(id=self._guild_id)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+        else:
+            synced = await self.tree.sync()
+        log.info("discord_commands_synced", count=len(synced))
+        self._ready.set()
 
-    async def __aenter__(self) -> DiscordPoster:
+    # ---------- lifecycle ----------
+
+    async def __aenter__(self) -> TradeMasterBot:
         if not self._token:
             raise RuntimeError("DISCORD_BOT_TOKEN is empty")
-        self._task = asyncio.create_task(self._client.start(self._token))
+        self._task = asyncio.create_task(self.start(self._token))
         await self._ready.wait()
         return self
 
     async def __aexit__(self, *_exc) -> None:
-        await self._client.close()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._task
+        await self.close()
+        if self._task:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+
+    # ---------- post helpers ----------
 
     async def post(self, channel_id: int, text: str) -> None:
         if channel_id == 0:
             log.warning("discord_post_skipped_no_channel")
             return
-        channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
-            channel_id
-        )
+        channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
         for chunk in _split_for_discord(text):
             await channel.send(chunk)
         log.info("discord_posted", channel_id=channel_id, chars=len(text))
 
     async def post_research(self, text: str) -> None:
         await self.post(self._research_channel_id, text)
+
+    # ---------- slash commands ----------
+
+    def _register_commands(self) -> None:
+        async def owner_only(interaction: discord.Interaction) -> bool:
+            app = await self.application_info()
+            return interaction.user.id == app.owner.id
+
+        tree = self.tree
+
+        @tree.command(name="status", description="Show TradeMaster status")
+        @app_commands.check(owner_only)
+        async def _status(interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True)
+            text = await discord_commands.status()
+            await interaction.followup.send(text)
+
+        @tree.command(name="positions", description="List open Alpaca positions")
+        @app_commands.check(owner_only)
+        async def _positions(interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True)
+            text = await discord_commands.positions()
+            await interaction.followup.send(text)
+
+        @tree.command(name="cash", description="Show account cash, buying power, equity")
+        @app_commands.check(owner_only)
+        async def _cash(interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True)
+            text = await discord_commands.cash()
+            await interaction.followup.send(text)
+
+        @tree.command(
+            name="kill",
+            description="EMERGENCY: cancel all orders, close all positions, pause 24h",
+        )
+        @app_commands.check(owner_only)
+        async def _kill(interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True)
+            text = await discord_commands.kill(
+                reason=f"discord /kill by {interaction.user}"
+            )
+            await interaction.followup.send(text)
+
+        @tree.command(name="pause", description="Pause new trades for N minutes")
+        @app_commands.describe(minutes="How many minutes to pause (1-1440)")
+        @app_commands.check(owner_only)
+        async def _pause(interaction: discord.Interaction, minutes: int):
+            await interaction.response.send_message(await discord_commands.pause(minutes))
+
+        @tree.command(name="resume", description="Resume trading after a pause")
+        @app_commands.check(owner_only)
+        async def _resume(interaction: discord.Interaction):
+            await interaction.response.send_message(await discord_commands.resume())
+
+        @tree.error
+        async def _on_app_command_error(
+            interaction: discord.Interaction, error: app_commands.AppCommandError
+        ):
+            if isinstance(error, app_commands.CheckFailure):
+                msg = "🔒 This command is owner-only."
+            else:
+                log.error("app_command_error", error=str(error))
+                msg = f"⚠️ Command error: `{type(error).__name__}: {error}`"
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
