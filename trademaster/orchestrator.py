@@ -27,6 +27,7 @@ from trademaster.logging import configure_logging, get_logger
 from trademaster.risk_manager import validate_account_is_cash
 from trademaster.scheduler import (
     make_scheduler,
+    run_directional_once,
     run_intraday_once,
     run_iron_condor_once,
     run_premarket_once,
@@ -93,6 +94,13 @@ async def _run_iron_condor_once() -> None:
         )
 
 
+async def _run_directional_once() -> None:
+    configure_logging()
+    get_settings().require_live_keys()
+    async with TradeMasterBot() as bot:
+        await run_directional_once(bot.post_signal, log_poster=bot.post_log)
+
+
 def main() -> None:
     import sys
 
@@ -102,6 +110,8 @@ def main() -> None:
         asyncio.run(_run_scan_once())
     elif "--ic-once" in sys.argv:
         asyncio.run(_run_iron_condor_once())
+    elif "--dir-once" in sys.argv:
+        asyncio.run(_run_directional_once())
     else:
         asyncio.run(_run())
 

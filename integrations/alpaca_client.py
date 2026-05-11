@@ -23,8 +23,10 @@ from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import (
     NewsRequest,
     OptionChainRequest,
+    StockBarsRequest,
     StockLatestQuoteRequest,
 )
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
     OrderClass,
@@ -618,3 +620,66 @@ async def wait_for_order(
         await asyncio.sleep(poll_interval_s)
     # Unreachable; mypy appeasement.
     return last  # type: ignore[return-value]
+
+
+# ====================================================================
+# Stock bars (for technical indicators)
+# ====================================================================
+
+
+@dataclass(frozen=True)
+class Bar:
+    """One OHLCV bar."""
+
+    timestamp: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int
+    vwap: Decimal | None
+
+
+def _to_bar(raw) -> Bar:
+    return Bar(
+        timestamp=getattr(raw, "timestamp", datetime.now(UTC)),
+        open=_to_decimal(getattr(raw, "open", 0)) or Decimal("0"),
+        high=_to_decimal(getattr(raw, "high", 0)) or Decimal("0"),
+        low=_to_decimal(getattr(raw, "low", 0)) or Decimal("0"),
+        close=_to_decimal(getattr(raw, "close", 0)) or Decimal("0"),
+        volume=int(getattr(raw, "volume", 0) or 0),
+        vwap=_to_decimal(getattr(raw, "vwap", None)),
+    )
+
+
+async def get_recent_bars(
+    symbol: str,
+    *,
+    timeframe_minutes: int = 5,
+    limit: int = 30,
+) -> list[Bar]:
+    """Fetch the last `limit` bars at `timeframe_minutes` granularity.
+
+    Returns oldest-first. Defaults match the intraday agent (5-min × 30 bars
+    = 2.5 hours of recent action).
+    """
+
+    def _fetch() -> list[Bar]:
+        tf = TimeFrame(timeframe_minutes, TimeFrameUnit.Minute)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            limit=limit,
+        )
+        resp = _stock_client().get_stock_bars(req)
+        # BarSet is dict[symbol -> list[Bar]] or has a .data attribute
+        if isinstance(resp, dict):
+            raw_bars = resp.get(symbol, [])
+        elif hasattr(resp, "data"):
+            raw_bars = resp.data.get(symbol, []) if isinstance(resp.data, dict) else resp.data
+        else:
+            raw_bars = []
+        bars = [_to_bar(b) for b in raw_bars]
+        return bars
+
+    return await asyncio.to_thread(_fetch)

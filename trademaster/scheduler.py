@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from agents.directional.intraday import run_directional_scan
 from agents.intraday.scan import run_intraday_scan
 from agents.options.exit_monitor import run_exit_monitor
 from agents.options.strategist import run_iron_condor_strategist
@@ -92,6 +93,47 @@ async def _intraday_scan_job(
 
     if alert_text:
         await signal_poster(alert_text)
+
+
+# ----------------- directional intraday signals -----------------
+
+
+async def _directional_scan_job(
+    *,
+    signal_poster: Poster,
+    log_poster: Poster = _noop_poster,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+) -> None:
+    """Sweep watchlist every 10 min, post actionable BUY signals to #signals."""
+    if get_state().is_paused():
+        log.info("directional_scan_skipped_paused")
+        return
+
+    try:
+        clock = await clock_fetcher()
+    except Exception as e:  # noqa: BLE001
+        log.warning("directional_scan_clock_failed", error=str(e))
+        return
+
+    if not clock.is_open:
+        log.info("directional_scan_skipped_closed", next_open=str(clock.next_open))
+        return
+
+    try:
+        _decisions, messages = await run_directional_scan()
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "directional_scan_failed",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        await log_poster(
+            f"⚠️ Directional intraday scan failed: `{type(e).__name__}: {e}`"
+        )
+        return
+
+    for msg in messages:
+        await signal_poster(msg)
 
 
 # ----------------- iron-condor strategist -----------------
@@ -230,6 +272,21 @@ def make_scheduler(
         misfire_grace_time=120,
     )
 
+    # Directional intraday signals — every 10 min during RTH, Mon-Fri.
+    scheduler.add_job(
+        _directional_scan_job,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            minute="0,10,20,30,40,50",
+            timezone=PREMARKET_TZ,
+        ),
+        kwargs={"signal_poster": signal_poster, "log_poster": log_post},
+        id="directional_scan",
+        replace_existing=True,
+        misfire_grace_time=120,
+    )
+
     # Iron-condor entry: 9:45 ET Mon-Fri (STRATEGIES.md 9:45-10:30 window).
     scheduler.add_job(
         _iron_condor_entry_job,
@@ -312,6 +369,20 @@ async def run_intraday_once(
 ) -> None:
     """Trigger the intraday-scan job immediately."""
     await _intraday_scan_job(
+        signal_poster=signal_poster,
+        log_poster=log_poster or _noop_poster,
+        clock_fetcher=clock_fetcher,
+    )
+
+
+async def run_directional_once(
+    signal_poster: Poster,
+    *,
+    log_poster: Poster | None = None,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+) -> None:
+    """Trigger the directional-intraday scan immediately."""
+    await _directional_scan_job(
         signal_poster=signal_poster,
         log_poster=log_poster or _noop_poster,
         clock_fetcher=clock_fetcher,
