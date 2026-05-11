@@ -16,6 +16,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from agents.intraday.scan import run_intraday_scan
+from agents.options.strategist import run_iron_condor_strategist
 from agents.research.premarket import run_premarket_briefing
 from integrations import alpaca_client
 from trademaster.logging import get_logger
@@ -79,6 +80,47 @@ async def _intraday_scan_job(
         await alert_poster(alert_text)
 
 
+# ----------------- iron-condor strategist -----------------
+
+
+async def _iron_condor_entry_job(
+    *,
+    alert_poster: Callable[[str], Awaitable[None]],
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+) -> None:
+    """Run the iron-condor strategist once. Posts to #alerts if approved."""
+    state = get_state()
+    if state.is_paused():
+        log.info("iron_condor_skipped_paused", paused_until=str(state.paused_until))
+        return
+
+    try:
+        clock = await clock_fetcher()
+    except Exception as e:  # noqa: BLE001
+        log.warning("iron_condor_clock_failed", error=str(e))
+        return
+
+    if not clock.is_open:
+        log.info("iron_condor_skipped_closed", next_open=str(clock.next_open))
+        return
+
+    try:
+        _signal, alert_text = await run_iron_condor_strategist()
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "iron_condor_strategist_failed",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        await alert_poster(
+            f"⚠️ Iron-condor strategist failed: `{type(e).__name__}: {e}`"
+        )
+        return
+
+    if alert_text:
+        await alert_poster(alert_text)
+
+
 # ----------------- scheduler builder -----------------
 
 
@@ -122,6 +164,22 @@ def make_scheduler(
         misfire_grace_time=120,
     )
 
+    # Iron-condor entry: 9:45 ET, Mon-Fri (matches STRATEGIES.md 9:45-10:30
+    # window — using the early edge of the window to leave time for fills).
+    scheduler.add_job(
+        _iron_condor_entry_job,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour=9,
+            minute=45,
+            timezone=PREMARKET_TZ,
+        ),
+        kwargs={"alert_poster": alert_poster},
+        id="iron_condor_entry",
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+
     log.info("scheduler_built", jobs=[j.id for j in scheduler.get_jobs()])
     return scheduler
 
@@ -141,3 +199,12 @@ async def run_intraday_once(
 ) -> None:
     """Trigger the intraday-scan job immediately."""
     await _intraday_scan_job(alert_poster=alert_poster, clock_fetcher=clock_fetcher)
+
+
+async def run_iron_condor_once(
+    alert_poster: Callable[[str], Awaitable[None]],
+    *,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+) -> None:
+    """Trigger the iron-condor entry job immediately."""
+    await _iron_condor_entry_job(alert_poster=alert_poster, clock_fetcher=clock_fetcher)

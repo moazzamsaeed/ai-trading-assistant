@@ -2,9 +2,10 @@
 
 ## Current Phase
 
-**Phase 1 complete.** Foundation, router with budget, pre-market briefing,
-risk manager, Discord slash commands, and intraday scan loop are all wired
-end-to-end. Trade execution (iron condors) is Phase 2.
+**Phase 2.2 — iron-condor strategist live (alert-only).** The strategist
+agent pulls SPY + chain at 9:45 ET Mon-Fri, asks DeepSeek V4-Pro to confirm,
+runs the candidate through the risk manager, and posts an approved plan
+to `#alerts`. Order submission is Phase 2.3.
 
 ## Build Phases
 
@@ -17,7 +18,10 @@ end-to-end. Trade execution (iron condors) is Phase 2.
 | 1.4a | Risk manager (cash-only, defined-risk, daily loss, max position, kill switch) | Done |
 | 1.4b | Discord slash commands (/status /positions /cash /kill /pause /resume) | Done |
 | 1.4c | Intraday scan loop (DeepSeek V4-Flash, every 15 min RTH, alert-only) | Done |
-| 2 | SPY 0DTE iron condor (backtest → paper) | Not started |
+| 2.1 | Options chain wrapper + iron-condor leg construction | Done |
+| 2.2 | Options strategist agent + entry-window scheduler (alert-only) | Done |
+| 2.3 | Multi-leg order submission + exit monitor + paper-mode auto-execute | Not started |
+| 2.4 | Backtest harness | Not started |
 | 3 | Crypto trend-follow + equity alerts | Not started |
 | 4 | Dashboard + 30-day paper run + Nous Hermes Agent (D-010) | Not started |
 | 5 | Live deployment review | Not started |
@@ -34,6 +38,7 @@ python -m trademaster.orchestrator
 # Smoke tests
 python -m trademaster.orchestrator --once        # one premarket briefing
 python -m trademaster.orchestrator --scan-once   # one intraday scan
+python -m trademaster.orchestrator --ic-once     # one iron-condor strategist run
 ```
 
 Requires `.env` populated with `ALPACA_*`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`,

@@ -18,7 +18,12 @@ from decimal import Decimal
 
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import NewsRequest, OptionChainRequest
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import (
+    NewsRequest,
+    OptionChainRequest,
+    StockLatestQuoteRequest,
+)
 from alpaca.trading.client import TradingClient
 
 from trademaster.config import get_settings
@@ -355,5 +360,50 @@ async def get_options_chain(
                 quotes.append(q)
         quotes.sort(key=lambda q: (q.option_type, q.strike))
         return quotes
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ====================================================================
+# Stock quotes
+# ====================================================================
+
+
+@dataclass(frozen=True)
+class StockQuote:
+    symbol: str
+    bid: Decimal
+    ask: Decimal
+    mid: Decimal
+    timestamp: datetime
+
+
+def _stock_client() -> StockHistoricalDataClient:
+    settings = get_settings()
+    return StockHistoricalDataClient(
+        api_key=settings.alpaca_api_key.get_secret_value(),
+        secret_key=settings.alpaca_api_secret.get_secret_value(),
+    )
+
+
+async def get_latest_stock_quote(symbol: str) -> StockQuote:
+    """Return the latest top-of-book quote for `symbol`."""
+
+    def _fetch() -> StockQuote:
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        resp = _stock_client().get_stock_latest_quote(req)
+        # alpaca-py returns dict[symbol -> Quote]
+        q = resp.get(symbol) if isinstance(resp, dict) else None
+        if q is None:
+            raise RuntimeError(f"no quote returned for {symbol}")
+        bid = _to_decimal(getattr(q, "bid_price", None)) or Decimal("0")
+        ask = _to_decimal(getattr(q, "ask_price", None)) or Decimal("0")
+        return StockQuote(
+            symbol=symbol,
+            bid=bid,
+            ask=ask,
+            mid=(bid + ask) / 2 if (bid > 0 and ask > 0) else (bid or ask),
+            timestamp=getattr(q, "timestamp", datetime.now(UTC)),
+        )
 
     return await asyncio.to_thread(_fetch)

@@ -215,3 +215,124 @@ async def test_run_intraday_once(monkeypatch):
     monkeypatch.setattr(sch, "run_intraday_scan", fake_scan)
     await sch.run_intraday_once(poster, clock_fetcher=clock_open)
     assert posted == ["alert"]
+
+
+# ----------------- iron condor entry -----------------
+
+
+def test_make_scheduler_registers_iron_condor_job():
+    scheduler = sch.make_scheduler(_noop_poster, _noop_poster)
+    job = scheduler.get_job("iron_condor_entry")
+    assert job is not None
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert fields["day_of_week"] == "mon-fri"
+    assert fields["hour"] == "9"
+    assert fields["minute"] == "45"
+
+
+async def test_iron_condor_job_skipped_when_paused(monkeypatch):
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    get_state().paused_until = datetime.now(UTC) + timedelta(minutes=30)
+
+    async def boom_strat(**_kwargs):
+        raise AssertionError("strategist must not run when paused")
+
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", boom_strat)
+    await sch._iron_condor_entry_job(
+        alert_poster=poster, clock_fetcher=lambda: _async(_clock(True))
+    )
+    assert posted == []
+
+
+async def test_iron_condor_job_skipped_when_market_closed(monkeypatch):
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    async def clock_closed() -> MarketClock:
+        return _clock(False)
+
+    async def boom_strat(**_kwargs):
+        raise AssertionError("strategist must not run when closed")
+
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", boom_strat)
+    await sch._iron_condor_entry_job(alert_poster=poster, clock_fetcher=clock_closed)
+    assert posted == []
+
+
+async def test_iron_condor_job_posts_alert_when_strategist_approves(monkeypatch):
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def fake_strat(**_kwargs):
+        return object(), "📋 candidate"
+
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", fake_strat)
+    await sch._iron_condor_entry_job(alert_poster=poster, clock_fetcher=clock_open)
+    assert posted == ["📋 candidate"]
+
+
+async def test_iron_condor_job_silent_on_hold(monkeypatch):
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def fake_strat(**_kwargs):
+        return object(), None  # HOLD
+
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", fake_strat)
+    await sch._iron_condor_entry_job(alert_poster=poster, clock_fetcher=clock_open)
+    assert posted == []
+
+
+async def test_iron_condor_job_swallows_exception(monkeypatch):
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def boom(**_kwargs):
+        raise RuntimeError("chain fetch failed")
+
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", boom)
+    await sch._iron_condor_entry_job(alert_poster=poster, clock_fetcher=clock_open)
+    assert len(posted) == 1
+    assert "failed" in posted[0].lower()
+
+
+async def _async(value):
+    return value
+
+
+async def test_run_iron_condor_once(monkeypatch):
+    posted: list[str] = []
+
+    async def poster(text: str) -> None:
+        posted.append(text)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def fake_strat(**_kwargs):
+        return object(), "alert"
+
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", fake_strat)
+    await sch.run_iron_condor_once(poster, clock_fetcher=clock_open)
+    assert posted == ["alert"]

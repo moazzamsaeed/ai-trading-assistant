@@ -19,7 +19,12 @@ from integrations.discord_bot import TradeMasterBot
 from trademaster.config import get_settings
 from trademaster.logging import configure_logging, get_logger
 from trademaster.risk_manager import validate_account_is_cash
-from trademaster.scheduler import make_scheduler, run_intraday_once, run_premarket_once
+from trademaster.scheduler import (
+    make_scheduler,
+    run_intraday_once,
+    run_iron_condor_once,
+    run_premarket_once,
+)
 
 log = get_logger(__name__)
 
@@ -71,6 +76,13 @@ async def _run_scan_once() -> None:
         await run_intraday_once(bot.post_alert)
 
 
+async def _run_iron_condor_once() -> None:
+    configure_logging()
+    get_settings().require_live_keys()
+    async with TradeMasterBot() as bot:
+        await run_iron_condor_once(bot.post_alert)
+
+
 def main() -> None:
     import sys
 
@@ -78,6 +90,8 @@ def main() -> None:
         asyncio.run(_run_premarket_once())
     elif "--scan-once" in sys.argv:
         asyncio.run(_run_scan_once())
+    elif "--ic-once" in sys.argv:
+        asyncio.run(_run_iron_condor_once())
     else:
         asyncio.run(_run())
 
