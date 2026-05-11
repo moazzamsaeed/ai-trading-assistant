@@ -25,6 +25,13 @@ from alpaca.data.requests import (
     StockLatestQuoteRequest,
 )
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import (
+    OrderClass,
+    OrderSide,
+    PositionIntent,
+    TimeInForce,
+)
+from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
 
 from trademaster.config import get_settings
 from trademaster.logging import get_logger
@@ -407,3 +414,198 @@ async def get_latest_stock_quote(symbol: str) -> StockQuote:
         )
 
     return await asyncio.to_thread(_fetch)
+
+
+# ====================================================================
+# Multi-leg option orders (iron condor entries + exits)
+# ====================================================================
+
+
+# Statuses that mean the order is settled — no need to keep polling.
+_TERMINAL_ORDER_STATUSES = {
+    "filled",
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+    "done_for_day",
+    "replaced",
+    "suspended",
+}
+
+
+@dataclass(frozen=True)
+class OrderResult:
+    order_id: str
+    status: str
+    filled_avg_price: Decimal | None
+    filled_qty: Decimal
+    submitted_at: datetime
+    raw_status: str  # exact string Alpaca returned
+
+
+def _to_order_result(raw) -> OrderResult:
+    return OrderResult(
+        order_id=str(getattr(raw, "id", "")),
+        status=str(getattr(raw, "status", "")).lower(),
+        filled_avg_price=_to_decimal(getattr(raw, "filled_avg_price", None)),
+        filled_qty=_to_decimal(getattr(raw, "filled_qty", 0)) or Decimal("0"),
+        submitted_at=getattr(raw, "submitted_at", datetime.now(UTC)),
+        raw_status=str(getattr(raw, "status", "")),
+    )
+
+
+@dataclass(frozen=True)
+class IronCondorLegSpec:
+    """One leg in a multi-leg order request."""
+
+    occ_symbol: str
+    side: str  # "buy" or "sell"
+    position_intent: str  # "sell_to_open", "buy_to_open", "sell_to_close", "buy_to_close"
+    ratio_qty: int = 1
+
+
+def _build_limit_order(
+    *,
+    qty: int,
+    limit_price: Decimal,
+    side: str,  # net posture: "sell" for credit, "buy" for debit
+    legs: list[IronCondorLegSpec],
+) -> LimitOrderRequest:
+    side_enum = OrderSide.SELL if side == "sell" else OrderSide.BUY
+    return LimitOrderRequest(
+        symbol="",  # ignored for MLEG
+        qty=qty,
+        side=side_enum,
+        time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.MLEG,
+        limit_price=float(limit_price),
+        legs=[
+            OptionLegRequest(
+                symbol=leg.occ_symbol,
+                ratio_qty=leg.ratio_qty,
+                side=OrderSide.SELL if leg.side == "sell" else OrderSide.BUY,
+                position_intent=PositionIntent(leg.position_intent),
+            )
+            for leg in legs
+        ],
+    )
+
+
+async def submit_iron_condor_entry(
+    *,
+    qty: int,
+    limit_credit_per_contract: Decimal,
+    short_put: str,
+    long_put: str,
+    short_call: str,
+    long_call: str,
+) -> OrderResult:
+    """Submit a 4-leg iron-condor open order (net credit, day TIF).
+
+    `limit_credit_per_contract` is in dollars (e.g., 0.80 means $0.80 credit).
+    Alpaca expects the per-share net price, not the per-contract dollars.
+    Iron condor: short put + long put + short call + long call, all opening.
+    """
+    # Net price for the spread, in per-share dollars
+    limit_price = (limit_credit_per_contract / Decimal("100")).quantize(Decimal("0.01"))
+
+    legs = [
+        IronCondorLegSpec(short_put, "sell", "sell_to_open"),
+        IronCondorLegSpec(long_put, "buy", "buy_to_open"),
+        IronCondorLegSpec(short_call, "sell", "sell_to_open"),
+        IronCondorLegSpec(long_call, "buy", "buy_to_open"),
+    ]
+    order_req = _build_limit_order(
+        qty=qty, limit_price=limit_price, side="sell", legs=legs
+    )
+
+    def _do() -> OrderResult:
+        resp = _trading_client().submit_order(order_req)
+        result = _to_order_result(resp)
+        log.info(
+            "alpaca_iron_condor_submitted",
+            order_id=result.order_id,
+            status=result.status,
+            qty=qty,
+            limit_price=str(limit_price),
+        )
+        return result
+
+    return await asyncio.to_thread(_do)
+
+
+async def submit_iron_condor_close(
+    *,
+    qty: int,
+    limit_debit_per_contract: Decimal,
+    short_put: str,
+    long_put: str,
+    short_call: str,
+    long_call: str,
+) -> OrderResult:
+    """Close a 4-leg iron condor at a target net debit. Reverses each leg."""
+    limit_price = (limit_debit_per_contract / Decimal("100")).quantize(Decimal("0.01"))
+    legs = [
+        IronCondorLegSpec(short_put, "buy", "buy_to_close"),
+        IronCondorLegSpec(long_put, "sell", "sell_to_close"),
+        IronCondorLegSpec(short_call, "buy", "buy_to_close"),
+        IronCondorLegSpec(long_call, "sell", "sell_to_close"),
+    ]
+    order_req = _build_limit_order(
+        qty=qty, limit_price=limit_price, side="buy", legs=legs
+    )
+
+    def _do() -> OrderResult:
+        resp = _trading_client().submit_order(order_req)
+        result = _to_order_result(resp)
+        log.info(
+            "alpaca_iron_condor_close_submitted",
+            order_id=result.order_id,
+            status=result.status,
+            qty=qty,
+            limit_price=str(limit_price),
+        )
+        return result
+
+    return await asyncio.to_thread(_do)
+
+
+async def get_order(order_id: str) -> OrderResult:
+    """Fetch a single order's current status."""
+
+    def _do() -> OrderResult:
+        return _to_order_result(_trading_client().get_order_by_id(order_id))
+
+    return await asyncio.to_thread(_do)
+
+
+async def wait_for_order(
+    order_id: str,
+    *,
+    timeout_s: float = 120.0,
+    poll_interval_s: float = 1.5,
+) -> OrderResult:
+    """Poll `get_order` until the status is terminal or `timeout_s` elapses.
+
+    Returns the last seen OrderResult — caller inspects `.status` to decide
+    next steps (filled vs cancelled vs rejected). On timeout, returns the
+    last observed state without raising; caller can choose to cancel.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    last: OrderResult | None = None
+    while True:
+        result = await get_order(order_id)
+        last = result
+        if result.status in _TERMINAL_ORDER_STATUSES:
+            return result
+        if asyncio.get_event_loop().time() >= deadline:
+            log.warning(
+                "alpaca_wait_for_order_timeout",
+                order_id=order_id,
+                last_status=result.status,
+            )
+            return result
+        await asyncio.sleep(poll_interval_s)
+    # Unreachable; mypy appeasement.
+    return last  # type: ignore[return-value]

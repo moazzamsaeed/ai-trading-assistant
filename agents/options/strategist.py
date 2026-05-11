@@ -21,6 +21,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from agents.options.executor import execute_iron_condor
 from integrations import alpaca_client
 from integrations.alpaca_client import OptionQuote, StockQuote
 from strategies.spy_0dte_iron_condor import (
@@ -29,6 +30,7 @@ from strategies.spy_0dte_iron_condor import (
     build_iron_condor,
 )
 from trademaster import risk_manager
+from trademaster.config import get_settings
 from trademaster.db import Signal as SignalRow
 from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
@@ -144,15 +146,23 @@ def _parse_decision(text: str) -> tuple[str, float | None, str]:
     return decision, confidence, reasoning
 
 
-def _format_alert(plan: IronCondorPlan, signal: Signal) -> str:
+def _format_alert(plan: IronCondorPlan, signal: Signal, *, execution=None) -> str:
+    mode = get_settings().trading_mode.upper()
+    if execution is None:
+        status_line = "Status: candidate (no execution attempted)"
+    elif execution.executed:
+        status_line = f"✅ EXECUTED ({mode}) · {execution.reason} · trade #{execution.trade_id}"
+    else:
+        status_line = f"⚠️ NOT EXECUTED ({mode}) · {execution.reason}"
     return (
-        f"📋 **SPY 0DTE iron-condor candidate** ({plan.short_put.expiry})\n"
+        f"📋 **SPY 0DTE iron-condor** ({plan.short_put.expiry})\n"
         f"Short put: ${plan.short_put.strike} · Long put: ${plan.long_put.strike}\n"
         f"Short call: ${plan.short_call.strike} · Long call: ${plan.long_call.strike}\n"
         f"Credit: ${plan.credit_per_contract} · Max loss: ${plan.max_loss_per_contract} · "
         f"qty: {plan.qty}\n"
         f"Confidence: {signal.confidence}\n"
-        f"Reasoning: {signal.reasoning}"
+        f"Reasoning: {signal.reasoning}\n"
+        f"{status_line}"
     )
 
 
@@ -169,6 +179,7 @@ async def run_iron_condor_strategist(
     stock_fetcher: Callable[[str], object] = alpaca_client.get_latest_stock_quote,
     chain_fetcher: Callable[..., object] = alpaca_client.get_options_chain,
     account_fetcher: Callable[[], object] | None = None,
+    executor: Callable[..., object] = execute_iron_condor,
 ) -> tuple[Signal, str | None]:
     """Run the full strategist pipeline.
 
@@ -276,7 +287,17 @@ async def run_iron_condor_strategist(
             row.accepted = True
             s.commit()
 
-    alert = _format_alert(plan, open_signal)
+    # Paper mode auto-executes. Live mode short-circuits — Phase 2.3c will
+    # post for approval instead.
+    execution = await executor(plan, session_factory=factory)
+    log.info(
+        "options_strategist_execution",
+        executed=execution.executed,
+        reason=execution.reason,
+        trade_id=execution.trade_id,
+    )
+
+    alert = _format_alert(plan, open_signal, execution=execution)
     return open_signal, alert
 
 

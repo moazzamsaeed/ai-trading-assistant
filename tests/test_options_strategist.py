@@ -257,6 +257,15 @@ async def test_strategist_open_approved_emits_alert(monkeypatch, session_factory
             '"reasoning": "IV elevated, tight spreads"}'
         )
 
+    async def fake_executor(plan, *, session_factory):
+        from agents.options.executor import ExecutionResult
+        return ExecutionResult(
+            executed=True,
+            order=None,
+            trade_id=42,
+            reason="filled at $80.00/contract",
+        )
+
     monkeypatch.setattr(strategist, "route_to_model", route)
     fetch_account = await _account_fetcher(_account("10000"))
 
@@ -265,18 +274,54 @@ async def test_strategist_open_approved_emits_alert(monkeypatch, session_factory
         stock_fetcher=_stock,
         chain_fetcher=_chain,
         account_fetcher=fetch_account,
+        executor=fake_executor,
     )
     assert signal.action.value == "open"
     assert alert is not None
-    assert "iron-condor candidate" in alert.lower()
+    assert "iron-condor" in alert.lower()
     assert "$495" in alert  # short put strike
     assert "$505" in alert  # short call strike
+    assert "executed" in alert.lower()
+    assert "#42" in alert  # trade id
 
     with session_factory() as s:
         rows = s.query(SignalRow).all()
         assert len(rows) == 1
         assert rows[0].action == "open"
         assert rows[0].accepted is True
+
+
+async def test_strategist_open_executor_failure_still_emits_alert(
+    monkeypatch, session_factory
+):
+    """If submission fails post-approval, we still alert with the failure status."""
+    async def route(_task_type, _prompt, **_k):
+        return _llm_response(
+            '{"decision": "OPEN", "confidence": 0.7, "reasoning": "go"}'
+        )
+
+    async def fake_executor(plan, *, session_factory):
+        from agents.options.executor import ExecutionResult
+        return ExecutionResult(
+            executed=False,
+            order=None,
+            trade_id=None,
+            reason="order ended in status=rejected",
+        )
+
+    monkeypatch.setattr(strategist, "route_to_model", route)
+    fetch_account = await _account_fetcher(_account("10000"))
+
+    _signal, alert = await strategist.run_iron_condor_strategist(
+        session_factory=session_factory,
+        stock_fetcher=_stock,
+        chain_fetcher=_chain,
+        account_fetcher=fetch_account,
+        executor=fake_executor,
+    )
+    assert alert is not None
+    assert "not executed" in alert.lower()
+    assert "rejected" in alert.lower()
 
 
 # ----------------- pipeline: OPEN rejected by risk -----------------
