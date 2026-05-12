@@ -2,20 +2,22 @@
 
 Runs two daemon threads:
   - alpaca-bar-stream  : 1-min bars → detects volume surges per ticker
-  - alpaca-news-stream : real-time news feed → fires on any watchlist mention
+  - alpaca-news-stream : real-time news feed → three trigger tiers:
+      1. Watchlist ticker mentioned   → fire immediately (per-ticker debounce)
+      2. Macro keyword in headline    → fire immediately (bypass debounce)
+         e.g. tariffs, Fed, Powell, CPI, jobs data, war, earnings
+      3. Any other financial news     → fire with 3-min global debounce
+         (Alpaca's feed is financial-only so anything in it is relevant)
 
 Both threads call on_trigger(ticker, reason) on the main asyncio event loop
-via run_coroutine_threadsafe when a condition fires. The orchestrator wires
-on_trigger to run_directional_scan so the LLM scan happens within seconds
-of a catalyst instead of waiting up to 10 minutes for the next poll.
-
-Debounce: the same ticker cannot trigger more than once per DEBOUNCE_SECONDS
-to avoid hammering the LLM on a sustained volume spike.
+via run_coroutine_threadsafe. The orchestrator wires on_trigger to
+run_directional_scan so the LLM scan happens within seconds of any catalyst.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
@@ -28,9 +30,28 @@ from trademaster.logging import get_logger
 
 log = get_logger(__name__)
 
-VOLUME_SURGE_RATIO = 2.0  # bar volume must be >= N× the rolling average
-MIN_HISTORY_BARS = 10     # need at least this many bars before checking surge
-DEBOUNCE_SECONDS = 120    # cooldown per ticker after a trigger fires
+VOLUME_SURGE_RATIO = 2.0   # bar volume must be >= N× the rolling average
+MIN_HISTORY_BARS = 10      # need at least this many bars before checking surge
+DEBOUNCE_SECONDS = 120     # cooldown per ticker after a trigger fires
+GLOBAL_NEWS_DEBOUNCE_SECONDS = 180  # cooldown for general (non-macro) news
+
+# Headlines containing any of these keywords trigger a scan immediately,
+# bypassing the normal per-ticker debounce. Covers the macro events that
+# move the whole market regardless of which ticker is mentioned.
+MACRO_KEYWORDS: frozenset[str] = frozenset({
+    "tariff", "tariffs", "trade war", "trade deal",
+    "fed ", "federal reserve", "powell", "fomc", "rate hike", "rate cut",
+    "interest rate", "quantitative",
+    "cpi", "inflation", "deflation", "pce",
+    "jobs", "nonfarm", "payroll", "unemployment", "jobless",
+    "gdp", "recession", "economic growth",
+    "earnings", "revenue miss", "revenue beat", "guidance",
+    "war", "invasion", "military", "geopolit", "sanction",
+    "opec", "oil price", "crude",
+    "default", "debt ceiling", "shutdown", "downgrade",
+    "china", "ukraine", "russia", "iran", "taiwan",
+    "bank failure", "banking crisis", "contagion",
+})
 
 
 Trigger = Callable[[str, str], Awaitable[None]]  # async(ticker, reason) -> None
@@ -62,6 +83,7 @@ class DirectionalStreamTrigger:
         self._watchlist = {t.upper() for t in watchlist}
         self._bar_vols: dict[str, deque[int]] = defaultdict(lambda: deque(maxlen=20))
         self._last_trigger: dict[str, datetime] = {}
+        self._last_news_scan: datetime | None = None  # global debounce for general news
         self._stock_stream: StockDataStream | None = None
         self._news_stream: NewsDataStream | None = None
         self._stock_thread: threading.Thread | None = None
@@ -77,8 +99,22 @@ class DirectionalStreamTrigger:
             return True
         return (datetime.now(UTC) - last).total_seconds() >= DEBOUNCE_SECONDS
 
-    def _fire(self, ticker: str, reason: str) -> None:
-        if not self._can_trigger(ticker):
+    def _is_macro(self, headline: str) -> bool:
+        lower = headline.lower()
+        # Multi-word phrases: substring match is unambiguous.
+        # Single words: require word-boundary match to avoid "war" inside "warehouse".
+        headline_words = set(re.findall(r"\b\w+\b", lower))
+        for kw in MACRO_KEYWORDS:
+            if " " in kw:
+                if kw in lower:
+                    return True
+            else:
+                if kw in headline_words:
+                    return True
+        return False
+
+    def _fire(self, ticker: str, reason: str, *, force: bool = False) -> None:
+        if not force and not self._can_trigger(ticker):
             log.debug("stream_debounced", ticker=ticker, reason=reason)
             return
         self._last_trigger[ticker] = datetime.now(UTC)
@@ -113,15 +149,32 @@ class DirectionalStreamTrigger:
             self._fire(ticker, f"volume_surge_{vol/avg:.1f}x")
 
     # ------------------------------------------------------------------ #
-    # News handler — any article mentioning a watchlist ticker             #
+    # News handler — three tiers: watchlist ticker / macro / general news   #
     # ------------------------------------------------------------------ #
 
     async def _handle_news(self, news) -> None:
         symbols: list[str] = list(getattr(news, "symbols", []) or [])
-        headline = str(getattr(news, "headline", "") or "")[:80]
+        headline = str(getattr(news, "headline", "") or "")
+        short = headline[:80]
+
+        # Tier 1: watchlist ticker explicitly mentioned → per-ticker debounce.
         for sym in symbols:
             if sym.upper() in self._watchlist:
-                self._fire(sym.upper(), f"news:{headline}")
+                self._fire(sym.upper(), f"news:{short}")
+                return  # article already handled; don't double-trigger
+
+        # Tier 2: macro keyword in headline → fire immediately, bypass debounce.
+        if self._is_macro(headline):
+            self._fire("MARKET", f"macro:{short}", force=True)
+            self._last_news_scan = datetime.now(UTC)
+            return
+
+        # Tier 3: any other financial news → 3-min global debounce.
+        now = datetime.now(UTC)
+        if (self._last_news_scan is None
+                or (now - self._last_news_scan).total_seconds() >= GLOBAL_NEWS_DEBOUNCE_SECONDS):
+            self._last_news_scan = now
+            self._fire("MARKET", f"news:{short}")
 
     # ------------------------------------------------------------------ #
     # Thread targets                                                        #

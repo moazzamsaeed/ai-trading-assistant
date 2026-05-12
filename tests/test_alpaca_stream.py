@@ -15,6 +15,7 @@ import pytest
 
 from integrations.alpaca_stream import (
     DEBOUNCE_SECONDS,
+    GLOBAL_NEWS_DEBOUNCE_SECONDS,
     MIN_HISTORY_BARS,
     VOLUME_SURGE_RATIO,
     DirectionalStreamTrigger,
@@ -143,11 +144,11 @@ async def test_non_watchlist_bar_ignored():
 
 
 # ---------------------------------------------------------------------------
-# News trigger
+# News trigger — Tier 1: watchlist ticker
 # ---------------------------------------------------------------------------
 
 
-async def test_news_fires_for_watchlist_ticker():
+async def test_news_tier1_watchlist_ticker_fires():
     fired: list = []
     t = _make_trigger(fired)
     await t._handle_news(_news(["TSLA"], "Tesla beats Q1 earnings"))
@@ -157,21 +158,102 @@ async def test_news_fires_for_watchlist_ticker():
     assert "Tesla beats" in fired[0][1]
 
 
-async def test_news_ignored_for_non_watchlist():
+async def test_news_tier1_returns_after_watchlist_hit():
+    """Watchlist match short-circuits — no second global trigger for same article."""
     fired: list = []
     t = _make_trigger(fired)
-    await t._handle_news(_news(["META", "MSFT"], "Big Tech rally"))
+    # Article tags both a watchlist ticker and has a macro keyword
+    await t._handle_news(_news(["NVDA"], "NVDA earnings beat on tariff relief news"))
     await asyncio.sleep(0)
-    assert fired == []
+    assert len(fired) == 1  # only one trigger, not two
+    assert fired[0][0] == "NVDA"
 
 
-async def test_news_fires_once_per_ticker_in_one_article():
+async def test_news_tier1_fires_once_per_debounce():
     fired: list = []
     t = _make_trigger(fired)
-    # Article mentions SPY twice (shouldn't happen but guard it)
-    await t._handle_news(_news(["SPY", "SPY"], "Market surges"))
+    await t._handle_news(_news(["SPY"], "SPY breaks resistance"))
     await asyncio.sleep(0)
-    # First mention triggers, second is debounced
+    await t._handle_news(_news(["SPY"], "SPY continues rally"))
+    await asyncio.sleep(0)
+    assert len(fired) == 1  # second blocked by per-ticker debounce
+
+
+# ---------------------------------------------------------------------------
+# News trigger — Tier 2: macro keywords
+# ---------------------------------------------------------------------------
+
+
+async def test_news_tier2_macro_keyword_fires():
+    fired: list = []
+    t = _make_trigger(fired)
+    await t._handle_news(_news([], "Fed raises interest rate by 25 bps"))
+    await asyncio.sleep(0)
+    assert len(fired) == 1
+    assert fired[0][0] == "MARKET"
+    assert "macro:" in fired[0][1]
+
+
+async def test_news_tier2_tariff_fires():
+    fired: list = []
+    t = _make_trigger(fired)
+    await t._handle_news(_news([], "Trump announces new tariffs on Chinese goods"))
+    await asyncio.sleep(0)
+    assert len(fired) == 1
+    assert fired[0][0] == "MARKET"
+
+
+async def test_news_tier2_macro_bypasses_debounce():
+    """Macro news fires even within the normal debounce window."""
+    fired: list = []
+    t = _make_trigger(fired)
+    # Set debounce as if we just fired
+    from datetime import UTC, datetime
+    t._last_trigger["MARKET"] = datetime.now(UTC)
+    await t._handle_news(_news([], "Powell signals emergency rate cut"))
+    await asyncio.sleep(0)
+    assert len(fired) == 1  # force=True bypasses the cooldown
+
+
+async def test_news_tier2_jobs_data_fires():
+    fired: list = []
+    t = _make_trigger(fired)
+    await t._handle_news(_news([], "Nonfarm payrolls miss expectations by 50k"))
+    await asyncio.sleep(0)
+    assert len(fired) == 1
+
+
+# ---------------------------------------------------------------------------
+# News trigger — Tier 3: general financial news
+# ---------------------------------------------------------------------------
+
+
+async def test_news_tier3_general_news_fires():
+    fired: list = []
+    t = _make_trigger(fired)
+    await t._handle_news(_news(["AAPL"], "Apple announces new product line"))
+    await asyncio.sleep(0)
+    assert len(fired) == 1
+    assert fired[0][0] == "MARKET"
+
+
+async def test_news_tier3_global_debounce_blocks_second():
+    fired: list = []
+    t = _make_trigger(fired)
+    await t._handle_news(_news(["AAPL"], "Apple product launch"))
+    await asyncio.sleep(0)
+    await t._handle_news(_news(["AMZN"], "Amazon warehouse expansion"))
+    await asyncio.sleep(0)
+    assert len(fired) == 1  # second blocked by global debounce
+
+
+async def test_news_tier3_fires_after_global_debounce_expires():
+    fired: list = []
+    t = _make_trigger(fired)
+    from datetime import UTC, datetime, timedelta
+    t._last_news_scan = datetime.now(UTC) - timedelta(seconds=GLOBAL_NEWS_DEBOUNCE_SECONDS + 1)
+    await t._handle_news(_news(["AMZN"], "Amazon AWS outage"))
+    await asyncio.sleep(0)
     assert len(fired) == 1
 
 
