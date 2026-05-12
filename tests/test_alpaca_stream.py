@@ -15,7 +15,6 @@ import pytest
 
 from integrations.alpaca_stream import (
     DEBOUNCE_SECONDS,
-    GLOBAL_NEWS_DEBOUNCE_SECONDS,
     MIN_HISTORY_BARS,
     VOLUME_SURGE_RATIO,
     DirectionalStreamTrigger,
@@ -223,38 +222,23 @@ async def test_news_tier2_jobs_data_fires():
     assert len(fired) == 1
 
 
-# ---------------------------------------------------------------------------
-# News trigger — Tier 3: general financial news
-# ---------------------------------------------------------------------------
-
-
-async def test_news_tier3_general_news_fires():
+async def test_news_tier3_dropped_general_news_silent():
+    """General financial news not in watchlist + no macro keyword → no trigger."""
     fired: list = []
     t = _make_trigger(fired)
     await t._handle_news(_news(["AAPL"], "Apple announces new product line"))
     await asyncio.sleep(0)
-    assert len(fired) == 1
-    assert fired[0][0] == "MARKET"
+    assert fired == []
 
 
-async def test_news_tier3_global_debounce_blocks_second():
+async def test_news_tier3_dropped_non_macro_repeated():
     fired: list = []
     t = _make_trigger(fired)
-    await t._handle_news(_news(["AAPL"], "Apple product launch"))
-    await asyncio.sleep(0)
     await t._handle_news(_news(["AMZN"], "Amazon warehouse expansion"))
     await asyncio.sleep(0)
-    assert len(fired) == 1  # second blocked by global debounce
-
-
-async def test_news_tier3_fires_after_global_debounce_expires():
-    fired: list = []
-    t = _make_trigger(fired)
-    from datetime import UTC, datetime, timedelta
-    t._last_news_scan = datetime.now(UTC) - timedelta(seconds=GLOBAL_NEWS_DEBOUNCE_SECONDS + 1)
-    await t._handle_news(_news(["AMZN"], "Amazon AWS outage"))
+    await t._handle_news(_news(["META"], "Meta opens new campus"))
     await asyncio.sleep(0)
-    assert len(fired) == 1
+    assert fired == []  # neither is macro, neither in watchlist
 
 
 async def test_news_headline_truncated_to_80_chars():

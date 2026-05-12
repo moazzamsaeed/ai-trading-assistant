@@ -113,11 +113,14 @@ async def _directional_scan_job(
     research_poster: Poster,
     log_poster: Poster = _noop_poster,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+    post_report_on_hold: bool = True,
 ) -> None:
-    """Sweep watchlist every 10 min.
+    """Sweep watchlist for directional signals.
 
-    - Posts BUY signals to #signals for manual trading reference.
-    - Auto-executes each signal via Alpaca; fills posted to #trades.
+    - Always posts BUY signals to #signals and executes via Alpaca.
+    - `post_report_on_hold`: when False (stream-triggered), only posts to
+      #research if there's at least one BUY signal. When True (30-min
+      fallback), always posts the full per-ticker summary.
     """
     if get_state().is_paused():
         log.info("directional_scan_skipped_paused")
@@ -153,10 +156,14 @@ async def _directional_scan_job(
     finally:
         _scan_in_progress = False
 
-    # Always post the scan report to #research so the user can see reasoning.
-    await research_poster(scan_report)
+    # Post scan report to #research.
+    # Fallback (scheduled) scans always post so the user gets a baseline picture.
+    # Stream-triggered scans only post when there's an actionable signal — all-HOLD
+    # stream scans are silent to avoid flooding #research with noise.
+    if post_report_on_hold or messages:
+        await research_poster(scan_report)
 
-    # Post signals to #signals so the user can manually trade alongside the bot.
+    # Post BUY signals to #signals for manual trading reference.
     for msg in messages:
         await signal_poster(msg)
 
@@ -532,6 +539,7 @@ def make_directional_trigger(
             trade_poster=trade_poster,
             research_poster=research_poster,
             log_poster=log_post,
+            post_report_on_hold=False,  # silent if all HOLD — only post on BUY signals
         )
 
     return DirectionalStreamTrigger(
