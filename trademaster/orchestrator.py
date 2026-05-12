@@ -26,6 +26,7 @@ from trademaster.config import get_settings
 from trademaster.logging import configure_logging, get_logger
 from trademaster.risk_manager import validate_account_is_cash
 from trademaster.scheduler import (
+    make_directional_trigger,
     make_scheduler,
     run_directional_once,
     run_intraday_once,
@@ -52,6 +53,18 @@ async def _run() -> None:
             log_poster=bot.post_log,
         )
         scheduler.start()
+
+        loop = asyncio.get_running_loop()
+
+        stream = make_directional_trigger(
+            main_loop=loop,
+            research_poster=bot.post_research,
+            signal_poster=bot.post_signal,
+            trade_poster=bot.post_trade,
+            log_poster=bot.post_log,
+        )
+        stream.start()
+
         log.info("trademaster_started", trading_mode=settings.trading_mode)
 
         stop = asyncio.Event()
@@ -60,13 +73,13 @@ async def _run() -> None:
             log.info("shutdown_signal_received")
             stop.set()
 
-        loop = asyncio.get_running_loop()
         for sig in (_signal.SIGTERM, _signal.SIGINT):
             loop.add_signal_handler(sig, _on_signal)
 
         try:
             await stop.wait()
         finally:
+            stream.stop()
             scheduler.shutdown(wait=False)
             log.info("trademaster_stopped")
 

@@ -14,6 +14,7 @@ Channel routing (passed as named posters by the orchestrator):
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -30,6 +31,10 @@ from integrations import alpaca_client
 from trademaster.config import get_settings
 from trademaster.logging import get_logger
 from trademaster.state import get_state
+from trademaster.watchlist import load_tickers
+
+# Prevents concurrent directional scans (stream + scheduler can both trigger).
+_scan_in_progress: bool = False
 
 log = get_logger(__name__)
 
@@ -128,6 +133,11 @@ async def _directional_scan_job(
         log.info("directional_scan_skipped_closed", next_open=str(clock.next_open))
         return
 
+    global _scan_in_progress
+    if _scan_in_progress:
+        log.info("directional_scan_skipped_already_running")
+        return
+    _scan_in_progress = True
     try:
         decisions, messages, scan_report = await run_directional_scan()
     except Exception as e:  # noqa: BLE001
@@ -140,6 +150,8 @@ async def _directional_scan_job(
             f"⚠️ Directional intraday scan failed: `{type(e).__name__}: {e}`"
         )
         return
+    finally:
+        _scan_in_progress = False
 
     # Always post the scan report to #research so the user can see reasoning.
     await research_poster(scan_report)
@@ -367,13 +379,15 @@ def make_scheduler(
         misfire_grace_time=120,
     )
 
-    # Directional intraday signals — every 10 min during RTH, Mon-Fri.
+    # Directional fallback scan — every 30 min during RTH.
+    # Real-time triggers come from the WebSocket stream (alpaca_stream.py).
+    # This fallback catches slow-building setups and guards against stream gaps.
     scheduler.add_job(
         _directional_scan_job,
         CronTrigger(
             day_of_week="mon-fri",
             hour="9-15",
-            minute="0,10,20,30,40,50",
+            minute="0,30",
             timezone=PREMARKET_TZ,
         ),
         kwargs={
@@ -384,7 +398,7 @@ def make_scheduler(
         },
         id="directional_scan",
         replace_existing=True,
-        misfire_grace_time=120,
+        misfire_grace_time=300,
     )
 
     # Directional exit monitor — every 5 min during RTH (10:00–15:25 ET).
@@ -487,6 +501,44 @@ def make_scheduler(
 
     log.info("scheduler_built", jobs=[j.id for j in scheduler.get_jobs()])
     return scheduler
+
+
+# ----------------- WebSocket stream trigger factory -----------------
+
+
+def make_directional_trigger(
+    *,
+    main_loop: "asyncio.AbstractEventLoop",
+    research_poster: Poster,
+    signal_poster: Poster,
+    trade_poster: Poster,
+    log_poster: Poster | None = None,
+) -> "DirectionalStreamTrigger":
+    """Build a DirectionalStreamTrigger wired to the directional scan job.
+
+    The trigger fires when Alpaca's real-time stream detects a volume surge
+    or news drop on a watchlist ticker, then immediately calls the full
+    directional scan (same logic as the 30-min fallback, but demand-driven).
+    """
+    from integrations.alpaca_stream import DirectionalStreamTrigger
+
+    log_post = log_poster or _noop_poster
+    watchlist = load_tickers()
+
+    async def on_trigger(ticker: str, reason: str) -> None:
+        log.info("stream_triggered_scan", ticker=ticker, reason=reason)
+        await _directional_scan_job(
+            signal_poster=signal_poster,
+            trade_poster=trade_poster,
+            research_poster=research_poster,
+            log_poster=log_post,
+        )
+
+    return DirectionalStreamTrigger(
+        main_loop=main_loop,
+        on_trigger=on_trigger,
+        watchlist=watchlist,
+    )
 
 
 # ----------------- manual runners (for `--once` and tests) -----------------
