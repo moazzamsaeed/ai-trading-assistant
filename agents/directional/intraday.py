@@ -41,7 +41,7 @@ AGENT_NAME = "intraday_directional"
 
 # Strategy parameters
 BARS_TIMEFRAME_MIN = 5
-BARS_LIMIT = 30
+BARS_LIMIT = 60  # EMA50 needs ≥50 bars; 60 gives comfortable headroom
 NEWS_LOOKBACK_MIN = 30
 
 
