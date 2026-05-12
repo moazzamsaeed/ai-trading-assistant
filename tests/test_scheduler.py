@@ -252,7 +252,7 @@ def test_make_scheduler_registers_directional_exit_jobs():
     assert f_fields["minute"] == "30"
 
 
-async def test_directional_exit_job_posts_to_both_channels(monkeypatch):
+async def test_directional_exit_job_posts_combined_to_signals(monkeypatch):
     sig: list[str] = []
     trd: list[str] = []
 
@@ -273,14 +273,14 @@ async def test_directional_exit_job_posts_to_both_channels(monkeypatch):
         )
 
     async def fake_monitor(**_kwargs):
-        return [{"signal_text": "📈 SPY EXIT", "trade_text": "🤖 closed #1"}]
+        return [{"combined_text": "📈 SPY CALL — bot closed"}]
 
     monkeypatch.setattr(sch, "run_directional_exit_monitor", fake_monitor)
     await sch._directional_exit_job(
         signal_poster=signals, trade_poster=trades, clock_fetcher=clock_open
     )
-    assert sig == ["📈 SPY EXIT"]
-    assert trd == ["🤖 closed #1"]
+    assert sig == ["📈 SPY CALL — bot closed"]
+    assert trd == []  # no #trades post for directional exits
 
 
 async def test_directional_force_close_skips_clock(monkeypatch):

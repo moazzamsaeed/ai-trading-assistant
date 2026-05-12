@@ -22,7 +22,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from agents.directional.executor import execute_directional_signal
 from agents.directional.exit_monitor import run_directional_exit_monitor
-from agents.directional.intraday import run_directional_scan
+from agents.directional.intraday import format_entry_combined, run_directional_scan
 from agents.intraday.scan import run_intraday_scan
 from agents.options.exit_monitor import run_exit_monitor
 from agents.options.strategist import run_iron_condor_strategist
@@ -163,22 +163,38 @@ async def _directional_scan_job(
     if post_report_on_hold or messages:
         await research_poster(scan_report)
 
-    # Post BUY signals to #signals for manual trading reference.
-    for msg in messages:
-        await signal_poster(msg)
+    # Auto-execute top 2 decisions (capped to avoid multi-signal floods).
+    # Combined entry+execution message posted to #signals — no separate #trades post.
+    from datetime import UTC, datetime
+    from decimal import Decimal
+    from zoneinfo import ZoneInfo
+    today = datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).date()
 
-    # Auto-execute every actionable decision.
     mode = get_settings().directional_mode
-    to_execute = [
-        d for d in decisions
-        if d.action != "HOLD"
-        and (mode != "aggressive" or d.conviction == "HIGH")
-    ]
+    conviction_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    to_execute = sorted(
+        [d for d in decisions if d.action != "HOLD"
+         and (mode != "aggressive" or d.conviction == "HIGH")],
+        key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
+    )[:2]  # cap at 2 per scan
+
     for decision in to_execute:
         try:
             result = await execute_directional_signal(decision, mode=mode)
-            if result.executed and result.trade_text:
-                await trade_poster(result.trade_text)
+            if result.executed and result.trade_id is not None:
+                entry_premium = result.entry_premium or Decimal("0")
+                total_cost = (entry_premium * 100 * result.qty).quantize(Decimal("0.01"))
+                combined = format_entry_combined(
+                    decision,
+                    today=today,
+                    mode=mode,
+                    trade_id=result.trade_id,
+                    qty=result.qty,
+                    occ=result.occ or "",
+                    entry_premium=entry_premium,
+                    total_cost=total_cost,
+                )
+                await signal_poster(combined)
             elif not result.executed:
                 log.info(
                     "directional_execute_skipped",
@@ -238,12 +254,11 @@ async def _directional_exit_job(
         return
 
     for r in results:
-        signal_text = r.get("signal_text")
-        trade_text = r.get("trade_text")
-        if signal_text:
-            await signal_poster(signal_text)
-        if trade_text:
-            await trade_poster(trade_text)
+        combined_text = r.get("combined_text")
+        if combined_text:
+            await signal_poster(combined_text)  # one message to #signals
+        elif r.get("error_text"):
+            await log_poster(r["error_text"])
 
 
 # ----------------- iron-condor strategist -----------------
@@ -335,9 +350,6 @@ async def _iron_condor_exit_job(
             await signal_poster(signal_text)
         if trade_text:
             await trade_poster(trade_text)
-
-
-# ----------------- scheduler builder -----------------
 
 
 def make_scheduler(

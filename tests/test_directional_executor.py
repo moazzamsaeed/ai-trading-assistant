@@ -246,7 +246,9 @@ async def test_execute_success_persists_trade(session_factory):
     )
     assert result.executed
     assert result.trade_id is not None
-    assert result.trade_text is not None
+    assert result.qty is not None
+    assert result.occ is not None
+    assert result.entry_premium is not None
 
     with session_factory() as session:
         trade = session.get(Trade, result.trade_id)
@@ -256,6 +258,7 @@ async def test_execute_success_persists_trade(session_factory):
         extra = trade.extra or {}
         assert "profit_target_premium" in extra
         assert "stop_premium" in extra
+        assert "entry_reasoning" in extra
         assert extra["mode"] == "aggressive"
 
 

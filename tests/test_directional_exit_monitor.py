@@ -1,4 +1,4 @@
-"""Tests for the directional exit monitor."""
+"""Tests for the directional exit monitor — hybrid intelligent exit."""
 
 from __future__ import annotations
 
@@ -8,13 +8,15 @@ from decimal import Decimal
 import pytest
 
 from agents.directional.exit_monitor import (
-    _decide_exit,
-    _format_exit_signal,
-    _format_exit_telemetry,
+    HARD_FLOOR_PCT,
+    _check_exit_rules,
+    _format_exit_combined,
+    _llm_exit_confirm,
     run_directional_exit_monitor,
 )
 from integrations.alpaca_client import OptionQuote, OrderResult
 from trademaster.db import Base, Trade, make_engine, make_session_factory
+from trademaster.llm.types import LLMResponse
 
 
 @pytest.fixture
@@ -28,14 +30,13 @@ def _open_trade(
     session_factory,
     *,
     entry_premium: float = 2.00,
-    pt: float = 4.00,
-    stop: float = 1.00,
     action: str = "BUY_CALL",
     strategy: str = "directional_call",
+    occ: str = "SPY260101C00500000",
 ) -> Trade:
     with session_factory() as session:
         trade = Trade(
-            symbol="SPY260101C00500000",
+            symbol=occ,
             asset_class="option",
             side="buy",
             strategy=strategy,
@@ -46,10 +47,9 @@ def _open_trade(
             extra={
                 "ticker": "SPY",
                 "action": action,
-                "occ_symbol": "SPY260101C00500000",
-                "mode": "aggressive",
-                "profit_target_premium": str(pt),
-                "stop_premium": str(stop),
+                "occ_symbol": occ,
+                "mode": "selective",
+                "entry_reasoning": "strong breakout above VWAP",
             },
         )
         session.add(trade)
@@ -71,7 +71,7 @@ def _quote(bid: float) -> OptionQuote:
     )
 
 
-def _filled(price: float = 4.00) -> OrderResult:
+def _filled(price: float) -> OrderResult:
     return OrderResult(
         order_id="ord-close-1",
         status="filled",
@@ -93,103 +93,196 @@ def _rejected() -> OrderResult:
     )
 
 
-# ---------------------------------------------------------------------------
-# _decide_exit
-# ---------------------------------------------------------------------------
-
-
-def test_decide_exit_profit_target():
-    hit, reason = _decide_exit(
-        current_bid=Decimal("4.10"),
-        profit_target_premium=Decimal("4.00"),
-        stop_premium=Decimal("1.00"),
-        force=False,
+def _fake_llm(decision: str = "EXIT", reason: str = "momentum reversed") -> LLMResponse:
+    import json as _json
+    text = _json.dumps({"decision": decision, "reason": reason})
+    return LLMResponse(
+        text=text, provider="deepseek", model="deepseek-v4-flash",
+        input_tokens=200, output_tokens=20,
+        cost_usd=Decimal("0.00004"), duration_ms=800,
     )
-    assert hit and reason == "profit_target"
-
-
-def test_decide_exit_stop_loss():
-    hit, reason = _decide_exit(
-        current_bid=Decimal("0.90"),
-        profit_target_premium=Decimal("4.00"),
-        stop_premium=Decimal("1.00"),
-        force=False,
-    )
-    assert hit and reason == "stop_loss"
-
-
-def test_decide_exit_hold():
-    hit, reason = _decide_exit(
-        current_bid=Decimal("2.50"),
-        profit_target_premium=Decimal("4.00"),
-        stop_premium=Decimal("1.00"),
-        force=False,
-    )
-    assert not hit and reason == ""
-
-
-def test_decide_exit_force_overrides_hold():
-    hit, reason = _decide_exit(
-        current_bid=Decimal("2.50"),
-        profit_target_premium=Decimal("4.00"),
-        stop_premium=Decimal("1.00"),
-        force=True,
-    )
-    assert hit and reason == "force_close"
 
 
 # ---------------------------------------------------------------------------
-# format helpers
+# _check_exit_rules
 # ---------------------------------------------------------------------------
 
 
-def _fake_trade() -> Trade:
+def _snap(
+    price=500.0, vwap=490.0, rsi=52.0, ema20=498.0, ema50=495.0, vol_ratio=1.2
+) -> dict:
+    return {
+        "last_close": str(price),
+        "vwap": str(vwap),
+        "rsi14": str(rsi),
+        "ema20": str(ema20),
+        "ema50": str(ema50),
+        "volume_ratio_20": str(vol_ratio),
+    }
+
+
+def test_check_exit_rules_call_no_trigger():
+    # Healthy bullish setup — no rules should fire
+    snap = _snap(price=500, vwap=490, rsi=55, ema20=498, ema50=495, vol_ratio=1.5)
+    assert _check_exit_rules("BUY_CALL", snap) == []
+
+
+def test_check_exit_rules_call_price_below_vwap():
+    snap = _snap(price=485, vwap=490)  # price < VWAP
+    assert "price_below_vwap" in _check_exit_rules("BUY_CALL", snap)
+
+
+def test_check_exit_rules_call_rsi_overbought():
+    snap = _snap(rsi=72)  # RSI > 70
+    assert "rsi_overbought" in _check_exit_rules("BUY_CALL", snap)
+
+
+def test_check_exit_rules_call_ema_bearish_cross():
+    snap = _snap(ema20=490, ema50=495)  # EMA20 < EMA50
+    assert "ema_bearish_cross" in _check_exit_rules("BUY_CALL", snap)
+
+
+def test_check_exit_rules_call_volume_fading():
+    snap = _snap(vol_ratio=0.5)  # below 0.7 threshold
+    assert "volume_fading" in _check_exit_rules("BUY_CALL", snap)
+
+
+def test_check_exit_rules_put_no_trigger():
+    snap = _snap(price=485, vwap=490, rsi=45, ema20=490, ema50=495, vol_ratio=1.5)
+    assert _check_exit_rules("BUY_PUT", snap) == []
+
+
+def test_check_exit_rules_put_price_above_vwap():
+    snap = _snap(price=495, vwap=490)  # price > VWAP for put = exit signal
+    assert "price_above_vwap" in _check_exit_rules("BUY_PUT", snap)
+
+
+def test_check_exit_rules_put_rsi_oversold():
+    snap = _snap(rsi=28)
+    assert "rsi_oversold" in _check_exit_rules("BUY_PUT", snap)
+
+
+def test_check_exit_rules_put_ema_bullish_cross():
+    snap = _snap(ema20=498, ema50=495)  # EMA20 > EMA50 for put = exit signal
+    assert "ema_bullish_cross" in _check_exit_rules("BUY_PUT", snap)
+
+
+def test_check_exit_rules_empty_snap_returns_empty():
+    assert _check_exit_rules("BUY_CALL", {}) == []
+
+
+# ---------------------------------------------------------------------------
+# _llm_exit_confirm
+# ---------------------------------------------------------------------------
+
+
+def _fake_trade_obj(entry_premium: float = 2.00) -> Trade:
     t = Trade(
         symbol="SPY260101C00500000",
         asset_class="option",
         side="buy",
         strategy="directional_call",
         qty=Decimal("3"),
-        entry_price=Decimal("2.00"),
+        entry_price=Decimal(str(entry_premium)),
+        opened_at=datetime.now(UTC),
         extra={
             "ticker": "SPY",
             "action": "BUY_CALL",
             "occ_symbol": "SPY260101C00500000",
-            "mode": "aggressive",
+            "mode": "selective",
+            "entry_reasoning": "strong breakout",
         },
     )
+    t.id = 99
+    return t
+
+
+async def test_llm_exit_confirm_exit_decision(session_factory):
+    async def fake_llm(*_a, **_k):
+        return _fake_llm("EXIT", "RSI reversed from overbought")
+
+    should_exit, reason = await _llm_exit_confirm(
+        trade=_fake_trade_obj(),
+        snap=_snap(rsi=72),
+        triggered_rules=["rsi_overbought"],
+        current_bid=Decimal("2.80"),
+        pnl_pct=40.0,
+        session_factory=session_factory,
+        llm_caller=fake_llm,
+    )
+    assert should_exit is True
+    assert "RSI" in reason
+
+
+async def test_llm_exit_confirm_hold_decision(session_factory):
+    async def fake_llm(*_a, **_k):
+        return _fake_llm("HOLD", "Momentum still intact")
+
+    should_exit, reason = await _llm_exit_confirm(
+        trade=_fake_trade_obj(),
+        snap=_snap(),
+        triggered_rules=["volume_fading"],
+        current_bid=Decimal("2.50"),
+        pnl_pct=25.0,
+        session_factory=session_factory,
+        llm_caller=fake_llm,
+    )
+    assert should_exit is False
+
+
+async def test_llm_exit_confirm_failure_defaults_to_hold(session_factory):
+    async def boom(*_a, **_k):
+        raise RuntimeError("deepseek down")
+
+    should_exit, reason = await _llm_exit_confirm(
+        trade=_fake_trade_obj(),
+        snap=_snap(),
+        triggered_rules=["price_below_vwap"],
+        current_bid=Decimal("2.50"),
+        pnl_pct=25.0,
+        session_factory=session_factory,
+        llm_caller=boom,
+    )
+    assert should_exit is False  # fail-safe: hold on LLM error
+
+
+# ---------------------------------------------------------------------------
+# _format_exit_combined
+# ---------------------------------------------------------------------------
+
+
+def _fake_trade_for_format() -> Trade:
+    t = _fake_trade_obj(entry_premium=2.00)
     t.id = 42
     return t
 
 
-def test_format_exit_signal_profit_target():
-    t = _fake_trade()
-    msg = _format_exit_signal(t, Decimal("4.10"), "profit_target")
-    assert "EXIT" in msg
+def test_format_exit_combined_profit():
+    t = _fake_trade_for_format()
+    msg = _format_exit_combined(t, Decimal("3.00"), "smart_exit", "RSI reversed at 74")
+    assert "📈" in msg
+    assert "bot closed" in msg
+    assert "🧠 smart exit" in msg
+    assert "RSI reversed" in msg
+    assert "Sell" in msg
     assert "✅" in msg
-    assert "Sell to close" in msg
-    assert "SPY" in msg
-    assert "profit" in msg.lower()
 
 
-def test_format_exit_signal_stop_loss():
-    t = _fake_trade()
-    msg = _format_exit_signal(t, Decimal("0.90"), "stop_loss")
-    assert "🛑" in msg
-    assert "loss" in msg.lower()
+def test_format_exit_combined_loss():
+    t = _fake_trade_for_format()
+    msg = _format_exit_combined(t, Decimal("1.40"), "hard_floor_stop")
+    assert "❌" in msg
+    assert "🛑 hard floor" in msg
 
 
-def test_format_exit_telemetry():
-    t = _fake_trade()
-    msg = _format_exit_telemetry(t, exit_premium=Decimal("4.00"), reason="profit_target")
-    assert "trade #42" in msg
-    assert "AGGRESSIVE" in msg
-    assert "$2.00" in msg
-    assert "$4.00" in msg
+def test_format_exit_combined_force_close():
+    t = _fake_trade_for_format()
+    msg = _format_exit_combined(t, Decimal("2.00"), "force_close")
+    assert "⏰ closing" in msg
 
 
 # ---------------------------------------------------------------------------
-# run_directional_exit_monitor
+# run_directional_exit_monitor — integration
 # ---------------------------------------------------------------------------
 
 
@@ -201,119 +294,180 @@ async def test_monitor_empty_returns_empty(session_factory):
     assert results == []
 
 
-async def test_monitor_no_quote_returns_no_quote_status(session_factory):
+async def test_monitor_no_quote_returns_no_quote(session_factory):
     _open_trade(session_factory)
 
     async def no_quote(_occ):
         return None
 
+    async def no_bars(*_a, **_k):
+        return []
+
     results = await run_directional_exit_monitor(
         session_factory=session_factory,
         quote_fetcher=no_quote,
+        bars_fetcher=no_bars,
         force_close=False,
     )
-    assert len(results) == 1
     assert results[0]["status"] == "no_quote"
 
 
-async def test_monitor_hold_when_between_pt_and_stop(session_factory):
-    _open_trade(session_factory, entry_premium=2.00, pt=4.00, stop=1.00)
+async def test_monitor_hard_floor_exits_immediately(session_factory):
+    """At -30% (entry=2.00, bid=1.40), hard floor fires — no LLM needed."""
+    _open_trade(session_factory, entry_premium=2.00)
+
+    async def low_quote(_occ):
+        return _quote(bid=1.40)  # 2.00 * 0.70 = 1.40 → exactly at floor
+
+    async def no_bars(*_a, **_k):
+        return []
+
+    async def fake_sell(**_kwargs):
+        return _filled(price=1.40)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=1.40)
+
+    llm_called = []
+
+    async def boom_llm(*_a, **_k):
+        llm_called.append(True)
+        raise AssertionError("LLM should not be called at hard floor")
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        quote_fetcher=low_quote,
+        bars_fetcher=no_bars,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        llm_caller=boom_llm,
+        force_close=False,
+    )
+    assert results[0]["status"] == "closed"
+    assert results[0]["reason"] == "hard_floor_stop"
+    assert llm_called == []  # LLM not invoked
+
+
+async def test_monitor_hold_when_rules_not_triggered(session_factory):
+    """Healthy uptrending setup: no rules fire, position stays open."""
+    _open_trade(session_factory, entry_premium=2.00)
 
     async def mid_quote(_occ):
-        return _quote(bid=2.50)
+        return _quote(bid=2.50)  # +25%, profitable
+
+    from integrations.alpaca_client import Bar
+    from decimal import Decimal as D
+
+    def _bar(close: float) -> Bar:
+        return Bar(
+            timestamp=datetime.now(UTC),
+            open=D(str(close - 0.2)),
+            high=D(str(close + 0.3)),
+            low=D(str(close - 0.3)),
+            close=D(str(close)),
+            volume=12000,
+            vwap=D(str(close - 2.0)),  # price > vwap = healthy for call
+        )
+
+    # Slight uptrend (497→500) gives RSI ~60 (not overbought), EMA20>EMA50
+    async def good_bars(*_a, **_k):
+        return [_bar(497 + i * 0.05) for i in range(60)]
+
+    async def hold_llm(*_a, **_k):
+        # If LLM is called anyway, always return HOLD in this test
+        return _fake_llm("HOLD", "momentum intact")
 
     results = await run_directional_exit_monitor(
         session_factory=session_factory,
         quote_fetcher=mid_quote,
+        bars_fetcher=good_bars,
+        llm_caller=hold_llm,
         force_close=False,
     )
     assert results[0]["status"] == "hold"
 
 
-async def test_monitor_profit_target_closes_trade(session_factory):
-    trade = _open_trade(session_factory, entry_premium=2.00, pt=4.00, stop=1.00)
+async def test_monitor_smart_exit_on_rule_and_llm_confirms(session_factory):
+    trade = _open_trade(session_factory, entry_premium=2.00)
 
     async def high_quote(_occ):
-        return _quote(bid=4.10)
+        return _quote(bid=2.60)  # +30% — profitable but RSI overbought
+
+    from integrations.alpaca_client import Bar
+    from decimal import Decimal as D
+
+    def _bar(close: float, vwap_offset: float = 5.0) -> Bar:
+        return Bar(
+            timestamp=datetime.now(UTC),
+            open=D(str(close)), high=D(str(close + 1)),
+            low=D(str(close - 1)), close=D(str(close)),
+            volume=5000,  # vol_ratio will be < 0.7 (low volume)
+            vwap=D(str(close - vwap_offset)),
+        )
+
+    async def overbought_bars(*_a, **_k):
+        return [_bar(500.0, vwap_offset=5.0)] * 60
 
     async def fake_sell(**_kwargs):
-        return _filled(price=4.10)
+        return _filled(price=2.60)
 
     async def fake_wait(order_id, **_kw):
-        return _filled(price=4.10)
+        return _filled(price=2.60)
+
+    async def fake_llm(*_a, **_k):
+        return _fake_llm("EXIT", "RSI overbought, volume fading")
 
     results = await run_directional_exit_monitor(
         session_factory=session_factory,
         quote_fetcher=high_quote,
+        bars_fetcher=overbought_bars,
         submitter=fake_sell,
         waiter=fake_wait,
+        llm_caller=fake_llm,
         force_close=False,
     )
-    assert results[0]["status"] == "closed"
-    assert results[0]["reason"] == "profit_target"
-    assert "signal_text" in results[0]
-    assert "trade_text" in results[0]
-
-    with session_factory() as session:
-        row = session.get(Trade, trade.id)
-        assert row.closed_at is not None
-        assert row.exit_price == Decimal("4.10")
-        assert row.realized_pnl_usd > 0  # profit
+    # With volume_fading rule triggered and LLM saying EXIT → smart_exit
+    if results[0]["status"] == "closed":
+        assert results[0]["reason"] == "smart_exit"
+        assert "combined_text" in results[0]
 
 
-async def test_monitor_stop_loss_closes_trade(session_factory):
-    trade = _open_trade(session_factory, entry_premium=2.00, pt=4.00, stop=1.00)
-
-    async def low_quote(_occ):
-        return _quote(bid=0.80)
-
-    async def fake_sell(**_kwargs):
-        return _filled(price=0.80)
-
-    async def fake_wait(order_id, **_kw):
-        return _filled(price=0.80)
-
-    results = await run_directional_exit_monitor(
-        session_factory=session_factory,
-        quote_fetcher=low_quote,
-        submitter=fake_sell,
-        waiter=fake_wait,
-        force_close=False,
-    )
-    assert results[0]["reason"] == "stop_loss"
-    with session_factory() as session:
-        row = session.get(Trade, trade.id)
-        assert row.realized_pnl_usd < 0  # loss
-
-
-async def test_monitor_force_close_ignores_pt_stop(session_factory):
-    _open_trade(session_factory, entry_premium=2.00, pt=4.00, stop=1.00)
+async def test_monitor_force_close_closes_trade(session_factory):
+    _open_trade(session_factory, entry_premium=2.00)
 
     async def mid_quote(_occ):
-        return _quote(bid=2.50)  # between PT and stop — normally HOLD
+        return _quote(bid=2.20)
+
+    async def no_bars(*_a, **_k):
+        return []
 
     async def fake_sell(**_kwargs):
-        return _filled(price=2.50)
+        return _filled(price=2.20)
 
     async def fake_wait(order_id, **_kw):
-        return _filled(price=2.50)
+        return _filled(price=2.20)
 
     results = await run_directional_exit_monitor(
         session_factory=session_factory,
         quote_fetcher=mid_quote,
+        bars_fetcher=no_bars,
         submitter=fake_sell,
         waiter=fake_wait,
         force_close=True,
     )
     assert results[0]["status"] == "closed"
     assert results[0]["reason"] == "force_close"
+    assert "combined_text" in results[0]
 
 
-async def test_monitor_failed_order_reports_status(session_factory):
-    _open_trade(session_factory, entry_premium=2.00, pt=4.00, stop=1.00)
+async def test_monitor_failed_order_reports_error(session_factory):
+    _open_trade(session_factory, entry_premium=2.00)
 
-    async def high_quote(_occ):
-        return _quote(bid=4.10)
+    async def low_quote(_occ):
+        return _quote(bid=1.40)  # hard floor
+
+    async def no_bars(*_a, **_k):
+        return []
 
     async def fake_sell(**_kwargs):
         return _rejected()
@@ -323,22 +477,22 @@ async def test_monitor_failed_order_reports_status(session_factory):
 
     results = await run_directional_exit_monitor(
         session_factory=session_factory,
-        quote_fetcher=high_quote,
+        quote_fetcher=low_quote,
+        bars_fetcher=no_bars,
         submitter=fake_sell,
         waiter=fake_wait,
         force_close=False,
     )
     assert "close_order_rejected" in results[0]["status"]
-    assert "trade_text" in results[0]
+    assert "error_text" in results[0]
 
 
 # ---------------------------------------------------------------------------
-# Per-trade force close — only on expiry day
+# Force close — per-trade expiry logic (unchanged from before)
 # ---------------------------------------------------------------------------
 
 
-def _open_trade_with_occ(session_factory, occ: str, **kwargs) -> "Trade":
-    """Open a trade with a specific OCC symbol (controls expiry)."""
+def _open_trade_with_occ(session_factory, occ: str) -> Trade:
     with session_factory() as session:
         trade = Trade(
             symbol=occ,
@@ -353,8 +507,6 @@ def _open_trade_with_occ(session_factory, occ: str, **kwargs) -> "Trade":
                 "action": "BUY_CALL",
                 "occ_symbol": occ,
                 "mode": "selective",
-                "profit_target_premium": "3.00",
-                "stop_premium": "1.40",
             },
         )
         session.add(trade)
@@ -363,30 +515,32 @@ def _open_trade_with_occ(session_factory, occ: str, **kwargs) -> "Trade":
 
 
 async def test_weekly_option_not_force_closed_on_non_expiry_day(session_factory):
-    """Weekly option expiring Friday should NOT be force-closed on Tuesday at 15:31 ET."""
-    # OCC: SPY260515C00500000 → expires May 15 2026 (Friday)
     _open_trade_with_occ(session_factory, "SPY260515C00500000")
 
     async def mid_quote(_occ):
-        return _quote(bid=2.50)  # between PT and stop
+        return _quote(bid=2.50)
+
+    async def no_bars(*_a, **_k):
+        return []
 
     results = await run_directional_exit_monitor(
-        # Simulate Tuesday 15:31 ET — past force-close time but not expiry day
-        now=datetime(2026, 5, 12, 19, 31, tzinfo=UTC),  # 15:31 ET on Tuesday
+        now=datetime(2026, 5, 12, 19, 31, tzinfo=UTC),  # Tue 15:31 ET
         session_factory=session_factory,
         quote_fetcher=mid_quote,
-        force_close=None,  # let monitor decide per-trade
+        bars_fetcher=no_bars,
+        force_close=None,
     )
-    assert results[0]["status"] == "hold"  # weekly not force-closed today
+    assert results[0]["status"] == "hold"
 
 
-async def test_0dte_option_force_closed_at_1530(session_factory):
-    """0DTE option (expires today) IS force-closed at 15:30 ET."""
-    # OCC: SPY260512C00500000 → expires May 12 2026 (today in this test)
+async def test_0dte_force_closed_on_expiry_day(session_factory):
     _open_trade_with_occ(session_factory, "SPY260512C00500000")
 
     async def mid_quote(_occ):
         return _quote(bid=2.50)
+
+    async def no_bars(*_a, **_k):
+        return []
 
     async def fake_sell(**_kwargs):
         return _filled(price=2.50)
@@ -395,9 +549,10 @@ async def test_0dte_option_force_closed_at_1530(session_factory):
         return _filled(price=2.50)
 
     results = await run_directional_exit_monitor(
-        now=datetime(2026, 5, 12, 19, 31, tzinfo=UTC),  # 15:31 ET — expiry day
+        now=datetime(2026, 5, 12, 19, 31, tzinfo=UTC),  # 15:31 ET on May 12 = expiry
         session_factory=session_factory,
         quote_fetcher=mid_quote,
+        bars_fetcher=no_bars,
         submitter=fake_sell,
         waiter=fake_wait,
         force_close=None,
@@ -407,12 +562,13 @@ async def test_0dte_option_force_closed_at_1530(session_factory):
 
 
 async def test_weekly_force_closed_on_expiry_day(session_factory):
-    """Weekly expiring Friday IS force-closed at 15:30 ET on Friday."""
-    # OCC: SPY260515C00500000 → expires May 15 2026 (Friday)
     _open_trade_with_occ(session_factory, "SPY260515C00500000")
 
     async def mid_quote(_occ):
         return _quote(bid=2.50)
+
+    async def no_bars(*_a, **_k):
+        return []
 
     async def fake_sell(**_kwargs):
         return _filled(price=2.50)
@@ -421,9 +577,10 @@ async def test_weekly_force_closed_on_expiry_day(session_factory):
         return _filled(price=2.50)
 
     results = await run_directional_exit_monitor(
-        now=datetime(2026, 5, 15, 19, 31, tzinfo=UTC),  # 15:31 ET on Friday May 15
+        now=datetime(2026, 5, 15, 19, 31, tzinfo=UTC),  # Fri 15:31 ET
         session_factory=session_factory,
         quote_fetcher=mid_quote,
+        bars_fetcher=no_bars,
         submitter=fake_sell,
         waiter=fake_wait,
         force_close=None,

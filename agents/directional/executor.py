@@ -56,12 +56,18 @@ class DirectionalExecutionResult:
         trade_id: int | None,
         reason: str,
         trade_text: str | None = None,
+        qty: int | None = None,
+        occ: str | None = None,
+        entry_premium: "Decimal | None" = None,
     ) -> None:
         self.executed = executed
         self.order = order
         self.trade_id = trade_id
         self.reason = reason
         self.trade_text = trade_text
+        self.qty = qty
+        self.occ = occ
+        self.entry_premium = entry_premium
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +104,7 @@ def _persist_entry(
     stop_premium: Decimal,
     mode: str,
     order: OrderResult,
+    entry_reasoning: str = "",
 ) -> int:
     strategy = STRATEGY_CALL if action == "BUY_CALL" else STRATEGY_PUT
     row = Trade(
@@ -116,6 +123,7 @@ def _persist_entry(
             "mode": mode,
             "profit_target_premium": str(profit_target_premium),
             "stop_premium": str(stop_premium),
+            "entry_reasoning": entry_reasoning[:300],
             "fill_status": order.status,
             "filled_avg_price": (
                 str(order.filled_avg_price) if order.filled_avg_price else None
@@ -265,22 +273,15 @@ async def execute_directional_signal(
             stop_premium=stop_premium,
             mode=mode,
             order=final,
+            entry_reasoning=decision.reasoning,
         )
 
-    trade_text = _format_trade_text(
-        decision,
-        trade_id=trade_id,
-        qty=qty,
-        occ=occ,
-        entry_premium=filled_premium,
-        profit_target_premium=profit_target_premium,
-        stop_premium=stop_premium,
-        mode=mode,
-    )
     return DirectionalExecutionResult(
         executed=True,
         order=final,
         trade_id=trade_id,
         reason=f"filled {qty}× {occ} at ${filled_premium}",
-        trade_text=trade_text,
+        qty=qty,
+        occ=occ,
+        entry_premium=filled_premium,
     )

@@ -219,6 +219,40 @@ def format_scan_report(
     return "\n".join(lines)
 
 
+def format_entry_combined(
+    decision: TickerDecision,
+    *,
+    today: date,
+    mode: str,
+    trade_id: int,
+    qty: int,
+    occ: str,
+    entry_premium: Decimal,
+    total_cost: Decimal,
+) -> str:
+    """Single #signals message combining entry signal + execution confirmation."""
+    action_word = "BUY CALL" if decision.action == "BUY_CALL" else "BUY PUT"
+    icon = "📈" if decision.action == "BUY_CALL" else "📉"
+    option_word = "Call" if decision.action == "BUY_CALL" else "Put"
+
+    if decision.expiry == "0DTE":
+        manual_expiry = today.strftime("%b %-d")
+    else:
+        wk = _next_friday(today)
+        manual_expiry = wk.strftime("%b %-d")
+
+    return (
+        f"{icon} **{decision.ticker} {action_word} — bot entered** [{mode.upper()}]\n"
+        f"\n"
+        f"Bot: **{qty}×** `{occ}` @ **${entry_premium}**/share (${total_cost} total)\n"
+        f"**Manual entry: Buy {decision.ticker} {manual_expiry} "
+        f"${decision.strike} {option_word}**\n"
+        f"\n"
+        f"Why: {decision.reasoning}\n"
+        f"Conviction: {decision.conviction} · Smart exit active (hard floor: −30%)"
+    )
+
+
 def format_directional_signal(
     d: TickerDecision, *, today: date, mode: str = "selective"
 ) -> str:
