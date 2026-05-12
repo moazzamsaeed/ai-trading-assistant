@@ -386,7 +386,7 @@ def make_scheduler(
         misfire_grace_time=120,
     )
 
-    # Directional fallback scan — every 30 min during RTH.
+    # Directional fallback scan — every 60 min during RTH.
     # Real-time triggers come from the WebSocket stream (alpaca_stream.py).
     # This fallback catches slow-building setups and guards against stream gaps.
     scheduler.add_job(
@@ -394,7 +394,7 @@ def make_scheduler(
         CronTrigger(
             day_of_week="mon-fri",
             hour="9-15",
-            minute="0,30",
+            minute="0",
             timezone=PREMARKET_TZ,
         ),
         kwargs={
