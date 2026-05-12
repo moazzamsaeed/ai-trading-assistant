@@ -166,6 +166,24 @@ async def test_execute_max_concurrent_blocks(session_factory, monkeypatch):
     cfg.get_settings.cache_clear()
 
 
+async def test_execute_too_expensive_skips(session_factory):
+    """If 1 contract costs more than position_usd, skip rather than overspend."""
+    async def expensive_quote(_occ):
+        # $8/share × 100 = $800/contract > $750 aggressive position cap
+        return _quote(ask=8.00)
+
+    result = await execute_directional_signal(
+        _decision(),
+        today=date(2026, 1, 2),
+        mode="aggressive",
+        session_factory=session_factory,
+        quote_fetcher=expensive_quote,
+    )
+    assert not result.executed
+    assert "exceeds" in result.reason
+    assert "$800" in result.reason
+
+
 async def test_execute_no_quote_skips(session_factory):
     async def fake_quote(_occ):
         return None

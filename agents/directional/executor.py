@@ -207,7 +207,23 @@ async def execute_directional_signal(
     exit_pcts = _EXIT_PCT.get(mode, _EXIT_PCT["selective"])
     size_frac = _SIZE_FRACTION.get(mode, _SIZE_FRACTION["selective"])
     position_usd = float(settings.trading_capital_usd) * size_frac
-    qty = max(1, math.floor(position_usd / (float(quote.ask) * 100)))
+    one_contract_cost = float(quote.ask) * 100
+    if one_contract_cost > position_usd:
+        log.info(
+            "directional_execute_skipped_too_expensive",
+            occ=occ,
+            ask=float(quote.ask),
+            one_contract_cost=one_contract_cost,
+            position_cap=position_usd,
+        )
+        return DirectionalExecutionResult(
+            executed=False, order=None, trade_id=None,
+            reason=(
+                f"1 contract costs ${one_contract_cost:.0f} — "
+                f"exceeds ${position_usd:.0f} position cap"
+            ),
+        )
+    qty = max(1, math.floor(position_usd / one_contract_cost))
 
     entry_premium = quote.ask
     profit_target_premium = (

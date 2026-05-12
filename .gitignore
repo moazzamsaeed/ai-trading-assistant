@@ -49,8 +49,9 @@ out/
 .yarn/
 .pnp.*
 
-# Databases and data
+# Databases and data (watchlist.json is tracked — see exception below)
 data/
+!data/watchlist.json
 *.db
 *.sqlite
 *.sqlite3
