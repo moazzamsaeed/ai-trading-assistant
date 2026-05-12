@@ -81,11 +81,16 @@ class TradeMasterBot(commands.Bot):
         self._watchlist_channel_id = _chan(settings.discord_channel_watchlist)
         self._guild_id = _chan(settings.discord_guild_id)
         self._app_ready = asyncio.Event()
+        self._owner_id: int | None = None
         self._task: asyncio.Task | None = None
         self._register_commands()
 
     async def on_ready(self) -> None:
         log.info("discord_ready", user=str(self.user))
+        # Cache owner ID once so the check in every slash command is instant
+        # (avoids a round-trip that eats into Discord's 3-second response window).
+        app = await self.application_info()
+        self._owner_id = app.owner.id
         # Sync slash commands. Per-guild sync is fast; global takes up to an hour.
         if self._guild_id:
             guild = discord.Object(id=self._guild_id)
@@ -144,9 +149,8 @@ class TradeMasterBot(commands.Bot):
     # ---------- slash commands ----------
 
     def _register_commands(self) -> None:
-        async def owner_only(interaction: discord.Interaction) -> bool:
-            app = await self.application_info()
-            return interaction.user.id == app.owner.id
+        def owner_only(interaction: discord.Interaction) -> bool:
+            return self._owner_id is not None and interaction.user.id == self._owner_id
 
         tree = self.tree
 
@@ -275,7 +279,11 @@ class TradeMasterBot(commands.Bot):
             else:
                 log.error("app_command_error", error=str(error))
                 msg = f"⚠️ Command error: `{type(error).__name__}: {error}`"
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except discord.HTTPException:
+                # Interaction expired before we could reply — nothing to do.
+                pass
