@@ -631,6 +631,7 @@ async def submit_single_option_buy(
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
         limit_price=float(limit_price),
+        position_intent=PositionIntent.BUY_TO_OPEN,
     )
 
     def _do() -> OrderResult:
@@ -662,6 +663,7 @@ async def submit_single_option_sell(
         side=OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
         limit_price=float(limit_price),
+        position_intent=PositionIntent.SELL_TO_CLOSE,
     )
 
     def _do() -> OrderResult:
