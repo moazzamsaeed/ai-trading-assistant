@@ -98,7 +98,7 @@ async def _run_directional_once() -> None:
     configure_logging()
     get_settings().require_live_keys()
     async with TradeMasterBot() as bot:
-        await run_directional_once(bot.post_signal, log_poster=bot.post_log)
+        await run_directional_once(bot.post_signal, bot.post_trade, bot.post_research, log_poster=bot.post_log)
 
 
 def main() -> None:

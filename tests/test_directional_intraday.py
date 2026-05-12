@@ -194,7 +194,7 @@ async def test_scan_actionable_returns_messages(monkeypatch, session_factory):
 
     monkeypatch.setattr(agent, "route_to_model", fake_route)
 
-    decisions, messages = await agent.run_directional_scan(
+    decisions, messages, _report = await agent.run_directional_scan(
         watchlist=("SPY", "QQQ"),
         session_factory=session_factory,
         bars_fetcher=fake_bars,
@@ -232,7 +232,7 @@ async def test_scan_all_hold_returns_no_messages(monkeypatch, session_factory):
 
     monkeypatch.setattr(agent, "route_to_model", fake_route)
 
-    decisions, messages = await agent.run_directional_scan(
+    decisions, messages, _report = await agent.run_directional_scan(
         watchlist=("SPY",),
         session_factory=session_factory,
         bars_fetcher=fake_bars,
@@ -267,7 +267,7 @@ async def test_scan_handles_bars_fetch_failure(monkeypatch, session_factory):
 
     monkeypatch.setattr(agent, "route_to_model", fake_route)
 
-    decisions, _ = await agent.run_directional_scan(
+    decisions, _, _report = await agent.run_directional_scan(
         watchlist=("BROKEN", "SPY"),
         session_factory=session_factory,
         bars_fetcher=fake_bars,
@@ -279,7 +279,7 @@ async def test_scan_handles_bars_fetch_failure(monkeypatch, session_factory):
 
 
 async def test_scan_empty_watchlist_returns_empty():
-    decisions, messages = await agent.run_directional_scan(watchlist=())
+    decisions, messages, _report = await agent.run_directional_scan(watchlist=())
     assert decisions == []
     assert messages == []
 
@@ -304,7 +304,7 @@ async def test_scan_aggressive_filters_medium_conviction(monkeypatch, session_fa
 
     monkeypatch.setattr(agent, "route_to_model", fake_route)
 
-    decisions, messages = await agent.run_directional_scan(
+    decisions, messages, _report = await agent.run_directional_scan(
         watchlist=("SPY", "QQQ"),
         session_factory=session_factory,
         bars_fetcher=fake_bars,
@@ -334,7 +334,7 @@ async def test_scan_selective_passes_medium_conviction(monkeypatch, session_fact
 
     monkeypatch.setattr(agent, "route_to_model", fake_route)
 
-    decisions, messages = await agent.run_directional_scan(
+    decisions, messages, _report = await agent.run_directional_scan(
         watchlist=("SPY",),
         session_factory=session_factory,
         bars_fetcher=fake_bars,

@@ -105,6 +105,7 @@ async def _directional_scan_job(
     *,
     signal_poster: Poster,
     trade_poster: Poster,
+    research_poster: Poster,
     log_poster: Poster = _noop_poster,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
 ) -> None:
@@ -128,7 +129,7 @@ async def _directional_scan_job(
         return
 
     try:
-        decisions, messages = await run_directional_scan()
+        decisions, messages, scan_report = await run_directional_scan()
     except Exception as e:  # noqa: BLE001
         log.error(
             "directional_scan_failed",
@@ -140,7 +141,10 @@ async def _directional_scan_job(
         )
         return
 
-    # Post signals first so the user sees the alert before the fill notification.
+    # Always post the scan report to #research so the user can see reasoning.
+    await research_poster(scan_report)
+
+    # Post signals to #signals so the user can manually trade alongside the bot.
     for msg in messages:
         await signal_poster(msg)
 
@@ -375,6 +379,7 @@ def make_scheduler(
         kwargs={
             "signal_poster": signal_poster,
             "trade_poster": trade_poster,
+            "research_poster": research_poster,
             "log_poster": log_post,
         },
         id="directional_scan",
@@ -513,6 +518,7 @@ async def run_intraday_once(
 async def run_directional_once(
     signal_poster: Poster,
     trade_poster: Poster,
+    research_poster: Poster,
     *,
     log_poster: Poster | None = None,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
@@ -521,6 +527,7 @@ async def run_directional_once(
     await _directional_scan_job(
         signal_poster=signal_poster,
         trade_poster=trade_poster,
+        research_poster=research_poster,
         log_poster=log_poster or _noop_poster,
         clock_fetcher=clock_fetcher,
     )

@@ -186,6 +186,39 @@ def _next_friday(today: date) -> date:
     return today + timedelta(days=days)
 
 
+def format_scan_report(
+    decisions: list[TickerDecision],
+    *,
+    now: datetime,
+    mode: str,
+    cost_usd: str,
+    n_actionable: int,
+) -> str:
+    """One-message scan summary for #research — posted after every scan."""
+    et_time = now.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York"))
+    time_str = et_time.strftime("%I:%M %p ET").lstrip("0")
+
+    lines = [
+        f"📊 **Directional Scan — {time_str}** [{mode.upper()}]",
+        f"{len(decisions)} tickers · {n_actionable} signal{'s' if n_actionable != 1 else ''} · cost ${cost_usd}",
+        "",
+    ]
+    for d in decisions:
+        if d.action == "BUY_CALL":
+            icon = "📈"
+            action_str = f"BUY CALL · strike ${d.strike} · {d.expiry} · {d.conviction}"
+        elif d.action == "BUY_PUT":
+            icon = "📉"
+            action_str = f"BUY PUT · strike ${d.strike} · {d.expiry} · {d.conviction}"
+        else:
+            icon = "⬜"
+            action_str = f"HOLD · {d.conviction}"
+        lines.append(f"{icon} **{d.ticker}** — {action_str}")
+        if d.reasoning:
+            lines.append(f"  _{d.reasoning}_")
+    return "\n".join(lines)
+
+
 def format_directional_signal(
     d: TickerDecision, *, today: date, mode: str = "selective"
 ) -> str:
@@ -222,11 +255,11 @@ async def run_directional_scan(
     bars_fetcher=alpaca_client.get_recent_bars,
     news_fetcher=alpaca_client.get_recent_news,
     mode: str | None = None,
-) -> tuple[list[TickerDecision], list[str]]:
-    """Scan the watchlist, return (decisions, signal_messages).
+) -> tuple[list[TickerDecision], list[str], str]:
+    """Scan the watchlist, return (decisions, signal_messages, scan_report).
 
-    `signal_messages` is the list of formatted strings ready to post to
-    #signals — only for tickers where action != HOLD.
+    `signal_messages` contains formatted strings for #signals (BUY signals only).
+    `scan_report` is a per-ticker summary for #research (always, including HOLDs).
     """
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
@@ -237,7 +270,7 @@ async def run_directional_scan(
         watchlist = load_tickers()
     tickers = list(watchlist)
     if not tickers:
-        return [], []
+        return [], [], ""
 
     # Per-ticker context (bars + news + indicators) — gather in parallel-ish.
     ticker_blocks: list[str] = []
@@ -323,4 +356,11 @@ async def run_directional_scan(
         actions=[f"{d.ticker}:{d.action}" for d in actionable],
         cost_usd=str(response.cost_usd),
     )
-    return decisions, messages
+    scan_report = format_scan_report(
+        decisions,
+        now=now,
+        mode=mode,
+        cost_usd=str(response.cost_usd),
+        n_actionable=len(actionable),
+    )
+    return decisions, messages, scan_report
