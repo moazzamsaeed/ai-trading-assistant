@@ -330,3 +330,103 @@ async def test_monitor_failed_order_reports_status(session_factory):
     )
     assert "close_order_rejected" in results[0]["status"]
     assert "trade_text" in results[0]
+
+
+# ---------------------------------------------------------------------------
+# Per-trade force close — only on expiry day
+# ---------------------------------------------------------------------------
+
+
+def _open_trade_with_occ(session_factory, occ: str, **kwargs) -> "Trade":
+    """Open a trade with a specific OCC symbol (controls expiry)."""
+    with session_factory() as session:
+        trade = Trade(
+            symbol=occ,
+            asset_class="option",
+            side="buy",
+            strategy="directional_call",
+            qty=Decimal("1"),
+            entry_price=Decimal("2.00"),
+            opened_at=datetime.now(UTC),
+            extra={
+                "ticker": occ[:3],
+                "action": "BUY_CALL",
+                "occ_symbol": occ,
+                "mode": "selective",
+                "profit_target_premium": "3.00",
+                "stop_premium": "1.40",
+            },
+        )
+        session.add(trade)
+        session.commit()
+        return trade
+
+
+async def test_weekly_option_not_force_closed_on_non_expiry_day(session_factory):
+    """Weekly option expiring Friday should NOT be force-closed on Tuesday at 15:31 ET."""
+    # OCC: SPY260515C00500000 → expires May 15 2026 (Friday)
+    _open_trade_with_occ(session_factory, "SPY260515C00500000")
+
+    async def mid_quote(_occ):
+        return _quote(bid=2.50)  # between PT and stop
+
+    results = await run_directional_exit_monitor(
+        # Simulate Tuesday 15:31 ET — past force-close time but not expiry day
+        now=datetime(2026, 5, 12, 19, 31, tzinfo=UTC),  # 15:31 ET on Tuesday
+        session_factory=session_factory,
+        quote_fetcher=mid_quote,
+        force_close=None,  # let monitor decide per-trade
+    )
+    assert results[0]["status"] == "hold"  # weekly not force-closed today
+
+
+async def test_0dte_option_force_closed_at_1530(session_factory):
+    """0DTE option (expires today) IS force-closed at 15:30 ET."""
+    # OCC: SPY260512C00500000 → expires May 12 2026 (today in this test)
+    _open_trade_with_occ(session_factory, "SPY260512C00500000")
+
+    async def mid_quote(_occ):
+        return _quote(bid=2.50)
+
+    async def fake_sell(**_kwargs):
+        return _filled(price=2.50)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=2.50)
+
+    results = await run_directional_exit_monitor(
+        now=datetime(2026, 5, 12, 19, 31, tzinfo=UTC),  # 15:31 ET — expiry day
+        session_factory=session_factory,
+        quote_fetcher=mid_quote,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        force_close=None,
+    )
+    assert results[0]["status"] == "closed"
+    assert results[0]["reason"] == "force_close"
+
+
+async def test_weekly_force_closed_on_expiry_day(session_factory):
+    """Weekly expiring Friday IS force-closed at 15:30 ET on Friday."""
+    # OCC: SPY260515C00500000 → expires May 15 2026 (Friday)
+    _open_trade_with_occ(session_factory, "SPY260515C00500000")
+
+    async def mid_quote(_occ):
+        return _quote(bid=2.50)
+
+    async def fake_sell(**_kwargs):
+        return _filled(price=2.50)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=2.50)
+
+    results = await run_directional_exit_monitor(
+        now=datetime(2026, 5, 15, 19, 31, tzinfo=UTC),  # 15:31 ET on Friday May 15
+        session_factory=session_factory,
+        quote_fetcher=mid_quote,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        force_close=None,
+    )
+    assert results[0]["status"] == "closed"
+    assert results[0]["reason"] == "force_close"

@@ -1,10 +1,11 @@
 """Directional options exit monitor.
 
 Runs every 5 min during RTH. For each open directional Trade row:
-  - fetch current bid via Alpaca options chain
   - bid >= profit_target_premium → close (profit_target)
   - bid <= stop_premium          → close (stop_loss)
-  - ET time >= 15:30             → close (force_close)
+  - ET time >= 15:30 AND option expires today → close (force_close)
+    0DTE: force-closed every day at 15:30.
+    Weekly: force-closed only on the expiry date (e.g. Friday at 15:30).
 
 On a close fill:
   - updates the Trade row (exit_price, realized_pnl_usd, closed_at)
@@ -23,7 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from integrations import alpaca_client
-from integrations.alpaca_client import OrderResult, get_single_option_quote
+from integrations.alpaca_client import OrderResult, get_single_option_quote, parse_occ_symbol
 from trademaster.db import Trade, make_session_factory
 from trademaster.logging import get_logger
 
@@ -152,8 +153,13 @@ async def run_directional_exit_monitor(
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
 
-    if force_close is None:
-        force_close = now.astimezone(ET).time() >= FORCE_CLOSE_AFTER
+    et_now = now.astimezone(ET)
+    past_force_close_time = et_now.time() >= FORCE_CLOSE_AFTER
+    today_et = et_now.date()
+
+    # force_close param lets the scheduler override (e.g. the 15:30 cron job).
+    # When None we derive it per-trade: only force-close if it's expiry day.
+    global_force = force_close  # None means "decide per trade"
 
     with factory() as session:
         trades = _open_directional_trades(session)
@@ -165,6 +171,19 @@ async def run_directional_exit_monitor(
     for trade in trades:
         extra = trade.extra or {}
         occ = extra.get("occ_symbol", trade.symbol)
+
+        # Determine whether to force-close this specific trade.
+        # 0DTE options must close today; weekly options only close on expiry day.
+        if global_force is not None:
+            trade_force = global_force
+        elif past_force_close_time:
+            try:
+                _, expiry, _, _ = parse_occ_symbol(occ)
+                trade_force = expiry == today_et
+            except ValueError:
+                trade_force = True  # can't parse → close to be safe
+        else:
+            trade_force = False
 
         quote = await quote_fetcher(occ)
         if quote is None or quote.bid <= 0:
@@ -180,7 +199,7 @@ async def run_directional_exit_monitor(
             current_bid=current_bid,
             profit_target_premium=pt_premium,
             stop_premium=stop_premium,
-            force=force_close,
+            force=trade_force,
         )
         if not should_exit:
             results.append({
