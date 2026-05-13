@@ -760,16 +760,28 @@ async def get_recent_bars(
 ) -> list[Bar]:
     """Fetch the last `limit` bars at `timeframe_minutes` granularity.
 
-    Returns oldest-first. Defaults match the intraday agent (5-min × 30 bars
-    = 2.5 hours of recent action).
+    Returns oldest-first. Always anchors to today's RTH open (9:30 AM ET) so
+    the intraday agent sees real-time price action, not stale pre-market bars.
+    Without an explicit start, Alpaca returns extended-hours bars from ~4 AM
+    which causes the agent to miss the entire RTH session.
     """
+    import zoneinfo as _zi
 
     def _fetch() -> list[Bar]:
         tf = TimeFrame(timeframe_minutes, TimeFrameUnit.Minute)
+
+        # Anchor to today's RTH open so we always get intraday bars.
+        # If called before RTH (pre-market), fall back to 4 AM to get some context.
+        et = _zi.ZoneInfo("America/New_York")
+        now_et = datetime.now(UTC).astimezone(et)
+        rth_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        start = rth_open if now_et >= rth_open else now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
             limit=limit,
+            start=start,
         )
         resp = _stock_client().get_stock_bars(req)
         # BarSet is dict[symbol -> list[Bar]] or has a .data attribute
