@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -35,6 +36,11 @@ from trademaster.watchlist import load_tickers
 
 # Prevents concurrent directional scans (stream + scheduler can both trigger).
 _scan_in_progress: bool = False
+
+# Throttle #research posts to at most once per hour across all scan triggers.
+# Trade execution is unaffected — signals are still acted on immediately.
+_last_research_post: datetime | None = None
+_RESEARCH_POST_INTERVAL_SECONDS = 3600
 
 log = get_logger(__name__)
 
@@ -156,16 +162,17 @@ async def _directional_scan_job(
     finally:
         _scan_in_progress = False
 
-    # Post scan report to #research.
-    # Fallback (scheduled) scans always post so the user gets a baseline picture.
-    # Stream-triggered scans only post when there's an actionable signal — all-HOLD
-    # stream scans are silent to avoid flooding #research with noise.
-    if post_report_on_hold or messages:
+    # Post scan report to #research at most once per hour.
+    # Scans and trade execution run on every trigger; only the Discord post is throttled.
+    global _last_research_post
+    now = datetime.now(UTC)
+    elapsed = (now - _last_research_post).total_seconds() if _last_research_post else float("inf")
+    if elapsed >= _RESEARCH_POST_INTERVAL_SECONDS and (post_report_on_hold or messages):
         await research_poster(scan_report)
+        _last_research_post = now
 
     # Auto-execute top 2 decisions (capped to avoid multi-signal floods).
     # Combined entry+execution message posted to #signals — no separate #trades post.
-    from datetime import UTC, datetime
     from decimal import Decimal
     from zoneinfo import ZoneInfo
     today = datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).date()
