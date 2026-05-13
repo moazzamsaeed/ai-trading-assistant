@@ -81,7 +81,12 @@ def _rejected_order() -> OrderResult:
 
 def test_resolve_expiry_0dte():
     today = date(2026, 5, 11)  # Monday
-    assert _resolve_expiry("0DTE", today) == today
+    # SPY has daily options — 0DTE resolves to today
+    assert _resolve_expiry("0DTE", today, "SPY") == today
+    # AMD only has weekly options — 0DTE resolves to next Friday
+    assert _resolve_expiry("0DTE", today, "AMD") == date(2026, 5, 15)
+    # No ticker given — defaults to next Friday (safe fallback)
+    assert _resolve_expiry("0DTE", today) == date(2026, 5, 15)
 
 
 def test_resolve_expiry_weekly_from_monday():
