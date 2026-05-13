@@ -10,6 +10,7 @@ import pytest
 from agents.directional.executor import (
     STRATEGY_CALL,
     STRATEGY_PUT,
+    _SelectedStrike,
     DirectionalExecutionResult,
     _format_trade_text,
     _resolve_expiry,
@@ -50,6 +51,17 @@ def _quote(ask: float = 2.00, bid: float = 1.90) -> OptionQuote:
         mid=Decimal(str((ask + bid) / 2)),
         delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
     )
+
+
+def _selected(ask: float = 2.00):
+    """Return a strike_selector that always picks the given ask price."""
+    q = _quote(ask=ask)
+    sel = _SelectedStrike(strike=Decimal("500"), occ="SPY260101C00500000", quote=q)
+    async def _fn(_ticker, _expiry, _opt_type, _target, _budget):
+        if ask * 100 > _budget:
+            return None
+        return sel
+    return _fn
 
 
 def _filled_order(price: float = 2.00) -> OrderResult:
@@ -172,25 +184,21 @@ async def test_execute_max_concurrent_blocks(session_factory, monkeypatch):
 
 
 async def test_execute_too_expensive_skips(session_factory):
-    """If 1 contract costs more than position_usd, skip rather than overspend."""
-    async def expensive_quote(_occ):
-        # $14/share × 100 = $1400/contract > $1250 aggressive position cap (25% of $5000)
-        return _quote(ask=14.00)
-
+    """selector returns None when ask exceeds budget — execution skipped."""
     result = await execute_directional_signal(
         _decision(),
         today=date(2026, 1, 2),
         mode="aggressive",
         session_factory=session_factory,
-        quote_fetcher=expensive_quote,
+        strike_selector=_selected(ask=14.00),  # $1400/contract > $1250 cap
     )
     assert not result.executed
-    assert "exceeds" in result.reason
-    assert "$1400" in result.reason
+    assert "budget" in result.reason
 
 
 async def test_execute_no_quote_skips(session_factory):
-    async def fake_quote(_occ):
+    """selector returns None when no chain strike found — execution skipped."""
+    async def no_strike(_ticker, _expiry, _opt_type, _target, _budget):
         return None
 
     result = await execute_directional_signal(
@@ -198,16 +206,13 @@ async def test_execute_no_quote_skips(session_factory):
         today=date(2026, 1, 2),
         mode="aggressive",
         session_factory=session_factory,
-        quote_fetcher=fake_quote,
+        strike_selector=no_strike,
     )
     assert not result.executed
-    assert "no live quote" in result.reason
+    assert "budget" in result.reason or "no affordable" in result.reason
 
 
 async def test_execute_order_rejected_no_trade_row(session_factory):
-    async def fake_quote(_occ):
-        return _quote(ask=2.00)
-
     async def fake_submit(**_kwargs):
         return _rejected_order()
 
@@ -219,7 +224,7 @@ async def test_execute_order_rejected_no_trade_row(session_factory):
         today=date(2026, 1, 2),
         mode="aggressive",
         session_factory=session_factory,
-        quote_fetcher=fake_quote,
+        strike_selector=_selected(ask=2.00),
         submitter=fake_submit,
         waiter=fake_wait,
     )
@@ -231,9 +236,6 @@ async def test_execute_order_rejected_no_trade_row(session_factory):
 
 
 async def test_execute_success_persists_trade(session_factory):
-    async def fake_quote(_occ):
-        return _quote(ask=2.00)
-
     async def fake_submit(**_kwargs):
         return _filled_order(price=2.00)
 
@@ -245,7 +247,7 @@ async def test_execute_success_persists_trade(session_factory):
         today=date(2026, 1, 2),
         mode="aggressive",
         session_factory=session_factory,
-        quote_fetcher=fake_quote,
+        strike_selector=_selected(ask=2.00),
         submitter=fake_submit,
         waiter=fake_wait,
     )
@@ -268,9 +270,6 @@ async def test_execute_success_persists_trade(session_factory):
 
 
 async def test_execute_put_persists_correct_strategy(session_factory):
-    async def fake_quote(_occ):
-        return _quote(ask=1.50)
-
     async def fake_submit(**_kwargs):
         return _filled_order(price=1.50)
 
@@ -282,7 +281,7 @@ async def test_execute_put_persists_correct_strategy(session_factory):
         today=date(2026, 1, 2),
         mode="selective",
         session_factory=session_factory,
-        quote_fetcher=fake_quote,
+        strike_selector=_selected(ask=1.50),
         submitter=fake_submit,
         waiter=fake_wait,
     )
@@ -296,9 +295,6 @@ async def test_execute_aggressive_sizing(session_factory):
     """Aggressive mode allocates 25% of $5000 = $1250; at $2/share = 6 contracts."""
     submitted_kwargs = {}
 
-    async def fake_quote(_occ):
-        return _quote(ask=2.00)
-
     async def fake_submit(**kwargs):
         submitted_kwargs.update(kwargs)
         return _filled_order(price=2.00)
@@ -311,7 +307,7 @@ async def test_execute_aggressive_sizing(session_factory):
         today=date(2026, 1, 2),
         mode="aggressive",
         session_factory=session_factory,
-        quote_fetcher=fake_quote,
+        strike_selector=_selected(ask=2.00),
         submitter=fake_submit,
         waiter=fake_wait,
     )

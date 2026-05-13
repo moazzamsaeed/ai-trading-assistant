@@ -27,8 +27,6 @@ from agents.directional.intraday import TickerDecision
 from integrations import alpaca_client
 from integrations.alpaca_client import (
     OrderResult,
-    build_occ_symbol,
-    get_single_option_quote,
 )
 from trademaster.config import get_settings
 from trademaster.db import Trade, make_session_factory
@@ -171,83 +169,59 @@ def _format_trade_text(
 
 
 # ---------------------------------------------------------------------------
-# Strike snapping — find nearest valid chain strike when LLM picks a bad one
+# Unified chain-based strike selection — replaces all per-ticker fallbacks
 # ---------------------------------------------------------------------------
 
 @dataclass
-class _SnappedStrike:
+class _SelectedStrike:
     strike: Decimal
     occ: str
     quote: object
 
 
-async def _snap_to_valid_strike(
+async def select_best_strike(
     ticker: str,
     expiry_date: date,
     option_type: str,
     target_strike: float,
-) -> _SnappedStrike | None:
-    """Fetch a narrow chain window around target_strike and return the nearest valid strike."""
-    window = Decimal("20")  # ±$20 around the target — wide enough for any increment
-    lo = Decimal(str(target_strike)) - window
-    hi = Decimal(str(target_strike)) + window
-    try:
-        quotes = await alpaca_client.get_options_chain(
-            ticker,
-            expiry=expiry_date,
-            strike_lo=lo,
-            strike_hi=hi,
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("directional_snap_chain_failed", error=str(e))
-        return None
-
-    candidates = [
-        q for q in quotes
-        if q.option_type == option_type and q.ask is not None and q.ask > 0
-    ]
-    if not candidates:
-        return None
-
-    best = min(candidates, key=lambda q: abs(float(q.strike) - target_strike))
-    return _SnappedStrike(strike=best.strike, occ=best.occ_symbol, quote=best)
-
-
-async def _find_affordable_strike(
-    ticker: str,
-    expiry_date: date,
-    option_type: str,
-    *,
-    current_strike: float,
     budget: float,
-    max_otm_walk: float = 30.0,
-) -> _SnappedStrike | None:
-    """Walk OTM from current_strike until we find a strike whose ask fits in budget."""
-    # OTM direction: higher strike for calls, lower for puts
-    otm_direction = 1 if option_type == "call" else -1
-    far_strike = current_strike + otm_direction * max_otm_walk
-    lo = Decimal(str(min(current_strike, far_strike)))
-    hi = Decimal(str(max(current_strike, far_strike)))
+) -> _SelectedStrike | None:
+    """Fetch the real option chain and return the best available quoted strike.
+
+    Always goes to the chain — never trusts the LLM's raw strike number.
+    This handles all tickers uniformly: different strike increments ($1/$2.5/$5),
+    missing strikes, and budget constraints are resolved in one pass.
+
+    Selection logic:
+    - Fetch strikes from $10 ITM to $30 OTM relative to target
+    - Filter to those with a live ask quote within budget
+    - Pick the one closest to target (ATM preference over deep OTM)
+    """
+    otm_dir = 1 if option_type == "call" else -1
+    lo = Decimal(str(target_strike - 10))
+    hi = Decimal(str(target_strike + otm_dir * 30))
+    strike_lo, strike_hi = min(lo, hi), max(lo, hi)
+
     try:
         quotes = await alpaca_client.get_options_chain(
-            ticker, expiry=expiry_date, strike_lo=lo, strike_hi=hi,
+            ticker, expiry=expiry_date, strike_lo=strike_lo, strike_hi=strike_hi,
         )
     except Exception as e:  # noqa: BLE001
-        log.warning("directional_otm_walk_chain_failed", error=str(e))
+        log.warning("directional_chain_fetch_failed", ticker=ticker, error=str(e))
         return None
 
     candidates = [
         q for q in quotes
         if q.option_type == option_type
-        and q.ask is not None and q.ask > 0
+        and q.ask is not None
+        and q.ask > 0
         and float(q.ask) * 100 <= budget
     ]
     if not candidates:
         return None
 
-    # Pick closest to current strike (least OTM) that fits the budget
-    best = min(candidates, key=lambda q: abs(float(q.strike) - current_strike))
-    return _SnappedStrike(strike=best.strike, occ=best.occ_symbol, quote=best)
+    best = min(candidates, key=lambda q: abs(float(q.strike) - target_strike))
+    return _SelectedStrike(strike=best.strike, occ=best.occ_symbol, quote=best)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +235,7 @@ async def execute_directional_signal(
     today: date | None = None,
     mode: str | None = None,
     session_factory: Callable[[], Session] | None = None,
-    quote_fetcher: Callable[..., object] = get_single_option_quote,
+    strike_selector: Callable[..., object] = select_best_strike,
     submitter: Callable[..., object] = alpaca_client.submit_single_option_buy,
     waiter: Callable[..., object] = alpaca_client.wait_for_order,
     fill_timeout_s: float = 90.0,
@@ -297,69 +271,42 @@ async def execute_directional_signal(
 
     option_type = "call" if decision.action == "BUY_CALL" else "put"
     expiry_date = _resolve_expiry(decision.expiry, today, decision.ticker)
-    occ = build_occ_symbol(decision.ticker, expiry_date, option_type, decision.strike)
-
-    quote = await quote_fetcher(occ)
-    if quote is None or quote.ask <= 0:
-        # The LLM picks strikes from the prompt instruction ("ATM / 1 strike OTM")
-        # without seeing the real chain, so it often invents a strike that doesn't exist.
-        # Snap to the nearest valid strike by fetching a small chain window.
-        log.warning("directional_execute_no_quote", occ=occ)
-        snapped = await _snap_to_valid_strike(
-            decision.ticker, expiry_date, option_type, decision.strike
-        )
-        if snapped is None:
-            return DirectionalExecutionResult(
-                executed=False, order=None, trade_id=None,
-                reason=f"no live quote for {occ} and no valid chain strike found",
-            )
-        log.info("directional_execute_strike_snapped",
-                 original=float(decision.strike), snapped=float(snapped.strike),
-                 occ=snapped.occ)
-        occ = snapped.occ
-        quote = snapped.quote
 
     exit_pcts = _EXIT_PCT.get(mode, _EXIT_PCT["selective"])
     size_frac = _SIZE_FRACTION.get(mode, _SIZE_FRACTION["selective"])
     position_usd = float(settings.trading_capital_usd) * size_frac
-    one_contract_cost = float(quote.ask) * 100
-    if one_contract_cost > position_usd:
-        # ATM/near-ATM too expensive — walk OTM to find an affordable strike.
-        # Cap the search at $30 OTM to avoid buying worthless deep-OTM options.
+
+    # Always select from the real chain — handles strike increments, missing
+    # strikes, and budget constraints in one pass for every ticker.
+    selected = await strike_selector(
+        decision.ticker, expiry_date, option_type, decision.strike, position_usd,
+    )
+    if selected is None:
         log.info(
-            "directional_execute_too_expensive_walking_otm",
-            occ=occ,
-            ask=float(quote.ask),
-            one_contract_cost=one_contract_cost,
-            position_cap=position_usd,
-        )
-        affordable = await _find_affordable_strike(
-            decision.ticker, expiry_date, option_type,
-            current_strike=float(quote.strike if hasattr(quote, "strike") else decision.strike),
+            "directional_execute_no_affordable_strike",
+            ticker=decision.ticker,
+            target_strike=decision.strike,
             budget=position_usd,
-            max_otm_walk=30.0,
         )
-        if affordable is None:
-            log.info(
-                "directional_execute_skipped_too_expensive",
-                occ=occ,
-                ask=float(quote.ask),
-                one_contract_cost=one_contract_cost,
-                position_cap=position_usd,
-            )
-            return DirectionalExecutionResult(
-                executed=False, order=None, trade_id=None,
-                reason=(
-                    f"1 contract costs ${one_contract_cost:.0f} — "
-                    f"exceeds ${position_usd:.0f} cap and no affordable OTM strike found"
-                ),
-            )
-        log.info("directional_execute_affordable_strike_found",
-                 original_occ=occ, affordable_occ=affordable.occ,
-                 ask=float(affordable.quote.ask))
-        occ = affordable.occ
-        quote = affordable.quote
-        one_contract_cost = float(quote.ask) * 100
+        return DirectionalExecutionResult(
+            executed=False, order=None, trade_id=None,
+            reason=(
+                f"no affordable quoted strike near ${decision.strike:.0f} "
+                f"within ${position_usd:.0f} budget"
+            ),
+        )
+
+    if float(selected.strike) != decision.strike:
+        log.info(
+            "directional_execute_strike_adjusted",
+            llm_strike=decision.strike,
+            actual_strike=float(selected.strike),
+            occ=selected.occ,
+        )
+
+    occ = selected.occ
+    quote = selected.quote
+    one_contract_cost = float(quote.ask) * 100
     qty = max(1, math.floor(position_usd / one_contract_cost))
 
     entry_premium = quote.ask
