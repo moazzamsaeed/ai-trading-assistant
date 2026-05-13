@@ -169,8 +169,8 @@ async def test_execute_max_concurrent_blocks(session_factory, monkeypatch):
 async def test_execute_too_expensive_skips(session_factory):
     """If 1 contract costs more than position_usd, skip rather than overspend."""
     async def expensive_quote(_occ):
-        # $8/share × 100 = $800/contract > $750 aggressive position cap
-        return _quote(ask=8.00)
+        # $14/share × 100 = $1400/contract > $1250 aggressive position cap (25% of $5000)
+        return _quote(ask=14.00)
 
     result = await execute_directional_signal(
         _decision(),
@@ -181,7 +181,7 @@ async def test_execute_too_expensive_skips(session_factory):
     )
     assert not result.executed
     assert "exceeds" in result.reason
-    assert "$800" in result.reason
+    assert "$1400" in result.reason
 
 
 async def test_execute_no_quote_skips(session_factory):
@@ -288,7 +288,7 @@ async def test_execute_put_persists_correct_strategy(session_factory):
 
 
 async def test_execute_aggressive_sizing(session_factory):
-    """Aggressive mode allocates 15% of $5000 = $750; at $2/share = 3 contracts."""
+    """Aggressive mode allocates 25% of $5000 = $1250; at $2/share = 6 contracts."""
     submitted_kwargs = {}
 
     async def fake_quote(_occ):
@@ -310,4 +310,4 @@ async def test_execute_aggressive_sizing(session_factory):
         submitter=fake_submit,
         waiter=fake_wait,
     )
-    assert submitted_kwargs["qty"] == 3  # floor(750 / 200) = 3
+    assert submitted_kwargs["qty"] == 6  # floor(1250 / 200) = 6

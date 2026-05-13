@@ -183,7 +183,7 @@ async def _directional_scan_job(
         [d for d in decisions if d.action != "HOLD"
          and (mode != "aggressive" or d.conviction == "HIGH")],
         key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
-    )[:2]  # cap at 2 per scan
+    )[:3]  # cap at 3 per scan — enough to cover all watchlist signals in a busy move
 
     for decision in to_execute:
         try:

@@ -40,7 +40,9 @@ STRATEGY_CALL = "directional_call"
 STRATEGY_PUT = "directional_put"
 
 # Fraction of trading_capital_usd allocated per trade by mode.
-_SIZE_FRACTION = {"aggressive": 0.15, "selective": 0.03}
+# Directional buys require at least 1 contract (min $200-1500 depending on ticker).
+# 3% of $5k = $150 was sized for iron condor spreads — too small for outright calls/puts.
+_SIZE_FRACTION = {"aggressive": 0.25, "selective": 0.20}
 # PT and SL pct by mode (mirrors _MODE_CONFIG in intraday.py).
 _EXIT_PCT = {
     "aggressive": {"pt": Decimal("1.0"), "sl": Decimal("0.5")},
