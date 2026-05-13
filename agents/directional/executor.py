@@ -210,14 +210,27 @@ async def select_best_strike(
         log.warning("directional_chain_fetch_failed", ticker=ticker, error=str(e))
         return None
 
+    # Minimum $0.50/share ask ($50/contract). Options below this threshold are
+    # so cheap and illiquid that Alpaca paper accounts don't track them as
+    # positions — the buy fills but the position never appears, so every
+    # close attempt gets rejected as a naked sell.
+    MIN_ASK = Decimal("0.50")
+
     candidates = [
         q for q in quotes
         if q.option_type == option_type
         and q.ask is not None
-        and q.ask > 0
+        and q.ask >= MIN_ASK
         and float(q.ask) * 100 <= budget
     ]
     if not candidates:
+        log.info(
+            "directional_no_qualifying_strike",
+            ticker=ticker,
+            target_strike=target_strike,
+            budget=budget,
+            min_ask=float(MIN_ASK),
+        )
         return None
 
     best = min(candidates, key=lambda q: abs(float(q.strike) - target_strike))
