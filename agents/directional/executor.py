@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -58,7 +59,7 @@ class DirectionalExecutionResult:
         trade_text: str | None = None,
         qty: int | None = None,
         occ: str | None = None,
-        entry_premium: "Decimal | None" = None,
+        entry_premium: Decimal | None = None,
     ) -> None:
         self.executed = executed
         self.order = order
@@ -157,6 +158,49 @@ def _format_trade_text(
 
 
 # ---------------------------------------------------------------------------
+# Strike snapping — find nearest valid chain strike when LLM picks a bad one
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _SnappedStrike:
+    strike: Decimal
+    occ: str
+    quote: object
+
+
+async def _snap_to_valid_strike(
+    ticker: str,
+    expiry_date: date,
+    option_type: str,
+    target_strike: float,
+) -> _SnappedStrike | None:
+    """Fetch a narrow chain window around target_strike and return the nearest valid strike."""
+    window = Decimal("20")  # ±$20 around the target — wide enough for any increment
+    lo = Decimal(str(target_strike)) - window
+    hi = Decimal(str(target_strike)) + window
+    try:
+        quotes = await alpaca_client.get_options_chain(
+            ticker,
+            expiry=expiry_date,
+            strike_lo=lo,
+            strike_hi=hi,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("directional_snap_chain_failed", error=str(e))
+        return None
+
+    candidates = [
+        q for q in quotes
+        if q.option_type == option_type and q.ask is not None and q.ask > 0
+    ]
+    if not candidates:
+        return None
+
+    best = min(candidates, key=lambda q: abs(float(q.strike) - target_strike))
+    return _SnappedStrike(strike=best.strike, occ=best.occ_symbol, quote=best)
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -207,10 +251,23 @@ async def execute_directional_signal(
 
     quote = await quote_fetcher(occ)
     if quote is None or quote.ask <= 0:
+        # The LLM picks strikes from the prompt instruction ("ATM / 1 strike OTM")
+        # without seeing the real chain, so it often invents a strike that doesn't exist.
+        # Snap to the nearest valid strike by fetching a small chain window.
         log.warning("directional_execute_no_quote", occ=occ)
-        return DirectionalExecutionResult(
-            executed=False, order=None, trade_id=None, reason=f"no live quote for {occ}"
+        snapped = await _snap_to_valid_strike(
+            decision.ticker, expiry_date, option_type, decision.strike
         )
+        if snapped is None:
+            return DirectionalExecutionResult(
+                executed=False, order=None, trade_id=None,
+                reason=f"no live quote for {occ} and no valid chain strike found",
+            )
+        log.info("directional_execute_strike_snapped",
+                 original=float(decision.strike), snapped=float(snapped.strike),
+                 occ=snapped.occ)
+        occ = snapped.occ
+        quote = snapped.quote
 
     exit_pcts = _EXIT_PCT.get(mode, _EXIT_PCT["selective"])
     size_frac = _SIZE_FRACTION.get(mode, _SIZE_FRACTION["selective"])
