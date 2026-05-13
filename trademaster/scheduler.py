@@ -23,7 +23,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from agents.directional.executor import execute_directional_signal
 from agents.directional.exit_monitor import run_directional_exit_monitor
-from agents.directional.intraday import format_entry_combined, run_directional_scan
+from agents.directional.intraday import format_directional_signal, format_entry_combined, run_directional_scan
 from agents.intraday.scan import run_intraday_scan
 from agents.options.exit_monitor import run_exit_monitor
 from agents.options.strategist import run_iron_condor_strategist
@@ -208,6 +208,12 @@ async def _directional_scan_job(
                     ticker=decision.ticker,
                     reason=result.reason,
                 )
+                # Always post the manual signal to #signals even when auto-execution
+                # fails — user can act on it manually. Append skip reason so it's
+                # clear the bot did not trade it.
+                manual = format_directional_signal(decision, today=today, mode=mode)
+                manual += f"\n⚠️ _Auto-execute skipped: {result.reason}_"
+                await signal_poster(manual)
         except Exception as e:  # noqa: BLE001
             log.error(
                 "directional_execute_error",
