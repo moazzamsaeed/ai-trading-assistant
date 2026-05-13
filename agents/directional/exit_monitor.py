@@ -86,7 +86,7 @@ def _close_trade_row(
     trade: Trade,
     *,
     exit_premium: Decimal,
-    order: OrderResult,
+    order: OrderResult | None,
     reason: str,
     llm_reasoning: str = "",
 ) -> None:
@@ -98,8 +98,8 @@ def _close_trade_row(
     extra = dict(trade.extra or {})
     extra["exit_reason"] = reason
     extra["exit_reasoning"] = llm_reasoning
-    extra["close_order_id"] = order.order_id
-    extra["close_status"] = order.status
+    extra["close_order_id"] = order.order_id if order else None
+    extra["close_status"] = order.status if order else "broker_error"
     trade.extra = extra
     session.commit()
 
@@ -390,12 +390,50 @@ async def run_directional_exit_monitor(
             continue
 
         # ---- submit close order ----
-        order = await submitter(
-            qty=int(trade.qty),
-            occ_symbol=occ,
-            limit_price=current_bid,
-        )
-        final = await waiter(order.order_id, timeout_s=fill_timeout_s)
+        try:
+            order = await submitter(
+                qty=int(trade.qty),
+                occ_symbol=occ,
+                limit_price=current_bid,
+            )
+            final = await waiter(order.order_id, timeout_s=fill_timeout_s)
+        except Exception as e:  # noqa: BLE001
+            err_str = str(e)
+            # Alpaca 42210000: position intent mismatch (position not in broker book)
+            # Alpaca 40310000: not eligible for uncovered options (same root cause)
+            # Both mean the position is gone from Alpaca — mark closed so we stop retrying.
+            if "42210000" in err_str or "40310000" in err_str or "position intent" in err_str or "uncovered" in err_str:
+                log.warning(
+                    "directional_exit_position_not_in_broker",
+                    trade_id=trade.id, occ=occ, error=err_str,
+                )
+                with factory() as session:
+                    row = session.get(Trade, trade.id)
+                    if row is not None:
+                        _close_trade_row(
+                            session, row,
+                            exit_premium=current_bid,
+                            order=None,
+                            reason="position_not_in_broker",
+                            llm_reasoning="Position not found in Alpaca — auto-closed to stop retry loop",
+                        )
+                results.append({
+                    "trade_id": trade.id,
+                    "status": "closed_position_not_in_broker",
+                    "error_text": (
+                        f"⚠️ Trade #{trade.id} ({occ}) not found in Alpaca broker — "
+                        f"marked closed to stop retry loop. Check paper account."
+                    ),
+                })
+            else:
+                log.error("directional_exit_submit_failed", trade_id=trade.id, error=err_str)
+                results.append({
+                    "trade_id": trade.id,
+                    "status": "submit_error",
+                    "error_text": f"⚠️ Exit order failed for trade #{trade.id}: `{err_str}`",
+                })
+            continue
+
         log.info(
             "directional_exit_terminal",
             trade_id=trade.id,
