@@ -176,9 +176,10 @@ async def test_option_buy_uses_market_order_ioc_with_buy_to_open(monkeypatch):
     assert result.status == "filled"
 
 
-async def test_option_sell_uses_market_order_ioc_with_sell_to_close(monkeypatch):
-    """Same guarantee on the exit side. SELL_TO_CLOSE position_intent prevents
-    Alpaca from rejecting the order as 'uncovered short'.
+async def test_option_sell_uses_market_order_day_with_sell_to_close(monkeypatch):
+    """Exit sells use DAY (not IOC) — Alpaca does not support IOC for options.
+    SELL_TO_CLOSE position_intent prevents rejection as 'uncovered short'.
+    DAY fills immediately at best bid during RTH; auto-cancels at 4 PM if not.
     """
     from alpaca.trading.enums import OrderSide, PositionIntent, TimeInForce
     from alpaca.trading.requests import MarketOrderRequest
@@ -202,7 +203,7 @@ async def test_option_sell_uses_market_order_ioc_with_sell_to_close(monkeypatch)
 
     req = captured["req"]
     assert isinstance(req, MarketOrderRequest)
-    assert req.time_in_force == TimeInForce.IOC
+    assert req.time_in_force == TimeInForce.DAY  # IOC not supported for options on Alpaca
     assert req.side == OrderSide.SELL
     assert req.position_intent == PositionIntent.SELL_TO_CLOSE
 

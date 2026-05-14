@@ -676,15 +676,18 @@ async def submit_single_option_sell(
     occ_symbol: str,
     limit_price: Decimal,
 ) -> OrderResult:
-    """Market sell-to-close with IOC — exits instantly at best bid or auto-cancels.
+    """Market sell-to-close with DAY — fills at best bid immediately; cancels at 4 PM if not.
 
+    IOC is not supported for option orders on Alpaca (paper or live).
+    DAY achieves the same intent — fills instantly when liquidity exists for
+    ATM/near-ATM options during RTH, and auto-cancels at market close.
     `limit_price` is kept for logging reference only.
     """
     order_req = MarketOrderRequest(
         symbol=occ_symbol,
         qty=qty,
         side=OrderSide.SELL,
-        time_in_force=TimeInForce.IOC,
+        time_in_force=TimeInForce.DAY,
         position_intent=PositionIntent.SELL_TO_CLOSE,
     )
 

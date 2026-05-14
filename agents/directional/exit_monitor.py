@@ -398,10 +398,16 @@ async def run_directional_exit_monitor(
             final = await waiter(order.order_id, timeout_s=fill_timeout_s)
         except Exception as e:  # noqa: BLE001
             err_str = str(e)
-            # Alpaca 42210000: position intent mismatch (position not in broker book)
-            # Alpaca 40310000: not eligible for uncovered options (same root cause)
-            # Both mean the position is gone from Alpaca — mark closed so we stop retrying.
-            if "42210000" in err_str or "40310000" in err_str or "position intent" in err_str or "uncovered" in err_str:
+            # Auto-close the DB row only when Alpaca confirms the position is genuinely
+            # gone from the broker's book. Match on message text, not just error code —
+            # 42210000 is also returned for "IOC not supported" which does NOT mean the
+            # position is absent (it's a TIF rejection, position still exists).
+            if (
+                "position intent" in err_str
+                or "uncovered" in err_str
+                or "40310000" in err_str
+                or ("42210000" in err_str and "time_in_force" not in err_str)
+            ):
                 log.warning(
                     "directional_exit_position_not_in_broker",
                     trade_id=trade.id, occ=occ, error=err_str,
