@@ -144,11 +144,14 @@ def test_volume_ratio_none_when_too_few_bars():
 def test_snapshot_includes_all_keys():
     bars = _bars([100 + i * 0.1 for i in range(60)])
     snap = indicators.snapshot(bars)
-    for k in ("bars", "last_close", "last_volume", "vwap", "rsi14", "ema20", "ema50", "atr14"):
-        assert k in snap
+    for k in ("bars", "last_close", "last_volume", "vwap", "rsi9", "ema20", "ema50",
+              "atr10", "macd", "macd_signal", "volume_ratio_20"):
+        assert k in snap, f"missing key: {k}"
     assert snap["bars"] == 60
     assert snap["ema20"] is not None
     assert snap["ema50"] is not None
+    assert snap["rsi9"] is not None
+    assert snap["atr10"] is not None
 
 
 def test_snapshot_handles_few_bars():
@@ -156,8 +159,8 @@ def test_snapshot_handles_few_bars():
     snap = indicators.snapshot(bars)
     assert snap["bars"] == 5
     assert snap["vwap"] is not None
-    assert snap["ema20"] is None  # insufficient data
-    assert snap["rsi14"] is None
+    assert snap["ema20"] is None   # insufficient data
+    assert snap["rsi9"] is None    # RSI-9 needs 10+ bars
 
 
 def test_snapshot_empty():

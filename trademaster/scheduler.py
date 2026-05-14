@@ -240,10 +240,20 @@ async def _directional_scan_job(
     # also halves Alpaca round-trips in live mode.
     max_exposure = capital * Decimal(str(settings.max_total_exposure_pct))
 
+    # Day-of-week filter (backtested: Mon/Wed/Fri significantly outperform Tue/Thu).
+    # On Tue/Thu: only HIGH conviction trades execute; MEDIUM signals go to #signals
+    # for manual consideration but are not auto-executed.
+    dow = today.weekday()  # 0=Mon … 4=Fri
+    high_conviction_only_day = dow in (1, 3)   # Tuesday=1, Thursday=3
+    if high_conviction_only_day:
+        log.info("day_of_week_filter_active", day=today.strftime("%A"),
+                 rule="HIGH conviction only on Tue/Thu per backtested ORB research")
+
     conviction_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     to_execute = sorted(
         [d for d in decisions if d.action != "HOLD"
-         and (mode != "aggressive" or d.conviction == "HIGH")],
+         and (mode != "aggressive" or d.conviction == "HIGH")
+         and (not high_conviction_only_day or d.conviction == "HIGH")],
         key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
     )[:3]
 

@@ -33,7 +33,7 @@ from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
 from trademaster.models import SignalAction
 from trademaster.router import TaskType, route_to_model
-from trademaster.timeutils import to_et
+from trademaster.timeutils import fmt_et, to_et
 from trademaster.watchlist import load_tickers
 
 log = get_logger(__name__)
@@ -76,13 +76,25 @@ PROMPT_TEMPLATE = """You are a professional intraday options trader. Time: {now_
 Evaluate each ticker using this SEQUENTIAL 5-step hierarchy.
 STOP at any failing step and mark that ticker HOLD — do not average conflicting signals.
 
-STEP 1 — MARKET REGIME (hard filter):
-  SPY regime is {spy_regime}.
-  • BULL regime: BUY_PUT signals require HIGH conviction + ALL 4 indicators aligned.
-    MEDIUM conviction puts = HOLD regardless of ticker setup.
-  • BEAR regime: BUY_CALL signals require HIGH conviction + ALL 4 indicators aligned.
-    MEDIUM conviction calls = HOLD regardless of ticker setup.
-  • NEUTRAL: standard selectivity applies.
+STEP 1 — MARKET REGIME + VOLATILITY FILTER (hard filter):
+  SPY 5-min regime: {spy_regime} | SPY 15-min bias: {spy_15min_bias}
+  Volatility: {vol_regime}
+
+  Regime rules:
+  • BULL + 15-min BULL: strong confirmation for calls. Puts need HIGH conviction only.
+  • BULL + 15-min BEAR: conflicting timeframes — only HIGH conviction signals in either direction.
+  • BEAR + 15-min BEAR: strong confirmation for puts. Calls need HIGH conviction only.
+  • NEUTRAL or conflicting: standard selectivity applies.
+
+  Volatility rules:
+  • FLAT (ATR too low): options premium will not move enough to justify the trade. Mark ALL HOLD.
+  • VOLATILE (ATR too high): whipsaw risk elevated, spreads wider. Only HIGH conviction, reduce size.
+  • NORMAL: full-size trades allowed.
+
+  Opening Range: H=${orb_high} L=${orb_low}
+  • Price ABOVE ORH = breakout bullish — favours calls.
+  • Price BELOW ORL = breakout bearish — favours puts.
+  • Price INSIDE range = no breakout yet. Be more conservative; wait for confirmed break.
 
 STEP 2 — RELATIVE STRENGTH (filter):
   • BUY_CALL: ticker must show POSITIVE rel_vs_spy (outperforming) OR volume surge
@@ -91,11 +103,27 @@ STEP 2 — RELATIVE STRENGTH (filter):
     Never short a ticker that is outperforming SPY — you are fighting momentum.
 
 STEP 3 — INDICATOR CONFLUENCE (the setup):
-  Bullish requires ALL of: price > VWAP AND RSI 45–70 AND EMA20 > EMA50 AND volume_ratio > 1.3
-  Bearish requires ALL of: price < VWAP AND RSI 30–55 AND EMA20 < EMA50 AND volume_ratio > 1.3
-  RSI note: 45–70 is unambiguously bullish. 30–55 is unambiguously bearish.
-            RSI 55–70 without other confirmation → lean HOLD.
-  Conviction: HIGH = all 4 criteria. MEDIUM = 3 criteria. LOW = 2 or fewer → HOLD.
+  RSI uses period 9 (not 14) — faster on 5-min bars. Thresholds are wider accordingly.
+
+  Bullish requires ALL of: price > VWAP AND RSI9 45–72 AND EMA20 > EMA50 AND volume_ratio > 1.3
+  Bearish requires ALL of: price < VWAP AND RSI9 28–55 AND EMA20 < EMA50 AND volume_ratio > 1.3
+
+  RSI9 notes:
+  • 45–72 is unambiguously bullish momentum. RSI9 > 75 = overbought, caution.
+  • 28–55 is unambiguously bearish momentum. RSI9 < 25 = oversold, potential reversal.
+  • RSI9 between 55–72 without VWAP + EMA confirmation → HOLD.
+
+  MACD context (6-13-4 settings — intraday optimised):
+  • macd > macd_signal AND rising: bullish momentum accelerating.
+  • macd < macd_signal AND falling: bearish momentum accelerating.
+  • DIVERGENCE is the key signal: price making new highs while MACD is falling → weakening.
+  • Use MACD as confirmation, not a standalone trigger.
+
+  ATR10 context:
+  • Higher ATR = wider expected moves = good for buying directional options.
+  • If ATR is very low relative to recent history, options premium won't move enough.
+
+  Conviction: HIGH = all 4 criteria + MACD aligned. MEDIUM = 3 of 4 criteria. LOW = 2 or fewer → HOLD.
 
 STEP 4 — STRIKE & EXPIRY:
   • Strike rules:
@@ -107,6 +135,8 @@ STEP 4 — STRIKE & EXPIRY:
     The system validates strikes against the real options chain — pick the nearest whole number.
   • Expiry: "0DTE" only for SPY/QQQ/IWM (ETFs with daily options) when HIGH conviction
     AND time before 14:00 ET. All other tickers or MEDIUM conviction: "WEEKLY".
+  • Opening Range tip: if price just broke above ORH → strike near ORH is strong support.
+    If price just broke below ORL → strike near ORL is strong resistance.
 
 STEP 5 — CAPITAL EFFICIENCY:
   • Max 3 signals per scan. If more qualify, pick the 3 with strongest setups.
@@ -142,7 +172,8 @@ def _format_ticker_block(
             f"rel_vs_spy: {perf.get('rel_vs_spy', 0):+.1f}%  "
             f"above_vwap: {perf.get('above_vwap', False)}"
         )
-    for key in ("vwap", "rsi14", "ema20", "ema50", "atr14", "volume_ratio_20"):
+    # Core indicators — rsi9 replaces rsi14; atr10 replaces atr14; macd added
+    for key in ("vwap", "rsi9", "ema20", "ema50", "atr10", "macd", "macd_signal", "volume_ratio_20"):
         v = snap.get(key)
         if v is not None:
             lines.append(f"{key}: {v}")
@@ -307,7 +338,11 @@ async def _build_market_context(
     tickers: list[str],
     bars_fetcher=alpaca_client.get_recent_bars,
 ) -> dict:
-    """Fetch SPY regime + per-ticker relative strength vs SPY."""
+    """Fetch SPY regime + per-ticker relative strength, plus:
+    - Opening Range (9:30-9:35 high/low) — key S/R all day
+    - 15-min SPY trend bias — multi-timeframe confirmation
+    - ATR-based volatility regime — skip if market too flat or too wild
+    """
     try:
         spy_bars = await bars_fetcher("SPY", timeframe_minutes=5, limit=60)
         spy_snap = indicators.snapshot(spy_bars)
@@ -315,9 +350,28 @@ async def _build_market_context(
         spy_vwap = float(spy_snap.get("vwap") or spy_price)
         spy_open = float(spy_bars[0].open) if spy_bars else spy_price
         spy_pct = (spy_price - spy_open) / spy_open * 100 if spy_open else 0.0
+        spy_atr = float(spy_snap.get("atr10") or 0)
+
+        # Opening Range: first 5-min bar's high/low (9:30-9:35 ET)
+        orb_high = float(spy_bars[0].high) if spy_bars else 0.0
+        orb_low = float(spy_bars[0].low) if spy_bars else 0.0
+
+        # Volatility regime from ATR as % of price
+        atr_pct = (spy_atr / spy_price * 100) if spy_price else 0.0
+        if atr_pct < 0.05:
+            vol_regime = "FLAT"       # too quiet for options — premium not moving
+        elif atr_pct > 0.35:
+            vol_regime = "VOLATILE"   # wide ATR — options expensive, whipsaw risk
+        else:
+            vol_regime = "NORMAL"     # ideal options-buying conditions
+
     except Exception:  # noqa: BLE001
-        return {"spy_regime": "NEUTRAL", "spy_price": 0, "spy_vwap": 0,
-                "spy_pct": 0, "ticker_perf": {}, "tickers_above_vwap": 0}
+        return {
+            "spy_regime": "NEUTRAL", "spy_price": 0, "spy_vwap": 0,
+            "spy_pct": 0, "ticker_perf": {}, "tickers_above_vwap": 0,
+            "orb_high": 0, "orb_low": 0, "vol_regime": "NORMAL",
+            "spy_15min_bias": "NEUTRAL",
+        }
 
     if spy_price > spy_vwap * 1.005:
         spy_regime = "BULL"
@@ -325,6 +379,22 @@ async def _build_market_context(
         spy_regime = "BEAR"
     else:
         spy_regime = "NEUTRAL"
+
+    # 15-min SPY bias — multi-timeframe trend confirmation
+    spy_15min_bias = "NEUTRAL"
+    try:
+        spy_15 = await bars_fetcher("SPY", timeframe_minutes=15, limit=20)
+        if spy_15:
+            snap15 = indicators.snapshot(spy_15)
+            p15 = float(snap15.get("last_close") or 0)
+            v15 = float(snap15.get("vwap") or p15)
+            e20_15 = float(snap15.get("ema20") or 0)
+            if p15 > v15 * 1.003 and e20_15 > 0 and p15 > e20_15:
+                spy_15min_bias = "BULL"
+            elif p15 < v15 * 0.997 and e20_15 > 0 and p15 < e20_15:
+                spy_15min_bias = "BEAR"
+    except Exception:  # noqa: BLE001
+        pass
 
     ticker_perf: dict[str, dict] = {}
     above_vwap_count = 0
@@ -356,6 +426,10 @@ async def _build_market_context(
         "spy_pct": round(spy_pct, 2),
         "ticker_perf": ticker_perf,
         "tickers_above_vwap": above_vwap_count,
+        "orb_high": round(orb_high, 2),
+        "orb_low": round(orb_low, 2),
+        "vol_regime": vol_regime,
+        "spy_15min_bias": spy_15min_bias,
     }
 
 
@@ -364,8 +438,11 @@ def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> st
     lines = [
         "═══ MARKET CONTEXT ═══",
         f"SPY: ${ctx['spy_price']:.2f} | VWAP: ${ctx['spy_vwap']:.2f} | "
-        f"Day: {ctx['spy_pct']:+.1f}% | Regime: {ctx['spy_regime']}",
-        f"Watchlist breadth: {ctx['tickers_above_vwap']} tickers above VWAP",
+        f"Day: {ctx['spy_pct']:+.1f}% | Regime: {ctx['spy_regime']} | "
+        f"15-min: {ctx.get('spy_15min_bias','?')}",
+        f"Opening Range: H=${ctx.get('orb_high',0):.2f} L=${ctx.get('orb_low',0):.2f} "
+        f"(price {'ABOVE ORH — breakout bullish' if ctx['spy_price'] > ctx.get('orb_high',0) else 'BELOW ORL — breakout bearish' if ctx['spy_price'] < ctx.get('orb_low',0) else 'INSIDE range — wait for breakout'})",
+        f"Volatility: {ctx.get('vol_regime','NORMAL')} | Breadth: {ctx['tickers_above_vwap']} tickers above VWAP",
         "",
         "Relative performance vs SPY today:",
     ]
@@ -406,7 +483,7 @@ def _log_near_misses(
         snap = ticker_snaps.get(d.ticker, {})
         price = float(snap.get("last_close") or 0)
         vwap = float(snap.get("vwap") or 0)
-        rsi = float(snap.get("rsi14") or 0)
+        rsi = float(snap.get("rsi9") or 0)
         ema20 = float(snap.get("ema20") or 0)
         ema50 = float(snap.get("ema50") or 0)
         vr = float(snap.get("volume_ratio_20") or 0)
@@ -419,8 +496,8 @@ def _log_near_misses(
         ema_bear = 0 < ema20 < ema50
         vol_relaxed = vr >= 1.0
 
-        bullish = sum([above_vwap, 45 <= rsi <= 70, ema_bull, vol_relaxed])
-        bearish = sum([not above_vwap, 30 <= rsi <= 55, ema_bear, vol_relaxed])
+        bullish = sum([above_vwap, 45 <= rsi <= 72, ema_bull, vol_relaxed])
+        bearish = sum([not above_vwap, 28 <= rsi <= 55, ema_bear, vol_relaxed])
 
         if bullish >= 3:
             criteria_met, would_be, ema_flag = bullish, "BUY_CALL", ema_bull
@@ -526,9 +603,13 @@ async def run_directional_scan(
         ticker_snaps[t] = snap
 
     prompt = PROMPT_TEMPLATE.format(
-        now_iso=now.strftime("%Y-%m-%d %H:%M UTC"),
+        now_iso=fmt_et(now, "%Y-%m-%d %H:%M ET"),
         mode_upper=mode.upper(),
         spy_regime=market_ctx["spy_regime"],
+        spy_15min_bias=market_ctx.get("spy_15min_bias", "NEUTRAL"),
+        vol_regime=market_ctx.get("vol_regime", "NORMAL"),
+        orb_high=market_ctx.get("orb_high", 0),
+        orb_low=market_ctx.get("orb_low", 0),
         exit_hint=mc["exit_hint"],
         market_context_block=market_context_block,
         ticker_blocks="\n\n".join(ticker_blocks),

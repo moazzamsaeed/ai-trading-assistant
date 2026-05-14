@@ -4,9 +4,13 @@ No numpy/pandas dependencies — all bars-in, scalar-out. Inputs are
 sequences of `alpaca_client.Bar` objects (oldest-first). Outputs are
 Decimals (or None when there's insufficient data).
 
-Indicators here are descriptive — they distill a 30-bar history into a
-small set of numbers the LLM can reason about. We deliberately keep
-this simple: VWAP, RSI(14), EMA(20), EMA(50), ATR(14), volume ratio.
+Indicator choices informed by expert research on intraday 5-min options trading:
+- VWAP: primary institutional reference — algos benchmark against it all day
+- RSI-9: faster response on 5-min bars than RSI-14 (covers 45 min vs 70 min of history)
+- EMA-20/50: trend confirmation; EMA-50 needs 50 bars (~2.5h RTH to become available)
+- MACD(6-13-4): momentum divergence signal; 6-13-4 is the intraday-optimised setting
+- ATR-10: current volatility — used as entry quality filter and for S/R context
+- Volume ratio (20-bar): RVOL; SMB Capital calls it "the single most important variable"
 """
 
 from __future__ import annotations
@@ -131,6 +135,50 @@ def atr(bars: list[Bar], period: int = 14) -> Decimal | None:
     return atr_val.quantize(Decimal("0.01"))
 
 
+# ----------------- MACD -----------------
+
+
+def macd(bars: list[Bar], fast: int = 6, slow: int = 13, signal: int = 4) -> tuple[Decimal | None, Decimal | None]:
+    """MACD line and signal line using EMA-fast minus EMA-slow.
+
+    Returns (macd_line, signal_line). Both None when insufficient data.
+    Default settings 6-13-4 are the intraday-optimised parameters recommended
+    for 5-minute charts — faster than the standard 12-26-9.
+
+    Use divergence (price making new highs while MACD makes lower highs) as the
+    primary signal, not crossovers (which lag too much on intraday bars).
+    """
+    if len(bars) < slow + signal:
+        return None, None
+    macd_line = ema(bars, fast)
+    slow_ema = ema(bars, slow)
+    if macd_line is None or slow_ema is None:
+        return None, None
+    macd_val = (macd_line - slow_ema).quantize(Decimal("0.01"))
+
+    # Signal line = EMA of the MACD values over the last `slow+signal` bars.
+    # We approximate by computing MACD on each sub-window.
+    macd_series: list[Decimal] = []
+    for i in range(signal, len(bars) + 1):
+        sub = bars[:i] if i >= slow else []
+        if len(sub) >= slow:
+            f = ema(sub, fast)
+            s = ema(sub, slow)
+            if f is not None and s is not None:
+                macd_series.append(f - s)
+
+    if len(macd_series) < signal:
+        return macd_val, None
+
+    # EMA of the last `signal` MACD values as the signal line
+    alpha = Decimal(2) / Decimal(signal + 1)
+    sig = sum(macd_series[:signal], Decimal("0")) / Decimal(signal)
+    for m in macd_series[signal:]:
+        sig = (m * alpha) + (sig * (Decimal(1) - alpha))
+
+    return macd_val, sig.quantize(Decimal("0.01"))
+
+
 # ----------------- volume ratio -----------------
 
 
@@ -157,19 +205,30 @@ def snapshot(bars: list[Bar]) -> dict:
 
     Returns a dict of plain types (Decimal/None) ready to be serialized
     into the LLM prompt.
+
+    RSI uses period 9 (not 14) — the professional choice for 5-minute intraday bars.
+    RSI-14 looks back 70 minutes; RSI-9 covers 45 minutes and captures momentum shifts
+    2-3 candles earlier. ATR uses period 10 for the same reason (more responsive).
     """
     if not bars:
         return {"bars": 0}
     last = bars[-1]
+
+    rsi_val = rsi(bars, 9)
+    atr_val = atr(bars, 10)
+    macd_val, macd_sig = macd(bars, fast=6, slow=13, signal=4)
+
     return {
         "bars": len(bars),
         "last_close": str(last.close),
         "last_volume": last.volume,
         "vwap": str(vwap(bars)) if vwap(bars) is not None else None,
-        "rsi14": str(rsi(bars, 14)) if rsi(bars, 14) is not None else None,
+        "rsi9": str(rsi_val) if rsi_val is not None else None,
         "ema20": str(ema(bars, 20)) if ema(bars, 20) is not None else None,
         "ema50": str(ema(bars, 50)) if ema(bars, 50) is not None else None,
-        "atr14": str(atr(bars, 14)) if atr(bars, 14) is not None else None,
+        "atr10": str(atr_val) if atr_val is not None else None,
+        "macd": str(macd_val) if macd_val is not None else None,
+        "macd_signal": str(macd_sig) if macd_sig is not None else None,
         "volume_ratio_20": (
             str(volume_ratio(bars, 20))
             if volume_ratio(bars, 20) is not None
