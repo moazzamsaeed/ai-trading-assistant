@@ -90,6 +90,29 @@ class AgentRun(Base):
     error: Mapped[str | None] = mapped_column(Text)
 
 
+class NearMiss(Base):
+    """A ticker that was HELD but nearly qualified — logged for post-hoc analysis.
+
+    Recorded when a HOLD ticker meets ≥3 of 4 indicator criteria using a
+    relaxed 1.0× volume threshold. Lets us compare 'what would have been'
+    against actual price movement to calibrate the volume filter over time.
+    """
+
+    __tablename__ = "near_misses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    ticker: Mapped[str] = mapped_column(String(16), index=True)
+    would_be_action: Mapped[str] = mapped_column(String(16))   # BUY_CALL | BUY_PUT
+    criteria_met: Mapped[int]                                   # 3 or 4
+    volume_ratio: Mapped[float | None]
+    rsi: Mapped[float | None]
+    above_vwap: Mapped[bool]
+    ema_confirmed: Mapped[bool]                                 # ema20 > ema50
+    spy_regime: Mapped[str | None] = mapped_column(String(16))
+    llm_reasoning: Mapped[str | None] = mapped_column(Text)    # why LLM said HOLD
+
+
 class RiskEvent(Base):
     __tablename__ = "risk_events"
 

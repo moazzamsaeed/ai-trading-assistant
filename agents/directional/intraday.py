@@ -28,7 +28,7 @@ from integrations import alpaca_client
 from integrations.alpaca_client import Bar, NewsArticle
 from trademaster import indicators
 from trademaster.config import get_settings
-from trademaster.db import Signal as SignalRow
+from trademaster.db import NearMiss, Signal as SignalRow
 from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
 from trademaster.models import SignalAction
@@ -389,6 +389,70 @@ def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> st
     return "\n".join(lines)
 
 
+def _log_near_misses(
+    hold_decisions: list[TickerDecision],
+    *,
+    ticker_snaps: dict[str, dict],
+    spy_regime: str,
+    session_factory,
+) -> None:
+    """Persist near-miss rows for HOLDs that would fire at relaxed 1.0× volume.
+
+    Bullish near-miss: price>VWAP + RSI 45-70 + EMA20>EMA50 + vol>=1.0 → ≥3 criteria.
+    Bearish near-miss: price<VWAP + RSI 30-55 + EMA20<EMA50 + vol>=1.0 → ≥3 criteria.
+    """
+    rows: list[NearMiss] = []
+    for d in hold_decisions:
+        snap = ticker_snaps.get(d.ticker, {})
+        price = float(snap.get("last_close") or 0)
+        vwap = float(snap.get("vwap") or 0)
+        rsi = float(snap.get("rsi14") or 0)
+        ema20 = float(snap.get("ema20") or 0)
+        ema50 = float(snap.get("ema50") or 0)
+        vr = float(snap.get("volume_ratio_20") or 0)
+
+        if price == 0 or vwap == 0:
+            continue
+
+        above_vwap = price > vwap
+        ema_bull = ema20 > ema50 > 0
+        ema_bear = 0 < ema20 < ema50
+        vol_relaxed = vr >= 1.0
+
+        bullish = sum([above_vwap, 45 <= rsi <= 70, ema_bull, vol_relaxed])
+        bearish = sum([not above_vwap, 30 <= rsi <= 55, ema_bear, vol_relaxed])
+
+        if bullish >= 3:
+            criteria_met, would_be, ema_flag = bullish, "BUY_CALL", ema_bull
+        elif bearish >= 3:
+            criteria_met, would_be, ema_flag = bearish, "BUY_PUT", ema_bear
+        else:
+            continue  # genuine HOLD, not a near-miss
+
+        rows.append(NearMiss(
+            ticker=d.ticker,
+            would_be_action=would_be,
+            criteria_met=criteria_met,
+            volume_ratio=vr if vr > 0 else None,
+            rsi=rsi if rsi > 0 else None,
+            above_vwap=above_vwap,
+            ema_confirmed=ema_flag,
+            spy_regime=spy_regime,
+            llm_reasoning=d.reasoning[:300] if d.reasoning else None,
+        ))
+
+    if rows:
+        try:
+            with session_factory() as session:
+                for r in rows:
+                    session.add(r)
+                session.commit()
+            log.info("near_misses_logged", count=len(rows),
+                     tickers=[r.ticker for r in rows])
+        except Exception as e:  # noqa: BLE001
+            log.debug("near_miss_log_failed", error=str(e))
+
+
 async def run_directional_scan(
     *,
     watchlist: tuple[str, ...] | None = None,
@@ -427,11 +491,10 @@ async def run_directional_scan(
     market_context_block = _format_market_context_block(market_ctx, truth_posts)
 
     # Per-ticker context (bars + news + indicators) — gather in parallel-ish.
-    # Track tickers with no bar data: the LLM will see an explicit warning in
-    # the ticker block, AND we hard-override any BUY decision to HOLD after
-    # parsing so a hallucinated "RSI looks bullish" can never slip through.
+    # Also retain snaps for post-LLM near-miss analysis.
     ticker_blocks: list[str] = []
     no_bar_tickers: set[str] = set()
+    ticker_snaps: dict[str, dict] = {}
     for t in tickers:
         try:
             bars: list[Bar] = await bars_fetcher(
@@ -460,6 +523,7 @@ async def run_directional_scan(
         if not bars:
             block += "\n⚠️ NO BAR DATA — MUST HOLD (cannot evaluate indicators)"
         ticker_blocks.append(block)
+        ticker_snaps[t] = snap
 
     prompt = PROMPT_TEMPLATE.format(
         now_iso=now.strftime("%Y-%m-%d %H:%M UTC"),
@@ -501,6 +565,16 @@ async def run_directional_scan(
         actionable = [d for d in decisions if d.action != "HOLD" and d.conviction == "HIGH"]
     else:
         actionable = [d for d in decisions if d.action != "HOLD"]
+
+    # Near-miss logging: for every HOLD, check if it would have triggered
+    # BUY at a relaxed 1.0× volume threshold. Persisted for post-hoc analysis
+    # so we can calibrate the 1.3× volume filter over time.
+    _log_near_misses(
+        [d for d in decisions if d.action == "HOLD" and d.ticker not in no_bar_tickers],
+        ticker_snaps=ticker_snaps,
+        spy_regime=market_ctx.get("spy_regime", "NEUTRAL"),
+        session_factory=factory,
+    )
 
     # Persist one Signal row per actionable decision.
     today = now.date()
