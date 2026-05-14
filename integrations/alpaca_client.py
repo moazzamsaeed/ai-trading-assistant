@@ -20,6 +20,7 @@ from enum import Enum
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.enums import DataFeed
 from alpaca.data.requests import (
     NewsRequest,
     OptionChainRequest,
@@ -813,6 +814,7 @@ async def get_recent_bars(
             timeframe=tf,
             limit=limit,
             start=start,
+            feed=DataFeed.IEX,
         )
         resp = _stock_client().get_stock_bars(req)
         # BarSet is dict[symbol -> list[Bar]] or has a .data attribute
