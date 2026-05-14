@@ -362,6 +362,43 @@ async def execute_directional_signal(
     filled_premium = (
         final.filled_avg_price if final.filled_avg_price is not None else entry_premium
     )
+
+    # ---- Post-fill position verification ----
+    # Alpaca paper sometimes fills an option order but never registers it as a
+    # position (ghost position). Verify immediately after fill so we can bail
+    # out before the trade ages and accrues premium decay losses.
+    import asyncio as _asyncio
+    await _asyncio.sleep(2)   # give Alpaca ~2s to register the position
+    try:
+        live_positions = await alpaca_client.get_positions()
+        position_registered = any(
+            getattr(p, "symbol", "") == occ for p in live_positions
+        )
+    except Exception:  # noqa: BLE001
+        position_registered = True  # can't verify → assume OK, proceed
+
+    if not position_registered:
+        log.warning(
+            "directional_execute_ghost_position_detected",
+            occ=occ, qty=qty,
+            msg="Fill confirmed but position not in Alpaca book — attempting immediate sell",
+        )
+        # Try to sell immediately — if Alpaca accepts it we close flat and avoid the loss.
+        try:
+            sell_order = await submitter(qty=qty, occ_symbol=occ, limit_price=filled_premium)
+            sell_final = await waiter(sell_order.order_id, timeout_s=10.0)
+            log.info(
+                "directional_execute_ghost_sell_attempted",
+                occ=occ, status=sell_final.status,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("directional_execute_ghost_sell_failed", occ=occ, error=str(e))
+
+        return DirectionalExecutionResult(
+            executed=False, order=final, trade_id=None,
+            reason=f"ghost_position — fill confirmed but position not in Alpaca book; immediate sell attempted",
+        )
+
     with factory() as session:
         trade_id = _persist_entry(
             session,

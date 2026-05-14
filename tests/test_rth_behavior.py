@@ -747,6 +747,44 @@ async def test_select_best_strike_rejects_sub_50_cent_strikes(monkeypatch):
     assert selected is None, "Sub-$0.50 strikes must be rejected even with plenty of budget"
 
 
+async def test_executor_detects_ghost_position_and_blocks_trade(session_factory, monkeypatch):
+    """After a fill, if Alpaca doesn't show the position in get_positions(),
+    the executor must return executed=False and attempt an immediate sell.
+    This prevents ghost-position losses (fill confirmed, position never tracked).
+    """
+    from types import SimpleNamespace
+
+    # Fill confirms immediately
+    async def fake_submit(**_k): return _filled(price=2.00)
+    async def fake_wait(order_id, **_k): return _filled(price=2.00)
+
+    sell_calls = []
+    original_submit = fake_submit
+    async def fake_submit_tracking(**kwargs):
+        sell_calls.append(kwargs)
+        return _filled(price=2.00)
+
+    # get_positions returns empty — position never registered
+    monkeypatch.setattr(alpaca_client, "get_positions", lambda: _ghost_positions())
+
+    result = await execute_directional_signal(
+        _decision(),
+        today=datetime(2026, 1, 2, tzinfo=UTC).date(),
+        mode="aggressive",
+        session_factory=session_factory,
+        strike_selector=_strike_selector(ask=2.00),
+        submitter=fake_submit,
+        waiter=fake_wait,
+    )
+
+    assert not result.executed
+    assert "ghost_position" in result.reason
+
+
+async def _ghost_positions():
+    return []  # Alpaca returns empty — no position registered
+
+
 async def test_executor_has_no_count_cap(session_factory):
     """The executor must not block on open-trade count — concurrency is gated
     solely by the scheduler's 20% capital exposure cap. A user can have 5
