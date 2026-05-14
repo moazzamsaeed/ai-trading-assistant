@@ -268,6 +268,17 @@ async def execute_directional_signal(
     option_type = "call" if decision.action == "BUY_CALL" else "put"
     expiry_date = _resolve_expiry(decision.expiry, today, decision.ticker)
 
+    # MEDIUM conviction 0DTE: hard block. On 0DTE, OTM options (used for MEDIUM
+    # conviction) decay 15%+/hour after 2 PM ET, spreads blow out, and they can
+    # go no-bid in the final 30 min — theta and friction make this a near-certain
+    # loss even when direction is right. The prompt already instructs HOLD; this
+    # is the executor backstop in case the LLM ignores it.
+    if decision.conviction == "MEDIUM" and expiry_date == today:
+        return DirectionalExecutionResult(
+            executed=False, order=None, trade_id=None,
+            reason="medium_conviction_0dte_blocked — OTM 0DTE has negative EV",
+        )
+
     exit_pcts = _EXIT_PCT.get(mode, _EXIT_PCT["selective"])
     size_frac = _SIZE_FRACTION.get(mode, _SIZE_FRACTION["selective"])
     # Effective capital scales with actual account performance — losses

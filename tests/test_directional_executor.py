@@ -148,6 +148,51 @@ async def test_execute_hold_returns_no_execute():
     assert "HOLD" in result.reason
 
 
+async def test_execute_medium_conviction_0dte_blocked(session_factory):
+    """MEDIUM conviction 0DTE is blocked — OTM on 0DTE has negative EV
+    due to extreme theta decay and widening bid-ask spreads after 2 PM ET."""
+    d = TickerDecision("SPY", "BUY_CALL", 500.0, "0DTE", "MEDIUM", "test")
+    result = await execute_directional_signal(
+        d,
+        today=date(2026, 1, 2),
+        session_factory=session_factory,
+    )
+    assert not result.executed
+    assert "medium_conviction_0dte" in result.reason
+
+
+async def test_execute_medium_conviction_weekly_allowed(session_factory):
+    """MEDIUM conviction WEEKLY is allowed — theta isn't lethal with 3-5 DTE."""
+    async def fake_submit(**_k): return _filled_order(price=1.50)
+    async def fake_wait(order_id, **_k): return _filled_order(price=1.50)
+
+    result = await execute_directional_signal(
+        TickerDecision("SPY", "BUY_CALL", 500.0, "WEEKLY", "MEDIUM", "test"),
+        today=date(2026, 1, 2),        # Monday — WEEKLY resolves to Friday Jan 6
+        session_factory=session_factory,
+        strike_selector=_selected(ask=1.50),
+        submitter=fake_submit,
+        waiter=fake_wait,
+    )
+    assert result.executed
+
+
+async def test_execute_high_conviction_0dte_allowed(session_factory):
+    """HIGH conviction 0DTE is allowed — ATM with max gamma is the right choice."""
+    async def fake_submit(**_k): return _filled_order(price=2.00)
+    async def fake_wait(order_id, **_k): return _filled_order(price=2.00)
+
+    result = await execute_directional_signal(
+        _decision(action="BUY_CALL", expiry="0DTE", conviction="HIGH"),
+        today=date(2026, 1, 2),
+        session_factory=session_factory,
+        strike_selector=_selected(ask=2.00),
+        submitter=fake_submit,
+        waiter=fake_wait,
+    )
+    assert result.executed
+
+
 async def test_execute_missing_strike_returns_no_execute():
     d = TickerDecision("SPY", "BUY_CALL", None, "0DTE", "HIGH", "test")
     result = await execute_directional_signal(d)

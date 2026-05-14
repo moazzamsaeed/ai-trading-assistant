@@ -98,10 +98,15 @@ STEP 3 — INDICATOR CONFLUENCE (the setup):
   Conviction: HIGH = all 4 criteria. MEDIUM = 3 criteria. LOW = 2 or fewer → HOLD.
 
 STEP 4 — STRIKE & EXPIRY:
-  • Strike: choose ATM (max gamma) for HIGH conviction; 1 strike OTM for MEDIUM.
-    The system will validate this against the real options chain — pick the nearest whole number.
-  • Expiry: "0DTE" only for SPY/QQQ/IWM (ETFs with Mon/Wed/Fri 0DTE) when HIGH conviction
-    AND time before 14:00 ET. All other tickers and times: "WEEKLY".
+  • Strike rules:
+    - HIGH conviction → ATM (at-the-money, max gamma, tightest spreads, easiest exit).
+    - MEDIUM conviction + WEEKLY → 1 strike OTM (delta ~0.35–0.40; still fillable, manageable theta).
+    - MEDIUM conviction + 0DTE → HOLD. Do NOT trade. On 0DTE, OTM options decay 15%+/hour
+      after 2 PM ET, bid-ask spreads blow out, and the option can go no-bid entirely in the
+      final 30 minutes. Theta risk makes OTM 0DTE a near-certain loss even when direction is right.
+    The system validates strikes against the real options chain — pick the nearest whole number.
+  • Expiry: "0DTE" only for SPY/QQQ/IWM (ETFs with daily options) when HIGH conviction
+    AND time before 14:00 ET. All other tickers or MEDIUM conviction: "WEEKLY".
 
 STEP 5 — CAPITAL EFFICIENCY:
   • Max 3 signals per scan. If more qualify, pick the 3 with strongest setups.
