@@ -118,7 +118,7 @@ def _check_exit_rules(action: str, snap: dict) -> list[str]:
 
     price = float(price_s)
     vwap = float(snap["vwap"]) if snap.get("vwap") else None
-    rsi = float(snap["rsi14"]) if snap.get("rsi14") else None
+    rsi = float(snap["rsi9"]) if snap.get("rsi9") else None
     ema20 = float(snap["ema20"]) if snap.get("ema20") else None
     ema50 = float(snap["ema50"]) if snap.get("ema50") else None
     vol = float(snap["volume_ratio_20"]) if snap.get("volume_ratio_20") else None
@@ -126,7 +126,7 @@ def _check_exit_rules(action: str, snap: dict) -> list[str]:
     if action == "BUY_CALL":
         if vwap is not None and price < vwap:
             triggered.append("price_below_vwap")
-        if rsi is not None and rsi > 70:
+        if rsi is not None and rsi > 75:   # RSI-9: overbought = 75 (wider than RSI-14's 70)
             triggered.append("rsi_overbought")
         if ema20 is not None and ema50 is not None and ema20 < ema50:
             triggered.append("ema_bearish_cross")
@@ -135,7 +135,7 @@ def _check_exit_rules(action: str, snap: dict) -> list[str]:
     else:  # BUY_PUT
         if vwap is not None and price > vwap:
             triggered.append("price_above_vwap")
-        if rsi is not None and rsi < 30:
+        if rsi is not None and rsi < 25:   # RSI-9: oversold = 25 (wider than RSI-14's 30)
             triggered.append("rsi_oversold")
         if ema20 is not None and ema50 is not None and ema20 > ema50:
             triggered.append("ema_bullish_cross")
@@ -196,7 +196,7 @@ async def _llm_exit_confirm(
         expiry=expiry,
         price=snap.get("last_close", "?"),
         vwap=snap.get("vwap", "N/A"),
-        rsi=snap.get("rsi14", "N/A"),
+        rsi=snap.get("rsi9", "N/A"),
         ema20=snap.get("ema20", "N/A"),
         ema50=snap.get("ema50", "N/A"),
         vol_ratio=snap.get("volume_ratio_20", "N/A"),
@@ -257,6 +257,7 @@ def _format_exit_combined(
 
     reason_text = {
         "hard_floor_stop": "🛑 hard floor −30%",
+        "stop_premium": "🛑 stop premium hit",
         "smart_exit": "🧠 smart exit",
         "force_close": "⏰ closing before market close",
     }.get(reason, f"closing ({reason})")
@@ -350,11 +351,24 @@ async def run_directional_exit_monitor(
         reason = ""
         llm_reasoning = ""
 
+        stop_p_raw = extra.get("stop_premium")
+        stop_p = Decimal(str(stop_p_raw)) if stop_p_raw else None
+
         if trade_force:
             should_exit, reason = True, "force_close"
 
         elif current_bid <= entry_p * (Decimal("1") - HARD_FLOOR_PCT):
             should_exit, reason = True, "hard_floor_stop"
+
+        elif stop_p is not None and current_bid <= stop_p:
+            should_exit, reason = True, "stop_premium"
+            log.info(
+                "directional_exit_stop_premium_hit",
+                trade_id=trade.id,
+                occ=occ,
+                current_bid=str(current_bid),
+                stop_premium=str(stop_p),
+            )
 
         else:
             # Rule-based trigger: fetch bars + indicators for underlying

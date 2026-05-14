@@ -114,7 +114,7 @@ def _snap(
     return {
         "last_close": str(price),
         "vwap": str(vwap),
-        "rsi14": str(rsi),
+        "rsi9": str(rsi),   # snapshot now returns rsi9 not rsi14
         "ema20": str(ema20),
         "ema50": str(ema50),
         "volume_ratio_20": str(vol_ratio),
@@ -133,7 +133,7 @@ def test_check_exit_rules_call_price_below_vwap():
 
 
 def test_check_exit_rules_call_rsi_overbought():
-    snap = _snap(rsi=72)  # RSI > 70
+    snap = _snap(rsi=76)  # RSI-9 overbought threshold is 75 (not 70)
     assert "rsi_overbought" in _check_exit_rules("BUY_CALL", snap)
 
 
@@ -158,7 +158,7 @@ def test_check_exit_rules_put_price_above_vwap():
 
 
 def test_check_exit_rules_put_rsi_oversold():
-    snap = _snap(rsi=28)
+    snap = _snap(rsi=24)  # RSI-9 oversold threshold is 25 (not 30)
     assert "rsi_oversold" in _check_exit_rules("BUY_PUT", snap)
 
 
