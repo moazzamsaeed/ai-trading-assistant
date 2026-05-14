@@ -142,9 +142,9 @@ def _open_clock() -> MarketClock:
 # ---------------------------------------------------------------------------
 
 
-async def test_option_buy_uses_market_order_ioc_with_buy_to_open(monkeypatch):
-    """Regression guard: a slip back to LimitOrder + DAY would cause stale-quote
-    hangs during volatile RTH. Verify Market + IOC + BUY_TO_OPEN.
+async def test_option_buy_uses_market_order_day_with_buy_to_open(monkeypatch):
+    """Regression guard: Alpaca does not support IOC for options (buys or sells).
+    Verify Market + DAY + BUY_TO_OPEN.
     """
     from alpaca.trading.enums import OrderSide, PositionIntent, TimeInForce
     from alpaca.trading.requests import MarketOrderRequest
@@ -168,7 +168,7 @@ async def test_option_buy_uses_market_order_ioc_with_buy_to_open(monkeypatch):
 
     req = captured["req"]
     assert isinstance(req, MarketOrderRequest), f"Expected MarketOrderRequest, got {type(req).__name__}"
-    assert req.time_in_force == TimeInForce.IOC, f"Expected IOC, got {req.time_in_force}"
+    assert req.time_in_force == TimeInForce.DAY, f"Expected DAY, got {req.time_in_force}"
     assert req.side == OrderSide.BUY
     assert req.position_intent == PositionIntent.BUY_TO_OPEN
     assert req.qty == 3

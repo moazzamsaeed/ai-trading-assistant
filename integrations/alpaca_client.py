@@ -640,17 +640,17 @@ async def submit_single_option_buy(
     occ_symbol: str,
     limit_price: Decimal,
 ) -> OrderResult:
-    """Market buy-to-open with IOC — fills instantly at best ask or auto-cancels.
+    """Market buy-to-open with DAY — fills at best ask immediately; cancels at 4 PM if not.
 
-    `limit_price` is kept for logging reference only; not sent to Alpaca.
-    Market+IOC eliminates stale-limit hangs: old approach used DAY limit orders
-    that sat unfilled for 90 s when the ask moved by a cent after quote fetch.
+    IOC is not supported for option orders on Alpaca (paper or live) — same
+    restriction as sells. DAY achieves the same intent for liquid ATM options
+    during RTH. `limit_price` is kept for logging reference only.
     """
     order_req = MarketOrderRequest(
         symbol=occ_symbol,
         qty=qty,
         side=OrderSide.BUY,
-        time_in_force=TimeInForce.IOC,
+        time_in_force=TimeInForce.DAY,
         position_intent=PositionIntent.BUY_TO_OPEN,
     )
 
