@@ -64,7 +64,8 @@ def test_account_type_cash_uppercase_accepted(monkeypatch, tmp_path):
 
 def test_negative_loss_limit_is_rejected(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    cfg = _fresh_settings(monkeypatch, DAILY_LOSS_LIMIT_USD="-1")
+    # daily_loss_limit_pct must be > 0 and ≤ 1
+    cfg = _fresh_settings(monkeypatch, DAILY_LOSS_LIMIT_PCT="-0.1")
     with pytest.raises(ValidationError):
         cfg.get_settings()
 

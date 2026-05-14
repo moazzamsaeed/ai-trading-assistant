@@ -190,7 +190,7 @@ async def test_execute_too_expensive_skips(session_factory):
         today=date(2026, 1, 2),
         mode="aggressive",
         session_factory=session_factory,
-        strike_selector=_selected(ask=14.00),  # $1400/contract > $1250 cap
+        strike_selector=_selected(ask=6.00),  # $600/contract > $500 cap (10% of $5k)
     )
     assert not result.executed
     assert "budget" in result.reason
@@ -292,7 +292,7 @@ async def test_execute_put_persists_correct_strategy(session_factory):
 
 
 async def test_execute_aggressive_sizing(session_factory):
-    """Aggressive mode allocates 25% of $5000 = $1250; at $2/share = 6 contracts."""
+    """Aggressive mode allocates 10% of $5000 = $500; at $2/share = 2 contracts."""
     submitted_kwargs = {}
 
     async def fake_submit(**kwargs):
@@ -311,4 +311,4 @@ async def test_execute_aggressive_sizing(session_factory):
         submitter=fake_submit,
         waiter=fake_wait,
     )
-    assert submitted_kwargs["qty"] == 6  # floor(1250 / 200) = 6
+    assert submitted_kwargs["qty"] == 2  # floor(500 / 200) = 2

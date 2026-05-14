@@ -28,8 +28,11 @@ from agents.intraday.scan import run_intraday_scan
 from agents.options.exit_monitor import run_exit_monitor
 from agents.options.strategist import run_iron_condor_strategist
 from agents.research.premarket import run_premarket_briefing
+from decimal import Decimal
+
 from integrations import alpaca_client
 from trademaster.config import get_settings
+from trademaster.db import get_today_realized_pnl, make_session_factory
 from trademaster.logging import get_logger
 from trademaster.state import get_state
 from trademaster.watchlist import load_tickers
@@ -41,6 +44,16 @@ _scan_in_progress: bool = False
 # Trade execution is unaffected — signals are still acted on immediately.
 _last_research_post: datetime | None = None
 _RESEARCH_POST_INTERVAL_SECONDS = 3600
+
+# Per-ticker 60-min cooldown: prevents re-entering the same ticker after a
+# stop-loss or position close (stops the PLTR-bought-4-times-in-30-min problem).
+_last_trade_open: dict[str, datetime] = {}
+_TICKER_COOLDOWN_SECONDS = 3600
+
+# Per-(ticker, action) signal dedup: suppress Discord #signals spam when the
+# same BUY_CALL/BUY_PUT fires repeatedly within 30 minutes.
+_last_signal_posted: dict[tuple[str, str], datetime] = {}
+_SIGNAL_DEDUP_SECONDS = 1800
 
 log = get_logger(__name__)
 
@@ -132,6 +145,30 @@ async def _directional_scan_job(
         log.info("directional_scan_skipped_paused")
         return
 
+    # Daily loss limit: halt if realized + unrealized P&L exceeds 15% of capital.
+    settings = get_settings()
+    limit_usd = settings.trading_capital_usd * Decimal(str(settings.daily_loss_limit_pct))
+    realized = get_today_realized_pnl(make_session_factory())
+    unrealized = await alpaca_client.get_unrealized_pnl()
+    total_pnl = realized + unrealized
+    if total_pnl <= -limit_usd:
+        get_state().pause(hours=24)
+        pct = float(-total_pnl / settings.trading_capital_usd * 100)
+        await log_poster(
+            f"🛑 Daily loss limit hit: **${float(total_pnl):.0f}** loss "
+            f"({pct:.0f}% of ${float(settings.trading_capital_usd):.0f} capital). "
+            f"Trading halted until tomorrow. "
+            f"Realized: ${float(realized):.0f} | Unrealized: ${float(unrealized):.0f}"
+        )
+        log.warning(
+            "daily_loss_limit_hit",
+            total_pnl=float(total_pnl),
+            limit_usd=float(limit_usd),
+            realized=float(realized),
+            unrealized=float(unrealized),
+        )
+        return
+
     try:
         clock = await clock_fetcher()
     except Exception as e:  # noqa: BLE001
@@ -171,24 +208,65 @@ async def _directional_scan_job(
         await research_poster(scan_report)
         _last_research_post = now
 
-    # Auto-execute top 2 decisions (capped to avoid multi-signal floods).
-    # Combined entry+execution message posted to #signals — no separate #trades post.
-    from decimal import Decimal
+    # Auto-execute top 3 decisions by conviction. Built-in guards:
+    # - 20% max total exposure cap (no new trades if too much deployed)
+    # - 60-min per-ticker cooldown (no re-entry after a stop-loss)
     from zoneinfo import ZoneInfo
     today = datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).date()
 
-    mode = get_settings().directional_mode
+    settings = get_settings()
+    mode = settings.directional_mode
+    max_exposure = settings.trading_capital_usd * Decimal(str(settings.max_total_exposure_pct))
+
     conviction_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     to_execute = sorted(
         [d for d in decisions if d.action != "HOLD"
          and (mode != "aggressive" or d.conviction == "HIGH")],
         key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
-    )[:3]  # cap at 3 per scan — enough to cover all watchlist signals in a busy move
+    )[:3]
+
+    global _last_trade_open, _last_signal_posted
 
     for decision in to_execute:
+        # 60-min per-ticker cooldown
+        last_open = _last_trade_open.get(decision.ticker)
+        now_ts = datetime.now(UTC)
+        if last_open and (now_ts - last_open).total_seconds() < _TICKER_COOLDOWN_SECONDS:
+            log.info(
+                "directional_execute_skipped_ticker_cooldown",
+                ticker=decision.ticker,
+                minutes_since_last=int((now_ts - last_open).total_seconds() / 60),
+            )
+            continue
+
+        # 20% max total exposure cap
+        from agents.directional.exit_monitor import DIRECTIONAL_STRATEGIES
+        from trademaster.db import Trade as TradeRow
+        from sqlalchemy import select as sa_select
+        factory = make_session_factory()
+        with factory() as session:
+            open_trades = list(session.execute(
+                sa_select(TradeRow).where(
+                    TradeRow.strategy.in_(DIRECTIONAL_STRATEGIES),
+                    TradeRow.closed_at.is_(None),
+                )
+            ).scalars())
+        deployed = sum(
+            Decimal(str(t.entry_price)) * Decimal(str(t.qty)) * 100
+            for t in open_trades
+        )
+        if deployed >= max_exposure:
+            log.info(
+                "directional_execute_skipped_exposure_cap",
+                deployed=float(deployed),
+                cap=float(max_exposure),
+            )
+            continue
+
         try:
             result = await execute_directional_signal(decision, mode=mode)
             if result.executed and result.trade_id is not None:
+                _last_trade_open[decision.ticker] = datetime.now(UTC)
                 entry_premium = result.entry_premium or Decimal("0")
                 total_cost = (entry_premium * 100 * result.qty).quantize(Decimal("0.01"))
                 combined = format_entry_combined(
@@ -208,12 +286,16 @@ async def _directional_scan_job(
                     ticker=decision.ticker,
                     reason=result.reason,
                 )
-                # Always post the manual signal to #signals even when auto-execution
-                # fails — user can act on it manually. Append skip reason so it's
-                # clear the bot did not trade it.
-                manual = format_directional_signal(decision, today=today, mode=mode)
-                manual += f"\n⚠️ _Auto-execute skipped: {result.reason}_"
-                await signal_poster(manual)
+                # Post to #signals for manual entry — deduplicated at 30 min per (ticker, action)
+                sig_key = (decision.ticker, decision.action)
+                last_sig = _last_signal_posted.get(sig_key)
+                if not last_sig or (datetime.now(UTC) - last_sig).total_seconds() >= _SIGNAL_DEDUP_SECONDS:
+                    manual = format_directional_signal(decision, today=today, mode=mode)
+                    manual += f"\n⚠️ _Auto-execute skipped: {result.reason}_"
+                    await signal_poster(manual)
+                    _last_signal_posted[sig_key] = datetime.now(UTC)
+                else:
+                    log.info("signal_dedup_suppressed", ticker=decision.ticker, action=decision.action)
         except Exception as e:  # noqa: BLE001
             log.error(
                 "directional_execute_error",

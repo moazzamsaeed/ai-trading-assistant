@@ -57,68 +57,85 @@ class TickerDecision:
 
 _MODE_CONFIG = {
     "aggressive": {
-        "selectivity": (
-            "Only signal HIGH conviction setups (3+ indicators aligning strongly). "
-            "MEDIUM conviction → HOLD. Miss opportunities before taking a bad trade."
-        ),
-        "strike": "Choose strike: ATM for all signals (max gamma exposure).",
         "exit_hint": "Exits: take profit at +100% on premium, stop at -50% on premium.",
         "profit_target": "+100%",
         "stop_loss": "-50%",
     },
     "selective": {
-        "selectivity": (
-            "Selectivity matters. False positives are worse than missed opportunities. "
-            "Default to HOLD unless at least 2-3 indicators align."
-        ),
-        "strike": "Choose strike: ATM if HIGH conviction (max gamma); 1 strike OTM if MEDIUM.",
         "exit_hint": "Exits: take profit at +50% on premium, stop at -30% on premium.",
         "profit_target": "+50%",
         "stop_loss": "-30%",
     },
 }
 
-PROMPT_TEMPLATE = """You are an intraday directional options trader scanning at {now_iso}.
-Mode: {mode_upper}
+PROMPT_TEMPLATE = """You are a professional intraday options trader. Time: {now_iso} | Mode: {mode_upper}
 
-You see {n} tickers below with recent indicators and news. For each ticker, decide:
-- BUY_CALL  : bullish setup, buy a call option
-- BUY_PUT   : bearish setup, buy a put option
-- HOLD      : no edge
+{market_context_block}
 
-{selectivity} A typical strong setup:
+Evaluate each ticker using this SEQUENTIAL 5-step hierarchy.
+STOP at any failing step and mark that ticker HOLD — do not average conflicting signals.
 
-  - Bullish: price > VWAP, RSI(14) in 40-65 range, EMA20 > EMA50, volume_ratio > 1.3,
-             news catalyst or breaking out of recent range
-  - Bearish: price < VWAP, RSI(14) in 35-60 range, EMA20 < EMA50, volume_ratio > 1.3,
-             news headwind or breaking down
+STEP 1 — MARKET REGIME (hard filter):
+  SPY regime is {spy_regime}.
+  • BULL regime: BUY_PUT signals require HIGH conviction + ALL 4 indicators aligned.
+    MEDIUM conviction puts = HOLD regardless of ticker setup.
+  • BEAR regime: BUY_CALL signals require HIGH conviction + ALL 4 indicators aligned.
+    MEDIUM conviction calls = HOLD regardless of ticker setup.
+  • NEUTRAL: standard selectivity applies.
 
-When you BUY:
-- {strike}
-- Choose expiry: "0DTE" if HIGH conviction and current time before 14:00 ET; otherwise "WEEKLY"
-- Conviction reflects how many indicators align: HIGH = 3+, MEDIUM = 2, LOW = 1 (HOLD instead)
-- {exit_hint}
+STEP 2 — RELATIVE STRENGTH (filter):
+  • BUY_CALL: ticker must show POSITIVE rel_vs_spy (outperforming) OR volume surge
+    with clear catalyst. Do NOT call a ticker lagging the market without a catalyst.
+  • BUY_PUT: ticker must show NEGATIVE rel_vs_spy (underperforming the market).
+    Never short a ticker that is outperforming SPY — you are fighting momentum.
 
-Output a JSON array of objects, one per ticker, in the same order as input. Schema:
+STEP 3 — INDICATOR CONFLUENCE (the setup):
+  Bullish requires ALL of: price > VWAP AND RSI 45–70 AND EMA20 > EMA50 AND volume_ratio > 1.3
+  Bearish requires ALL of: price < VWAP AND RSI 30–55 AND EMA20 < EMA50 AND volume_ratio > 1.3
+  RSI note: 45–70 is unambiguously bullish. 30–55 is unambiguously bearish.
+            RSI 55–70 without other confirmation → lean HOLD.
+  Conviction: HIGH = all 4 criteria. MEDIUM = 3 criteria. LOW = 2 or fewer → HOLD.
+
+STEP 4 — STRIKE & EXPIRY:
+  • Strike: choose ATM (max gamma) for HIGH conviction; 1 strike OTM for MEDIUM.
+    The system will validate this against the real options chain — pick the nearest whole number.
+  • Expiry: "0DTE" only for SPY/QQQ/IWM (ETFs with Mon/Wed/Fri 0DTE) when HIGH conviction
+    AND time before 14:00 ET. All other tickers and times: "WEEKLY".
+
+STEP 5 — CAPITAL EFFICIENCY:
+  • Max 3 signals per scan. If more qualify, pick the 3 with strongest setups.
+  • Do NOT signal the same ticker if it had a recent trade — prefer fresh opportunities.
+  • {exit_hint}
+
+Output a JSON array, one object per ticker, SAME ORDER as input:
 [
   {{"ticker": "SYM", "action": "BUY_CALL"|"BUY_PUT"|"HOLD", "strike": number|null,
     "expiry": "0DTE"|"WEEKLY"|null, "conviction": "HIGH"|"MEDIUM"|"LOW",
-    "reasoning": "short 1-2 sentence justification"}}
+    "reasoning": "STEP1:... STEP2:... STEP3:... decision and why"}}
 ]
 
-No prose, no markdown, just the JSON array.
+No prose, no markdown — JSON array only.
 
---- Tickers ---
+--- TICKER DATA ---
 {ticker_blocks}
 """
 
 
 def _format_ticker_block(
-    ticker: str, snap: dict, news_headlines: list[str]
+    ticker: str,
+    snap: dict,
+    news_headlines: list[str],
+    perf: dict | None = None,
 ) -> str:
     """Compact per-ticker context for the LLM prompt."""
     lines = [f"## {ticker}"]
     lines.append(f"last_close: ${snap.get('last_close')}")
+    if perf:
+        lines.append(
+            f"day_pct: {perf.get('pct', 0):+.1f}%  "
+            f"rel_vs_spy: {perf.get('rel_vs_spy', 0):+.1f}%  "
+            f"above_vwap: {perf.get('above_vwap', False)}"
+        )
     for key in ("vwap", "rsi14", "ema20", "ema50", "atr14", "volume_ratio_20"):
         v = snap.get(key)
         if v is not None:
@@ -281,6 +298,92 @@ def format_directional_signal(
     )
 
 
+async def _build_market_context(
+    tickers: list[str],
+    bars_fetcher=alpaca_client.get_recent_bars,
+) -> dict:
+    """Fetch SPY regime + per-ticker relative strength vs SPY."""
+    try:
+        spy_bars = await bars_fetcher("SPY", timeframe_minutes=5, limit=60)
+        spy_snap = indicators.snapshot(spy_bars)
+        spy_price = float(spy_snap.get("last_close") or 0)
+        spy_vwap = float(spy_snap.get("vwap") or spy_price)
+        spy_open = float(spy_bars[0].open) if spy_bars else spy_price
+        spy_pct = (spy_price - spy_open) / spy_open * 100 if spy_open else 0.0
+    except Exception:  # noqa: BLE001
+        return {"spy_regime": "NEUTRAL", "spy_price": 0, "spy_vwap": 0,
+                "spy_pct": 0, "ticker_perf": {}, "tickers_above_vwap": 0}
+
+    if spy_price > spy_vwap * 1.005:
+        spy_regime = "BULL"
+    elif spy_price < spy_vwap * 0.995:
+        spy_regime = "BEAR"
+    else:
+        spy_regime = "NEUTRAL"
+
+    ticker_perf: dict[str, dict] = {}
+    above_vwap_count = 0
+    for t in tickers:
+        if t == "SPY":
+            continue
+        try:
+            bars = await bars_fetcher(t, timeframe_minutes=5, limit=60)
+            snap = indicators.snapshot(bars)
+            t_price = float(snap.get("last_close") or 0)
+            t_open = float(bars[0].open) if bars else t_price
+            t_pct = (t_price - t_open) / t_open * 100 if t_open else 0.0
+            t_vwap = float(snap.get("vwap") or t_price)
+            above = t_price > t_vwap
+            if above:
+                above_vwap_count += 1
+            ticker_perf[t] = {
+                "pct": round(t_pct, 2),
+                "rel_vs_spy": round(t_pct - spy_pct, 2),
+                "above_vwap": above,
+            }
+        except Exception:  # noqa: BLE001
+            ticker_perf[t] = {"pct": 0.0, "rel_vs_spy": 0.0, "above_vwap": False}
+
+    return {
+        "spy_regime": spy_regime,
+        "spy_price": round(spy_price, 2),
+        "spy_vwap": round(spy_vwap, 2),
+        "spy_pct": round(spy_pct, 2),
+        "ticker_perf": ticker_perf,
+        "tickers_above_vwap": above_vwap_count,
+    }
+
+
+def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> str:
+    """Format the market context header for the LLM prompt."""
+    lines = [
+        "═══ MARKET CONTEXT ═══",
+        f"SPY: ${ctx['spy_price']:.2f} | VWAP: ${ctx['spy_vwap']:.2f} | "
+        f"Day: {ctx['spy_pct']:+.1f}% | Regime: {ctx['spy_regime']}",
+        f"Watchlist breadth: {ctx['tickers_above_vwap']} tickers above VWAP",
+        "",
+        "Relative performance vs SPY today:",
+    ]
+    perf = ctx.get("ticker_perf", {})
+    leaders = [t for t, v in perf.items() if v["rel_vs_spy"] > 0]
+    laggards = [t for t, v in perf.items() if v["rel_vs_spy"] < 0]
+    for t, v in sorted(perf.items(), key=lambda x: -x[1]["rel_vs_spy"]):
+        vwap_flag = "↑VWAP" if v["above_vwap"] else "↓VWAP"
+        lines.append(
+            f"  {t:<6} {v['pct']:+.1f}% (vs SPY: {v['rel_vs_spy']:+.1f}%)  {vwap_flag}"
+        )
+    lines.append(f"  Leaders: {', '.join(leaders) or 'none'}")
+    lines.append(f"  Laggards: {', '.join(laggards) or 'none'}")
+    if truth_social_posts:
+        lines.append("")
+        lines.append("⚡ TRUTH SOCIAL (Trump posts, last 60 min):")
+        for post in truth_social_posts[:3]:
+            lines.append(f"  • {post[:200]}")
+        lines.append("  Note: Trump posts frequently move SPY, QQQ, TSLA, and tech broadly.")
+    lines.append("═══════════════════════")
+    return "\n".join(lines)
+
+
 async def run_directional_scan(
     *,
     watchlist: tuple[str, ...] | None = None,
@@ -306,6 +409,18 @@ async def run_directional_scan(
     if not tickers:
         return [], [], ""
 
+    # Market context: SPY regime + relative strength across watchlist
+    market_ctx = await _build_market_context(tickers, bars_fetcher)
+
+    # Truth Social: fetch Trump posts (fail-open)
+    try:
+        from integrations.truth_social_client import get_recent_trump_posts
+        truth_posts = await get_recent_trump_posts(minutes=60)
+    except Exception:  # noqa: BLE001
+        truth_posts = []
+
+    market_context_block = _format_market_context_block(market_ctx, truth_posts)
+
     # Per-ticker context (bars + news + indicators) — gather in parallel-ish.
     ticker_blocks: list[str] = []
     for t in tickers:
@@ -329,15 +444,16 @@ async def run_directional_scan(
         except Exception as e:  # noqa: BLE001
             log.warning("directional_news_failed", ticker=t, error=str(e))
             headlines = []
-        ticker_blocks.append(_format_ticker_block(t, snap, headlines))
+        # Append relative performance to ticker block
+        t_perf = market_ctx["ticker_perf"].get(t, {})
+        ticker_blocks.append(_format_ticker_block(t, snap, headlines, t_perf))
 
     prompt = PROMPT_TEMPLATE.format(
         now_iso=now.strftime("%Y-%m-%d %H:%M UTC"),
         mode_upper=mode.upper(),
-        n=len(tickers),
-        selectivity=mc["selectivity"],
-        strike=mc["strike"],
+        spy_regime=market_ctx["spy_regime"],
         exit_hint=mc["exit_hint"],
+        market_context_block=market_context_block,
         ticker_blocks="\n\n".join(ticker_blocks),
     )
 

@@ -34,7 +34,7 @@ from alpaca.trading.enums import (
     PositionIntent,
     TimeInForce,
 )
-from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, OptionLegRequest
 
 from trademaster.config import get_settings
 from trademaster.logging import get_logger
@@ -174,6 +174,20 @@ async def get_positions() -> list[PositionSnapshot]:
         return [_to_position(p) for p in _trading_client().get_all_positions()]
 
     return await asyncio.to_thread(_fetch)
+
+
+async def get_unrealized_pnl() -> Decimal:
+    """Sum of unrealized_pl across all open positions.
+
+    Returns Decimal("0") on any error so a connectivity blip never halts trading.
+    """
+    try:
+        positions = await get_positions()
+        return sum(
+            Decimal(str(getattr(p, "unrealized_pl", 0) or 0)) for p in positions
+        )
+    except Exception:  # noqa: BLE001
+        return Decimal("0")
 
 
 async def cancel_all_orders() -> int:
@@ -624,13 +638,17 @@ async def submit_single_option_buy(
     occ_symbol: str,
     limit_price: Decimal,
 ) -> OrderResult:
-    """Limit buy-to-open a single-leg option at `limit_price` per share."""
-    order_req = LimitOrderRequest(
+    """Market buy-to-open with IOC — fills instantly at best ask or auto-cancels.
+
+    `limit_price` is kept for logging reference only; not sent to Alpaca.
+    Market+IOC eliminates stale-limit hangs: old approach used DAY limit orders
+    that sat unfilled for 90 s when the ask moved by a cent after quote fetch.
+    """
+    order_req = MarketOrderRequest(
         symbol=occ_symbol,
         qty=qty,
         side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY,
-        limit_price=float(limit_price),
+        time_in_force=TimeInForce.IOC,
         position_intent=PositionIntent.BUY_TO_OPEN,
     )
 
@@ -641,7 +659,7 @@ async def submit_single_option_buy(
             "alpaca_single_option_buy_submitted",
             occ=occ_symbol,
             qty=qty,
-            limit=str(limit_price),
+            ref_ask=str(limit_price),
             order_id=result.order_id,
             status=result.status,
         )
@@ -656,13 +674,15 @@ async def submit_single_option_sell(
     occ_symbol: str,
     limit_price: Decimal,
 ) -> OrderResult:
-    """Limit sell-to-close a single-leg option at `limit_price` per share."""
-    order_req = LimitOrderRequest(
+    """Market sell-to-close with IOC — exits instantly at best bid or auto-cancels.
+
+    `limit_price` is kept for logging reference only.
+    """
+    order_req = MarketOrderRequest(
         symbol=occ_symbol,
         qty=qty,
         side=OrderSide.SELL,
-        time_in_force=TimeInForce.DAY,
-        limit_price=float(limit_price),
+        time_in_force=TimeInForce.IOC,
         position_intent=PositionIntent.SELL_TO_CLOSE,
     )
 
@@ -673,7 +693,7 @@ async def submit_single_option_sell(
             "alpaca_single_option_sell_submitted",
             occ=occ_symbol,
             qty=qty,
-            limit=str(limit_price),
+            ref_bid=str(limit_price),
             order_id=result.order_id,
             status=result.status,
         )
@@ -689,6 +709,19 @@ async def get_order(order_id: str) -> OrderResult:
         return _to_order_result(_trading_client().get_order_by_id(order_id))
 
     return await asyncio.to_thread(_do)
+
+
+async def cancel_order(order_id: str) -> None:
+    """Cancel an open order. No-op if the order is already in a terminal state."""
+
+    def _do() -> None:
+        try:
+            _trading_client().cancel_order_by_id(order_id)
+        except Exception as e:  # noqa: BLE001
+            # Already filled/cancelled — safe to ignore
+            log.debug("alpaca_cancel_order_noop", order_id=order_id, reason=str(e))
+
+    await asyncio.to_thread(_do)
 
 
 async def wait_for_order(

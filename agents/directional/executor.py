@@ -37,10 +37,10 @@ log = get_logger(__name__)
 STRATEGY_CALL = "directional_call"
 STRATEGY_PUT = "directional_put"
 
-# Fraction of trading_capital_usd allocated per trade by mode.
-# Directional buys require at least 1 contract (min $200-1500 depending on ticker).
-# 3% of $5k = $150 was sized for iron condor spreads — too small for outright calls/puts.
-_SIZE_FRACTION = {"aggressive": 0.25, "selective": 0.20}
+# 10% of trading_capital_usd per trade. Scales with account: $500 on $5k, $1k on $10k.
+# This budget fits ATM weekly contracts on NVDA/AAPL/AMZN/QCOM/PLTR and
+# 0DTE contracts on SPY/QQQ/IWM at current prices.
+_SIZE_FRACTION = {"aggressive": 0.10, "selective": 0.10}
 # PT and SL pct by mode (mirrors _MODE_CONFIG in intraday.py).
 _EXIT_PCT = {
     "aggressive": {"pt": Decimal("1.0"), "sl": Decimal("0.5")},
@@ -87,7 +87,7 @@ def _open_directional_count(session: Session) -> int:
 # Only SPY (and QQQ) have true daily 0DTE options. All other tickers only
 # expire on Fridays — using today's date for them produces an OCC symbol
 # that doesn't exist and the chain snap finds nothing.
-_DAILY_OPTION_TICKERS = {"SPY", "QQQ"}
+_DAILY_OPTION_TICKERS = {"SPY", "QQQ", "IWM"}  # ETFs with Mon/Wed/Fri 0DTE options
 
 
 def _next_friday(today: date) -> date:
@@ -251,7 +251,7 @@ async def execute_directional_signal(
     strike_selector: Callable[..., object] = select_best_strike,
     submitter: Callable[..., object] = alpaca_client.submit_single_option_buy,
     waiter: Callable[..., object] = alpaca_client.wait_for_order,
-    fill_timeout_s: float = 90.0,
+    fill_timeout_s: float = 10.0,
 ) -> DirectionalExecutionResult:
     """Execute a BUY_CALL or BUY_PUT signal. Returns immediately on any skip."""
     if decision.action not in ("BUY_CALL", "BUY_PUT"):
@@ -332,6 +332,13 @@ async def execute_directional_signal(
 
     order = await submitter(qty=qty, occ_symbol=occ, limit_price=entry_premium)
     final = await waiter(order.order_id, timeout_s=fill_timeout_s)
+
+    # Belt-and-suspenders: if not terminal after timeout, explicitly cancel so
+    # the order doesn't linger in Alpaca as a dangling "new" order all day.
+    _terminal = {"filled", "cancelled", "canceled", "expired", "rejected", "done_for_day"}
+    if final.status not in _terminal:
+        await alpaca_client.cancel_order(order.order_id)
+        log.info("directional_execute_order_cancelled", occ=occ, status=final.status)
 
     log.info(
         "directional_execute_terminal",

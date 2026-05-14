@@ -35,10 +35,18 @@ class Settings(BaseSettings):
     # live account 1:1.
     trading_capital_usd: Decimal = Field(default=Decimal("5000"), gt=0)
 
-    daily_loss_limit_usd: Decimal = Field(default=Decimal("500"), gt=0)
+    # Daily loss limit: 15% of trading_capital_usd (= $750 on a $5k account).
+    # Counts realized P&L (closed trades today) + unrealized (open positions).
+    # When hit, trading halts until the next calendar day (ET).
+    daily_loss_limit_pct: float = Field(default=0.15, gt=0, le=1.0)
+
     max_position_size_usd: Decimal = Field(default=Decimal("2000"), gt=0)
     max_concurrent_positions: int = Field(default=5, gt=0)
     max_options_contracts_per_trade: int = Field(default=5, gt=0)
+
+    # Max total capital deployed across all open directional positions at once.
+    # 20% of trading_capital_usd = $1,000 on a $5k account (2 trades max).
+    max_total_exposure_pct: float = Field(default=0.20, gt=0, le=1.0)
 
     monthly_llm_budget_usd: Decimal = Field(default=Decimal("100"), gt=0)
 
@@ -63,6 +71,13 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///data/trademaster.db"
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+
+    @property
+    def daily_loss_limit_usd(self) -> Decimal:
+        """Derived from daily_loss_limit_pct × trading_capital_usd."""
+        return (self.trading_capital_usd * Decimal(str(self.daily_loss_limit_pct))).quantize(
+            Decimal("0.01")
+        )
 
     @field_validator("account_type", mode="before")
     @classmethod
