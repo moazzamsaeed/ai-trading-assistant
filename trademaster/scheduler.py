@@ -35,6 +35,7 @@ from trademaster.config import get_settings
 from trademaster.db import get_today_realized_pnl, make_session_factory
 from trademaster.logging import get_logger
 from trademaster.state import get_state
+from trademaster.timeutils import today_et
 from trademaster.watchlist import load_tickers
 
 # Prevents concurrent directional scans (stream + scheduler can both trigger).
@@ -211,8 +212,7 @@ async def _directional_scan_job(
     # Auto-execute top 3 decisions by conviction. Built-in guards:
     # - 20% max total exposure cap (no new trades if too much deployed)
     # - 60-min per-ticker cooldown (no re-entry after a stop-loss)
-    from zoneinfo import ZoneInfo
-    today = datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).date()
+    today = today_et()
 
     settings = get_settings()
     mode = settings.directional_mode

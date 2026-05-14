@@ -20,7 +20,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime, time
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -29,11 +28,11 @@ from integrations import alpaca_client
 from integrations.alpaca_client import OptionQuote, OrderResult
 from trademaster.db import Trade, make_session_factory
 from trademaster.logging import get_logger
+from trademaster.timeutils import to_et
 
 log = get_logger(__name__)
 
 STRATEGY_NAME = "spy_0dte_ic"
-ET = ZoneInfo("America/New_York")
 FORCE_CLOSE_AFTER = time(15, 50)
 
 
@@ -202,7 +201,7 @@ async def run_exit_monitor(
     factory = session_factory or make_session_factory()
 
     if force_close is None:
-        force_close = now.astimezone(ET).time() >= FORCE_CLOSE_AFTER
+        force_close = to_et(now).time() >= FORCE_CLOSE_AFTER
 
     results: list[dict] = []
 

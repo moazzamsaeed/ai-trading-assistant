@@ -38,6 +38,7 @@ from trademaster.models import Signal, SignalAction
 from trademaster.options_math import delta_from_market_mid
 from trademaster.risk_manager import RiskRejectionError
 from trademaster.router import TaskType, route_to_model
+from trademaster.timeutils import to_et
 
 log = get_logger(__name__)
 
@@ -170,7 +171,7 @@ def _format_plan_for_prompt(
         timestamp=now.isoformat(),
         spy_mid=spy_mid,
         atm_iv=(f"{atm_iv:.4f}" if atm_iv is not None else "unknown"),
-        now_et=now.astimezone().strftime("%H:%M"),
+        now_et=to_et(now).strftime("%H:%M ET"),
         expiry=sp.expiry.isoformat(),
         sp_strike=sp.strike, sp_delta=sp.delta, sp_bid=sp.bid, sp_ask=sp.ask,
         lp_strike=lp.strike, lp_delta=lp.delta, lp_bid=lp.bid, lp_ask=lp.ask,

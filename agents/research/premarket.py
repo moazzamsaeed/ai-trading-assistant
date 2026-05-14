@@ -19,6 +19,7 @@ from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
 from trademaster.models import Signal, SignalAction
 from trademaster.router import TaskType, route_to_model
+from trademaster.timeutils import fmt_et
 from trademaster.watchlist import load_tickers
 
 log = get_logger(__name__)
@@ -54,7 +55,7 @@ def _format_news_block(articles: list[NewsArticle]) -> str:
     lines: list[str] = []
     for a in articles:
         symbols = ",".join(a.symbols) if a.symbols else "—"
-        ts = a.created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        ts = fmt_et(a.created_at, "%Y-%m-%d %H:%M ET")
         # Trim long summaries to keep token use predictable.
         summary = (a.summary or "").strip().replace("\n", " ")
         if len(summary) > 400:

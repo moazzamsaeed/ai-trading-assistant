@@ -15,12 +15,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
-from zoneinfo import ZoneInfo
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Numeric, String, Text, create_engine, text
+from sqlalchemy import JSON, DateTime, ForeignKey, Numeric, String, Text, create_engine, func, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from trademaster.config import get_settings
+from trademaster.timeutils import ET, today_et
 
 
 def _utcnow() -> datetime:
@@ -154,24 +154,19 @@ def get_today_realized_pnl(session_factory) -> Decimal:
     """Sum of realized_pnl_usd for trades closed today (ET calendar day).
 
     Uses ET-aware day boundaries so trades near midnight ET are counted
-    correctly — SQLite's DATE('now') uses UTC and would miss them.
+    correctly — SQLite's DATE('now') is UTC and would miss them after ~8pm ET.
+
+    Binds Python `datetime` objects (not isoformat strings) so SQLAlchemy
+    handles the storage format conversion; raw string comparison against
+    SQLite TEXT timestamps is fragile (space vs. 'T', tz suffix, etc.).
     """
-    ET = ZoneInfo("America/New_York")
-    today_et = datetime.now(ET).date().isoformat()
-    day_start = (
-        datetime.fromisoformat(today_et).replace(tzinfo=ET).astimezone(UTC).isoformat()
-    )
-    day_end = (
-        (datetime.fromisoformat(today_et).replace(tzinfo=ET) + timedelta(days=1))
-        .astimezone(UTC)
-        .isoformat()
-    )
+    today = today_et()
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    day_end = day_start + timedelta(days=1)
     with session_factory() as session:
         result = session.execute(
-            text(
-                "SELECT COALESCE(SUM(CAST(realized_pnl_usd AS REAL)), 0) "
-                "FROM trades WHERE closed_at >= :start AND closed_at < :end"
-            ),
-            {"start": day_start, "end": day_end},
+            select(func.coalesce(func.sum(func.cast(Trade.realized_pnl_usd, Numeric)), 0))
+            .where(Trade.closed_at >= day_start)
+            .where(Trade.closed_at < day_end)
         ).scalar()
     return Decimal(str(result or 0))

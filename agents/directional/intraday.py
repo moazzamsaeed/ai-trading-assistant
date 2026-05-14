@@ -33,6 +33,7 @@ from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
 from trademaster.models import SignalAction
 from trademaster.router import TaskType, route_to_model
+from trademaster.timeutils import to_et
 from trademaster.watchlist import load_tickers
 
 log = get_logger(__name__)
@@ -212,8 +213,7 @@ def format_scan_report(
     n_actionable: int,
 ) -> str:
     """One-message scan summary for #research — posted after every scan."""
-    et_time = now.astimezone(__import__("zoneinfo").ZoneInfo("America/New_York"))
-    time_str = et_time.strftime("%I:%M %p ET").lstrip("0")
+    time_str = to_et(now).strftime("%I:%M %p ET").lstrip("0")
 
     lines = [
         f"📊 **Directional Scan — {time_str}** [{mode.upper()}]",

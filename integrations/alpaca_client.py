@@ -38,6 +38,7 @@ from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, Optio
 
 from trademaster.config import get_settings
 from trademaster.logging import get_logger
+from trademaster.timeutils import to_et
 
 log = get_logger(__name__)
 
@@ -798,15 +799,12 @@ async def get_recent_bars(
     Without an explicit start, Alpaca returns extended-hours bars from ~4 AM
     which causes the agent to miss the entire RTH session.
     """
-    import zoneinfo as _zi
-
     def _fetch() -> list[Bar]:
         tf = TimeFrame(timeframe_minutes, TimeFrameUnit.Minute)
 
         # Anchor to today's RTH open so we always get intraday bars.
         # If called before RTH (pre-market), fall back to 4 AM to get some context.
-        et = _zi.ZoneInfo("America/New_York")
-        now_et = datetime.now(UTC).astimezone(et)
+        now_et = to_et(datetime.now(UTC))
         rth_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         start = rth_open if now_et >= rth_open else now_et.replace(hour=4, minute=0, second=0, microsecond=0)
 

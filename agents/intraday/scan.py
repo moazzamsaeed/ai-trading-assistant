@@ -23,6 +23,7 @@ from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
 from trademaster.models import Signal, SignalAction
 from trademaster.router import TaskType, route_to_model
+from trademaster.timeutils import fmt_et
 from trademaster.watchlist import load_tickers
 
 log = get_logger(__name__)
@@ -58,7 +59,7 @@ def _format_news(articles: list[NewsArticle]) -> str:
     lines: list[str] = []
     for a in articles:
         symbols = ",".join(a.symbols) if a.symbols else "—"
-        ts = a.created_at.astimezone(UTC).strftime("%H:%M UTC")
+        ts = fmt_et(a.created_at, "%H:%M ET")
         summary = (a.summary or "").strip().replace("\n", " ")
         if len(summary) > 250:
             summary = summary[:247] + "..."
@@ -92,7 +93,7 @@ async def run_intraday_scan(
     articles = [a for a in articles if a.created_at >= cutoff]
 
     prompt = PROMPT_TEMPLATE.format(
-        now_iso=now.strftime("%Y-%m-%d %H:%M UTC"),
+        now_iso=fmt_et(now, "%Y-%m-%d %H:%M ET"),
         watchlist=", ".join(watchlist),
         minutes=minutes_back,
         news_block=_format_news(articles),

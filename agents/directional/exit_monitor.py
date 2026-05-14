@@ -21,7 +21,6 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, time
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -37,10 +36,10 @@ from trademaster import indicators
 from trademaster.db import Trade, make_session_factory
 from trademaster.logging import get_logger
 from trademaster.router import TaskType, route_to_model
+from trademaster.timeutils import to_et
 
 log = get_logger(__name__)
 
-ET = ZoneInfo("America/New_York")
 FORCE_CLOSE_AFTER = time(15, 30)
 DIRECTIONAL_STRATEGIES = {"directional_call", "directional_put"}
 HARD_FLOOR_PCT = Decimal("0.30")   # −30%: exit unconditionally, no LLM
@@ -305,9 +304,9 @@ async def run_directional_exit_monitor(
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
 
-    et_now = now.astimezone(ET)
+    et_now = to_et(now)
     past_force_close_time = et_now.time() >= FORCE_CLOSE_AFTER
-    today_et = et_now.date()
+    today = et_now.date()
     global_force = force_close  # None → decide per-trade
 
     with factory() as session:
@@ -330,7 +329,7 @@ async def run_directional_exit_monitor(
         elif past_force_close_time:
             try:
                 _, expiry, _, _ = parse_occ_symbol(occ)
-                trade_force = expiry == today_et
+                trade_force = expiry == today
             except ValueError:
                 trade_force = True
         else:
