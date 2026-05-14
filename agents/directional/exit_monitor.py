@@ -408,28 +408,53 @@ async def run_directional_exit_monitor(
                 or "40310000" in err_str
                 or ("42210000" in err_str and "time_in_force" not in err_str)
             ):
-                log.warning(
-                    "directional_exit_position_not_in_broker",
-                    trade_id=trade.id, occ=occ, error=err_str,
-                )
-                with factory() as session:
-                    row = session.get(Trade, trade.id)
-                    if row is not None:
-                        _close_trade_row(
-                            session, row,
-                            exit_premium=current_bid,
-                            order=None,
-                            reason="position_not_in_broker",
-                            llm_reasoning="Position not found in Alpaca — auto-closed to stop retry loop",
-                        )
-                results.append({
-                    "trade_id": trade.id,
-                    "status": "closed_position_not_in_broker",
-                    "error_text": (
-                        f"⚠️ Trade #{trade.id} ({occ}) not found in Alpaca broker — "
-                        f"marked closed to stop retry loop. Check paper account."
-                    ),
-                })
+                # Verify the position is genuinely absent before auto-closing.
+                # Alpaca paper sometimes rejects SELL_TO_CLOSE with "position intent
+                # mismatch" even when the position IS in the book (timing/tracking
+                # inconsistency). Only auto-close if get_positions() confirms it's gone.
+                try:
+                    live_positions = await alpaca_client.get_positions()
+                    still_live = any(
+                        getattr(p, "symbol", "") == occ for p in live_positions
+                    )
+                except Exception:  # noqa: BLE001
+                    still_live = False  # can't verify — be conservative and close
+
+                if still_live:
+                    # Position IS in Alpaca — the error was a transient rejection.
+                    # Log the warning but leave the DB row open to retry next cycle.
+                    log.warning(
+                        "directional_exit_sell_rejected_position_exists",
+                        trade_id=trade.id, occ=occ, error=err_str,
+                    )
+                    results.append({
+                        "trade_id": trade.id,
+                        "status": "sell_rejected_retry_next_cycle",
+                        "error_text": f"⚠️ Exit rejected for trade #{trade.id} ({occ}) but position exists — will retry.",
+                    })
+                else:
+                    log.warning(
+                        "directional_exit_position_not_in_broker",
+                        trade_id=trade.id, occ=occ, error=err_str,
+                    )
+                    with factory() as session:
+                        row = session.get(Trade, trade.id)
+                        if row is not None:
+                            _close_trade_row(
+                                session, row,
+                                exit_premium=current_bid,
+                                order=None,
+                                reason="position_not_in_broker",
+                                llm_reasoning="Position not found in Alpaca — auto-closed to stop retry loop",
+                            )
+                    results.append({
+                        "trade_id": trade.id,
+                        "status": "closed_position_not_in_broker",
+                        "error_text": (
+                            f"⚠️ Trade #{trade.id} ({occ}) not found in Alpaca broker — "
+                            f"marked closed to stop retry loop. Check paper account."
+                        ),
+                    })
             else:
                 log.error("directional_exit_submit_failed", trade_id=trade.id, error=err_str)
                 results.append({
