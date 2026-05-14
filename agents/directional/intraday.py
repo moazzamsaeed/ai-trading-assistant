@@ -376,10 +376,10 @@ def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> st
     lines.append(f"  Laggards: {', '.join(laggards) or 'none'}")
     if truth_social_posts:
         lines.append("")
-        lines.append("⚡ TRUTH SOCIAL (Trump posts, last 60 min):")
-        for post in truth_social_posts[:3]:
+        lines.append("⚡ MACRO HEADLINES (Trump/China/Fed, last 60 min):")
+        for post in truth_social_posts[:5]:
             lines.append(f"  • {post[:200]}")
-        lines.append("  Note: Trump posts frequently move SPY, QQQ, TSLA, and tech broadly.")
+        lines.append("  Note: These headlines may move SPY, QQQ, TSLA, NVDA, and tech broadly.")
     lines.append("═══════════════════════")
     return "\n".join(lines)
 
@@ -412,17 +412,21 @@ async def run_directional_scan(
     # Market context: SPY regime + relative strength across watchlist
     market_ctx = await _build_market_context(tickers, bars_fetcher)
 
-    # Truth Social: fetch Trump posts (fail-open)
+    # Macro context: Trump/China/Fed headlines written by Hermes cron (fail-open)
     try:
-        from integrations.truth_social_client import get_recent_trump_posts
-        truth_posts = await get_recent_trump_posts(minutes=60)
+        from integrations.macro_context_client import get_macro_headlines
+        truth_posts = get_macro_headlines()
     except Exception:  # noqa: BLE001
         truth_posts = []
 
     market_context_block = _format_market_context_block(market_ctx, truth_posts)
 
     # Per-ticker context (bars + news + indicators) — gather in parallel-ish.
+    # Track tickers with no bar data: the LLM will see an explicit warning in
+    # the ticker block, AND we hard-override any BUY decision to HOLD after
+    # parsing so a hallucinated "RSI looks bullish" can never slip through.
     ticker_blocks: list[str] = []
+    no_bar_tickers: set[str] = set()
     for t in tickers:
         try:
             bars: list[Bar] = await bars_fetcher(
@@ -432,6 +436,8 @@ async def run_directional_scan(
             log.warning("directional_bars_failed", ticker=t, error=str(e))
             bars = []
         snap = indicators.snapshot(bars)
+        if not bars:
+            no_bar_tickers.add(t)
         try:
             news_articles: list[NewsArticle] = await news_fetcher(
                 (t,),
@@ -444,9 +450,11 @@ async def run_directional_scan(
         except Exception as e:  # noqa: BLE001
             log.warning("directional_news_failed", ticker=t, error=str(e))
             headlines = []
-        # Append relative performance to ticker block
         t_perf = market_ctx["ticker_perf"].get(t, {})
-        ticker_blocks.append(_format_ticker_block(t, snap, headlines, t_perf))
+        block = _format_ticker_block(t, snap, headlines, t_perf)
+        if not bars:
+            block += "\n⚠️ NO BAR DATA — MUST HOLD (cannot evaluate indicators)"
+        ticker_blocks.append(block)
 
     prompt = PROMPT_TEMPLATE.format(
         now_iso=now.strftime("%Y-%m-%d %H:%M UTC"),
@@ -463,6 +471,27 @@ async def run_directional_scan(
         session_factory=factory,
     )
     decisions = _parse_decisions(response.text, tickers)
+
+    # Hard-override: any BUY on a ticker with no bar data becomes HOLD.
+    # This prevents hallucinated "RSI looks bullish" from slipping through
+    # when the bars feed was unavailable.
+    if no_bar_tickers:
+        overridden = []
+        for d in decisions:
+            if d.ticker in no_bar_tickers and d.action != "HOLD":
+                log.warning(
+                    "directional_decision_overridden_no_bars",
+                    ticker=d.ticker,
+                    original_action=d.action,
+                )
+                overridden.append(
+                    TickerDecision(d.ticker, "HOLD", None, None, "LOW",
+                                   "no_bar_data — overridden to HOLD")
+                )
+            else:
+                overridden.append(d)
+        decisions = overridden
+
     if mode == "aggressive":
         actionable = [d for d in decisions if d.action != "HOLD" and d.conviction == "HIGH"]
     else:
