@@ -49,6 +49,14 @@ MODEL_MAP: dict[TaskType, tuple[str, str]] = {
     TaskType.EXECUTION_DECISION: ("anthropic", "claude-opus-4-7"),
 }
 
+# Fallback providers used when the primary raises ProviderError (timeout, 5xx).
+# Only defined for tasks where missing a scan has real cost — not for
+# low-stakes formatting tasks.
+FALLBACK_MAP: dict[TaskType, tuple[str, str]] = {
+    TaskType.INTRADAY_SCAN: ("anthropic", "claude-haiku-4-5-20251001"),
+    TaskType.OPTIONS_STRATEGY: ("anthropic", "claude-haiku-4-5-20251001"),
+}
+
 
 Dispatcher = Callable[..., Awaitable[LLMResponse]]
 
@@ -134,6 +142,62 @@ async def route_to_model(
     try:
         response = await dispatcher(prompt, model=model, **client_kwargs)
         return response
+    except ProviderError as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        # Automatic fallback: if this task has a fallback provider defined,
+        # retry immediately rather than letting the scan miss entirely.
+        fallback = FALLBACK_MAP.get(task_type)
+        if fallback:
+            fb_provider, fb_model = fallback
+            log.warning(
+                "llm_fallback_triggered",
+                task_type=task_type.value,
+                primary_provider=provider,
+                primary_model=model,
+                fallback_provider=fb_provider,
+                fallback_model=fb_model,
+                primary_error=error_msg,
+            )
+            fb_dispatcher = _DISPATCH[fb_provider]
+            fb_started = datetime.now(UTC)
+            fb_perf = time.perf_counter()
+            fb_response: LLMResponse | None = None
+            fb_error: str | None = None
+            try:
+                fb_response = await fb_dispatcher(prompt, model=fb_model, **client_kwargs)
+                return fb_response
+            except Exception as fb_e:  # noqa: BLE001
+                fb_error = f"{type(fb_e).__name__}: {fb_e}"
+                raise ProviderError(f"Primary and fallback both failed. Primary: {error_msg} | Fallback: {fb_error}") from fb_e
+            finally:
+                fb_finished = datetime.now(UTC)
+                fb_ms = int((time.perf_counter() - fb_perf) * 1000)
+                with factory() as session:
+                    _persist_run(
+                        session,
+                        task_type=task_type,
+                        provider=fb_provider,
+                        model=fb_model,
+                        started_at=fb_started,
+                        finished_at=fb_finished,
+                        duration_ms=fb_ms,
+                        response=fb_response,
+                        error=fb_error,
+                    )
+                log.info(
+                    "llm_call",
+                    task_type=task_type.value,
+                    provider=fb_provider,
+                    model=fb_model,
+                    duration_ms=fb_ms,
+                    ok=fb_response is not None,
+                    cost_usd=str(fb_response.cost_usd) if fb_response else None,
+                    input_tokens=fb_response.input_tokens if fb_response else None,
+                    output_tokens=fb_response.output_tokens if fb_response else None,
+                    error=fb_error,
+                    fallback=True,
+                )
+        raise
     except RouterError as e:
         error_msg = f"{type(e).__name__}: {e}"
         raise
