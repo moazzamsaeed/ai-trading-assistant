@@ -6,6 +6,7 @@ to `"cash"` (D-001) — TradeMaster will refuse to start if anything else is set
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
@@ -27,25 +28,36 @@ class Settings(BaseSettings):
 
     enable_iron_condor: bool = False
     directional_mode: Literal["aggressive", "selective"] = "selective"
-    directional_max_concurrent: int = Field(default=3, gt=0)
 
-    # Working capital ceiling. The risk manager treats the effective
-    # cash as min(account.cash, trading_capital_usd). Paper account has
-    # $100k but we cap at $5k so paper-trade results map to a real $5k
-    # live account 1:1.
+    # Starting capital baseline for the directional flow. The actual
+    # effective capital is computed dynamically — see trademaster/capital.py.
+    # In paper mode, effective = this base + cumulative realized P&L (since
+    # baseline_reset_at). In live mode, effective = account.equity directly.
     trading_capital_usd: Decimal = Field(default=Decimal("5000"), gt=0)
 
-    # Daily loss limit: 15% of trading_capital_usd (= $750 on a $5k account).
-    # Counts realized P&L (closed trades today) + unrealized (open positions).
-    # When hit, trading halts until the next calendar day (ET).
+    # Baseline reset: if set, the dynamic-capital calc ignores all trades
+    # closed before this UTC timestamp. Use to start fresh after major
+    # strategy changes without losing the audit history. Set via .env:
+    #   BASELINE_RESET_AT=2026-05-14T03:30:00Z
+    baseline_reset_at: datetime | None = None
+
+    # Daily loss limit: 15% of effective capital. Counts realized P&L (closed
+    # trades today) + unrealized (open positions). When hit, trading halts
+    # until the next calendar day (ET). Note: because capital itself shrinks
+    # with today's realized losses, the actual halt point is base × pct/(1+pct)
+    # ≈ $652 on a $5k account, not the nominal $750. Conservative by design.
     daily_loss_limit_pct: float = Field(default=0.15, gt=0, le=1.0)
 
+    # Iron-condor-only legacy caps (risk_manager path). The directional flow
+    # uses dynamic capital sizing in capital.py + scheduler.py and ignores
+    # these. Keep them for the iron-condor strategist if/when it's re-enabled.
     max_position_size_usd: Decimal = Field(default=Decimal("2000"), gt=0)
     max_concurrent_positions: int = Field(default=5, gt=0)
     max_options_contracts_per_trade: int = Field(default=5, gt=0)
 
     # Max total capital deployed across all open directional positions at once.
-    # 20% of trading_capital_usd = $1,000 on a $5k account (2 trades max).
+    # 20% of trading_capital_usd = $1,000 on a $5k account. There is no count
+    # cap — concurrency is bounded by deployed dollars, not trade count.
     max_total_exposure_pct: float = Field(default=0.20, gt=0, le=1.0)
 
     monthly_llm_budget_usd: Decimal = Field(default=Decimal("100"), gt=0)

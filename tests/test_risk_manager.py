@@ -500,3 +500,66 @@ async def test_kill_switch_calls_both_apis_and_logs(session_factory):
         assert ev.severity == "critical"
         assert ev.details["orders_cancelled"] == 3
         assert ev.details["positions_closed"] == 2
+
+
+# ---------------------------------------------------------------------------
+# _deployed_capital_usd — option multiplier regression
+# ---------------------------------------------------------------------------
+
+
+def test_deployed_capital_multiplies_options_by_100(session_factory):
+    """Long option contract: dollars at risk = premium × qty × 100.
+    Without the multiplier, status/cash displays under-count by 100×.
+    """
+    from trademaster.risk_manager import _deployed_capital_usd
+
+    with session_factory() as s:
+        # 3 contracts at $2.00 premium → $600 at risk
+        s.add(Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call",
+            qty=Decimal("3"), entry_price=Decimal("2.00"),
+            opened_at=datetime.now(UTC),
+        ))
+        s.commit()
+
+    with session_factory() as s:
+        deployed = _deployed_capital_usd(s)
+    assert deployed == Decimal("600.00")
+
+
+def test_deployed_capital_iron_condor_uses_max_loss(session_factory):
+    """Iron condor: capital at risk = max_loss × qty (not premium × 100)."""
+    from trademaster.risk_manager import _deployed_capital_usd
+
+    with session_factory() as s:
+        s.add(Trade(
+            symbol="SPY_IC", asset_class="option", side="sell",
+            strategy="spy_0dte_ic",
+            qty=Decimal("2"), entry_price=Decimal("3.00"),
+            opened_at=datetime.now(UTC),
+            extra={"structure": "iron_condor", "max_loss_per_contract": "250"},
+        ))
+        s.commit()
+
+    with session_factory() as s:
+        deployed = _deployed_capital_usd(s)
+    assert deployed == Decimal("500")  # 250 × 2 (not 3 × 2 × 100)
+
+
+def test_deployed_capital_equity_uses_notional(session_factory):
+    """Equity: notional = qty × price (no multiplier)."""
+    from trademaster.risk_manager import _deployed_capital_usd
+
+    with session_factory() as s:
+        s.add(Trade(
+            symbol="SPY", asset_class="us_equity", side="buy",
+            strategy="equity_long",
+            qty=Decimal("10"), entry_price=Decimal("450"),
+            opened_at=datetime.now(UTC),
+        ))
+        s.commit()
+
+    with session_factory() as s:
+        deployed = _deployed_capital_usd(s)
+    assert deployed == Decimal("4500")

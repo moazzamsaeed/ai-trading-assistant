@@ -31,6 +31,7 @@ from agents.research.premarket import run_premarket_briefing
 from decimal import Decimal
 
 from integrations import alpaca_client
+from trademaster.capital import directional_deployed_usd, get_effective_capital
 from trademaster.config import get_settings
 from trademaster.db import get_today_realized_pnl, make_session_factory
 from trademaster.logging import get_logger
@@ -147,17 +148,34 @@ async def _directional_scan_job(
         return
 
     # Daily loss limit: halt if realized + unrealized P&L exceeds 15% of capital.
+    # Capital tracks the actual account size (paper: base + cumulative realized;
+    # live: Alpaca equity), so the limit shrinks with prior losses and grows
+    # with gains automatically.
     settings = get_settings()
-    limit_usd = settings.trading_capital_usd * Decimal(str(settings.daily_loss_limit_pct))
+    capital = await get_effective_capital(make_session_factory())
+
+    # Capital floor: with 0 capital there's nothing to deploy and dividing
+    # by it for the limit gives 0, which would tautologically trip "loss <= 0".
+    # Halt outright instead of erroring.
+    if capital <= Decimal("0"):
+        get_state().pause(hours=24)
+        await log_poster(
+            "🛑 Effective capital is $0 (cumulative losses exceed base). "
+            "Trading halted until tomorrow."
+        )
+        log.warning("scan_skipped_capital_zero")
+        return
+
+    limit_usd = capital * Decimal(str(settings.daily_loss_limit_pct))
     realized = get_today_realized_pnl(make_session_factory())
     unrealized = await alpaca_client.get_unrealized_pnl()
     total_pnl = realized + unrealized
     if total_pnl <= -limit_usd:
         get_state().pause(hours=24)
-        pct = float(-total_pnl / settings.trading_capital_usd * 100)
+        pct = float(-total_pnl / capital * 100)
         await log_poster(
             f"🛑 Daily loss limit hit: **${float(total_pnl):.0f}** loss "
-            f"({pct:.0f}% of ${float(settings.trading_capital_usd):.0f} capital). "
+            f"({pct:.0f}% of ${float(capital):.0f} capital). "
             f"Trading halted until tomorrow. "
             f"Realized: ${float(realized):.0f} | Unrealized: ${float(unrealized):.0f}"
         )
@@ -165,6 +183,7 @@ async def _directional_scan_job(
             "daily_loss_limit_hit",
             total_pnl=float(total_pnl),
             limit_usd=float(limit_usd),
+            capital=float(capital),
             realized=float(realized),
             unrealized=float(unrealized),
         )
@@ -216,7 +235,10 @@ async def _directional_scan_job(
 
     settings = get_settings()
     mode = settings.directional_mode
-    max_exposure = settings.trading_capital_usd * Decimal(str(settings.max_total_exposure_pct))
+    # Reuse the capital value computed for the loss-limit check above — both
+    # gates need a consistent view of capital, and avoiding a second fetch
+    # also halves Alpaca round-trips in live mode.
+    max_exposure = capital * Decimal(str(settings.max_total_exposure_pct))
 
     conviction_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     to_execute = sorted(
@@ -239,22 +261,10 @@ async def _directional_scan_job(
             )
             continue
 
-        # 20% max total exposure cap
-        from agents.directional.exit_monitor import DIRECTIONAL_STRATEGIES
-        from trademaster.db import Trade as TradeRow
-        from sqlalchemy import select as sa_select
+        # 20% max total exposure cap (directional-only deployed)
         factory = make_session_factory()
         with factory() as session:
-            open_trades = list(session.execute(
-                sa_select(TradeRow).where(
-                    TradeRow.strategy.in_(DIRECTIONAL_STRATEGIES),
-                    TradeRow.closed_at.is_(None),
-                )
-            ).scalars())
-        deployed = sum(
-            Decimal(str(t.entry_price)) * Decimal(str(t.qty)) * 100
-            for t in open_trades
-        )
+            deployed = directional_deployed_usd(session)
         if deployed >= max_exposure:
             log.info(
                 "directional_execute_skipped_exposure_cap",
@@ -264,7 +274,7 @@ async def _directional_scan_job(
             continue
 
         try:
-            result = await execute_directional_signal(decision, mode=mode)
+            result = await execute_directional_signal(decision, mode=mode, capital_usd=capital)
             if result.executed and result.trade_id is not None:
                 _last_trade_open[decision.ticker] = datetime.now(UTC)
                 entry_premium = result.entry_premium or Decimal("0")

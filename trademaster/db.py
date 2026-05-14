@@ -150,6 +150,31 @@ def init_db(engine=None) -> None:
     Base.metadata.create_all(engine)
 
 
+def get_cumulative_realized_pnl(session_factory) -> Decimal:
+    """Sum of realized_pnl_usd across closed trades.
+
+    Used by the paper-mode capital model: effective capital tracks the
+    starting base plus all realized gains/losses since the (optional)
+    baseline reset point, so today's sizing reflects recent outcomes
+    without being haunted by ancient bad runs.
+
+    If `settings.baseline_reset_at` is set, only trades closed at or
+    after that UTC timestamp are counted. Trades before the reset stay
+    in the DB for audit but are excluded from sizing.
+    """
+    reset_at = get_settings().baseline_reset_at
+
+    with session_factory() as session:
+        stmt = (
+            select(func.coalesce(func.sum(func.cast(Trade.realized_pnl_usd, Numeric)), 0))
+            .where(Trade.realized_pnl_usd.isnot(None))
+        )
+        if reset_at is not None:
+            stmt = stmt.where(Trade.closed_at >= reset_at)
+        result = session.execute(stmt).scalar()
+    return Decimal(str(result or 0))
+
+
 def get_today_realized_pnl(session_factory) -> Decimal:
     """Sum of realized_pnl_usd for trades closed today (ET calendar day).
 
@@ -163,10 +188,15 @@ def get_today_realized_pnl(session_factory) -> Decimal:
     today = today_et()
     day_start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
     day_end = day_start + timedelta(days=1)
+    # If a baseline reset is configured, also exclude pre-reset trades so
+    # the loss-limit gate doesn't trip on history we deliberately wiped.
+    reset_at = get_settings().baseline_reset_at
+    effective_start = max(day_start, reset_at) if reset_at is not None else day_start
+
     with session_factory() as session:
         result = session.execute(
             select(func.coalesce(func.sum(func.cast(Trade.realized_pnl_usd, Numeric)), 0))
-            .where(Trade.closed_at >= day_start)
+            .where(Trade.closed_at >= effective_start)
             .where(Trade.closed_at < day_end)
         ).scalar()
     return Decimal(str(result or 0))

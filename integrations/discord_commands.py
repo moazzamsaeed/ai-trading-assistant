@@ -66,28 +66,32 @@ async def status(
             f"cash=${account.cash} · buying_power=${account.buying_power} · "
             f"equity=${account.equity} · multiplier={account.multiplier}"
         )
-        effective_cash = min(account.cash, settings.trading_capital_usd)
     except Exception as e:  # noqa: BLE001
         log.warning("status_account_fetch_failed", error=str(e))
         account_line = f"(account fetch failed: {type(e).__name__})"
-        effective_cash = settings.trading_capital_usd
+
+    from trademaster.capital import directional_deployed_usd, get_effective_capital
+    capital = (await get_effective_capital(factory)).quantize(Decimal("0.01"))
+    exposure_cap = (capital * Decimal(str(settings.max_total_exposure_pct))).quantize(Decimal("0.01"))
 
     with factory() as session:
         signals_today = _today_signals_count(session)
         pnl_today = _today_realized_pnl(session).quantize(Decimal("0.01"))
         open_positions = risk_manager.count_open_positions(session)
-        deployed = risk_manager._deployed_capital_usd(session).quantize(Decimal("0.01"))
+        # Use directional-only deployed since exposure_cap governs directional.
+        deployed = directional_deployed_usd(session).quantize(Decimal("0.01"))
 
-    available = (effective_cash - deployed).quantize(Decimal("0.01"))
+    available = (exposure_cap - deployed).quantize(Decimal("0.01"))
 
     return (
         f"**TradeMaster status** · {paused_text}\n"
         f"mode: `{settings.trading_mode}` · account_type: `{settings.account_type}`\n"
         f"{account_line}\n"
-        f"**working capital:** cap=${settings.trading_capital_usd} · "
+        f"**capital:** ${capital} (base ${settings.trading_capital_usd} ± realized P&L)\n"
+        f"**exposure cap:** ${exposure_cap} ({int(settings.max_total_exposure_pct*100)}%) · "
         f"deployed=${deployed} · available=${available}\n"
         f"today: {signals_today} signals · realized P&L: ${pnl_today}\n"
-        f"open positions (db): {open_positions} / max {settings.max_concurrent_positions}"
+        f"open positions (db): {open_positions}"
     )
 
 
@@ -133,10 +137,13 @@ async def cash(
         return f"⚠️ Failed to fetch account: `{type(e).__name__}: {e}`"
 
     factory = session_factory or make_session_factory()
+    from trademaster.capital import directional_deployed_usd, get_effective_capital
     with factory() as session:
-        deployed = risk_manager._deployed_capital_usd(session).quantize(Decimal("0.01"))
-    effective_cash = min(a.cash, settings.trading_capital_usd)
-    available = (effective_cash - deployed).quantize(Decimal("0.01"))
+        deployed = directional_deployed_usd(session).quantize(Decimal("0.01"))
+
+    capital = (await get_effective_capital(factory)).quantize(Decimal("0.01"))
+    exposure_cap = (capital * Decimal(str(settings.max_total_exposure_pct))).quantize(Decimal("0.01"))
+    available = (exposure_cap - deployed).quantize(Decimal("0.01"))
 
     return (
         f"**Account (Alpaca):**\n"
@@ -145,8 +152,9 @@ async def cash(
         f"• Equity: ${a.equity}\n"
         f"• Portfolio value: ${a.portfolio_value}\n"
         f"\n"
-        f"**Working capital (TradeMaster cap):**\n"
-        f"• Cap: ${settings.trading_capital_usd}\n"
+        f"**Effective capital ({settings.trading_mode}):**\n"
+        f"• Capital: ${capital} (base ${settings.trading_capital_usd} ± realized P&L)\n"
+        f"• Exposure cap: ${exposure_cap} ({int(settings.max_total_exposure_pct*100)}%)\n"
         f"• Deployed: ${deployed}\n"
         f"• Available for new trades: ${available}"
     )
@@ -165,8 +173,9 @@ async def kill(
     except Exception as e:  # noqa: BLE001
         log.critical("kill_failed", error=str(e))
         return f"🛑 KILL FAILED: `{type(e).__name__}: {e}` — check Alpaca dashboard manually."
-    get_state().last_kill_at = datetime.now(UTC)
-    get_state().paused_until = datetime.now(UTC) + timedelta(hours=24)
+    state = get_state()
+    state.last_kill_at = datetime.now(UTC)
+    state.pause(hours=24)
     return (
         f"🛑 **KILL switch activated.**\n"
         f"Orders cancelled: {result['orders_cancelled']}\n"
@@ -181,9 +190,9 @@ async def kill(
 async def pause(minutes: int) -> str:
     if minutes <= 0:
         return "❌ Pause minutes must be positive."
-    until = datetime.now(UTC) + timedelta(minutes=minutes)
-    get_state().paused_until = until
-    return f"⏸ Paused for {minutes} min (until {until.isoformat()})."
+    state = get_state()
+    state.pause(minutes=minutes)
+    return f"⏸ Paused for {minutes} min (until {state.paused_until.isoformat()})."
 
 
 # ----------------- /resume -----------------

@@ -392,11 +392,14 @@ async def test_daily_loss_limit_pauses_when_threshold_hit(session_factory, monke
 
 
 async def test_daily_loss_limit_does_not_pause_below_threshold(session_factory, monkeypatch):
-    """At -$700 (under the -$750 limit), the scan proceeds normally."""
+    """Capital dynamically shrinks with realized losses. At -$400 closed today
+    the capital becomes $4,600, the limit becomes $690 (15%), and -$400 of
+    realized P&L is still well under $690 → scan proceeds.
+    """
     monkeypatch.setattr(sch, "make_session_factory", lambda: session_factory)
 
     _seed_realized_loss(
-        session_factory, amount=-700.00,
+        session_factory, amount=-400.00,
         when=datetime(2026, 5, 13, 18, 0, tzinfo=UTC),
     )
 
@@ -741,6 +744,40 @@ async def test_select_best_strike_rejects_sub_50_cent_strikes(monkeypatch):
         budget=500,
     )
     assert selected is None, "Sub-$0.50 strikes must be rejected even with plenty of budget"
+
+
+async def test_executor_has_no_count_cap(session_factory):
+    """The executor must not block on open-trade count — concurrency is gated
+    solely by the scheduler's 20% capital exposure cap. A user can have 5
+    small open positions if their combined notional stays under the cap.
+    """
+    # Pre-populate 5 open directional trades
+    with session_factory() as session:
+        for _ in range(5):
+            session.add(Trade(
+                symbol="SPY260101C00500000", asset_class="option", side="buy",
+                strategy=STRATEGY_CALL,
+                qty=Decimal("1"), entry_price=Decimal("1.00"),
+                opened_at=datetime.now(UTC),
+            ))
+        session.commit()
+
+    async def fake_submit(**_kwargs): return _filled(price=2.00)
+    async def fake_wait(order_id, **_kw): return _filled(price=2.00)
+
+    result = await execute_directional_signal(
+        _decision(),
+        today=datetime(2026, 1, 2, tzinfo=UTC).date(),
+        mode="aggressive",
+        session_factory=session_factory,
+        strike_selector=_strike_selector(ask=2.00),
+        submitter=fake_submit,
+        waiter=fake_wait,
+    )
+
+    assert result.executed, (
+        f"Expected execution to proceed despite 5 open positions; got reason: {result.reason}"
+    )
 
 
 async def test_select_best_strike_picks_closest_to_target(monkeypatch):

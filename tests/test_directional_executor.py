@@ -154,35 +154,6 @@ async def test_execute_missing_strike_returns_no_execute():
     assert not result.executed
 
 
-async def test_execute_max_concurrent_blocks(session_factory, monkeypatch):
-    """When directional_max_concurrent positions are open, execution is skipped."""
-    # Pre-populate 3 open directional trades
-    with session_factory() as session:
-        for _ in range(3):
-            session.add(Trade(
-                symbol="SPY260101C00500000",
-                asset_class="option",
-                side="buy",
-                strategy=STRATEGY_CALL,
-                qty=Decimal("1"),
-                entry_price=Decimal("2.00"),
-            ))
-        session.commit()
-
-    monkeypatch.setenv("DIRECTIONAL_MAX_CONCURRENT", "3")
-    import trademaster.config as cfg
-    cfg.get_settings.cache_clear()
-
-    result = await execute_directional_signal(
-        _decision(),
-        session_factory=session_factory,
-    )
-    assert not result.executed
-    assert "max_concurrent" in result.reason
-
-    cfg.get_settings.cache_clear()
-
-
 async def test_execute_too_expensive_skips(session_factory):
     """selector returns None when ask exceeds budget — execution skipped."""
     result = await execute_directional_signal(

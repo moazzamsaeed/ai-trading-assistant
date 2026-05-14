@@ -86,23 +86,29 @@ def count_open_positions(session: Session) -> int:
 
 
 def _deployed_capital_usd(session: Session) -> Decimal:
-    """Sum of max-loss × qty across all open trades.
+    """Sum of capital-at-risk across all open trades.
 
-    For defined-risk options spreads (D-001), max_loss_per_contract is
-    stored in `trades.extra` at entry. For equities the notional is the
-    entry cost. Returns Decimal(0) when nothing is open.
+    - Iron condor: max_loss_per_contract × qty (defined risk, set at entry).
+    - Single-leg option (asset_class == "option"): premium × qty × 100
+      (multiplier — one contract represents 100 shares).
+    - Equity / spot crypto: qty × entry_price.
+
+    Returns Decimal(0) when nothing is open.
     """
     stmt = select(Trade).where(Trade.closed_at.is_(None))
     rows = list(session.execute(stmt).scalars())
     total = Decimal("0")
     for row in rows:
         extra = row.extra or {}
+        qty = Decimal(str(row.qty))
         if extra.get("structure") == "iron_condor":
             max_loss_pc = Decimal(str(extra.get("max_loss_per_contract", "0")))
-            total += max_loss_pc * Decimal(str(row.qty))
+            total += max_loss_pc * qty
+        elif row.asset_class == "option":
+            # Premium × 100 = dollars at risk per contract for a long option.
+            total += Decimal(str(row.entry_price)) * qty * Decimal("100")
         else:
-            # Equities / spot crypto: notional = qty × entry_price
-            total += Decimal(str(row.qty)) * Decimal(str(row.entry_price))
+            total += qty * Decimal(str(row.entry_price))
     return total
 
 

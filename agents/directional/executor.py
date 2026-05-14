@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agents.directional.intraday import TickerDecision
@@ -37,9 +36,9 @@ log = get_logger(__name__)
 STRATEGY_CALL = "directional_call"
 STRATEGY_PUT = "directional_put"
 
-# 10% of trading_capital_usd per trade. Scales with account: $500 on $5k, $1k on $10k.
-# This budget fits ATM weekly contracts on NVDA/AAPL/AMZN/QCOM/PLTR and
-# 0DTE contracts on SPY/QQQ/IWM at current prices.
+# 10% of effective capital per trade (capital tracks realized P&L — see
+# trademaster/capital.py). At $5k base: $500/trade. After a $1k loss:
+# $400/trade. Fits ATM weekly contracts on the watchlist at current prices.
 _SIZE_FRACTION = {"aggressive": 0.10, "selective": 0.10}
 # PT and SL pct by mode (mirrors _MODE_CONFIG in intraday.py).
 _EXIT_PCT = {
@@ -74,14 +73,6 @@ class DirectionalExecutionResult:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _open_directional_count(session: Session) -> int:
-    stmt = select(Trade).where(
-        Trade.strategy.in_([STRATEGY_CALL, STRATEGY_PUT]),
-        Trade.closed_at.is_(None),
-    )
-    return len(list(session.execute(stmt).scalars()))
 
 
 # Only SPY (and QQQ) have true daily 0DTE options. All other tickers only
@@ -247,6 +238,7 @@ async def execute_directional_signal(
     *,
     today: date | None = None,
     mode: str | None = None,
+    capital_usd: Decimal | None = None,
     session_factory: Callable[[], Session] | None = None,
     strike_selector: Callable[..., object] = select_best_strike,
     submitter: Callable[..., object] = alpaca_client.submit_single_option_buy,
@@ -268,26 +260,28 @@ async def execute_directional_signal(
     mode = mode or settings.directional_mode
     today = today or datetime.now(UTC).date()
 
-    with factory() as session:
-        n_open = _open_directional_count(session)
-    max_concurrent = settings.directional_max_concurrent
-    if n_open >= max_concurrent:
-        log.info(
-            "directional_execute_skipped_max_concurrent",
-            n_open=n_open,
-            max=max_concurrent,
-        )
-        return DirectionalExecutionResult(
-            executed=False, order=None, trade_id=None,
-            reason=f"max_concurrent={max_concurrent} already open",
-        )
+    # No count cap — concurrent positions are gated solely by the 20% capital
+    # exposure cap enforced in the scheduler. Smaller positions → more allowed;
+    # larger positions → fewer allowed. Risk is bounded by deployed dollars,
+    # not arbitrary trade counts.
 
     option_type = "call" if decision.action == "BUY_CALL" else "put"
     expiry_date = _resolve_expiry(decision.expiry, today, decision.ticker)
 
     exit_pcts = _EXIT_PCT.get(mode, _EXIT_PCT["selective"])
     size_frac = _SIZE_FRACTION.get(mode, _SIZE_FRACTION["selective"])
-    position_usd = float(settings.trading_capital_usd) * size_frac
+    # Effective capital scales with actual account performance — losses
+    # shrink it, gains grow it. Scheduler passes its already-computed value
+    # to avoid double-fetching; standalone callers fetch their own.
+    if capital_usd is None:
+        from trademaster.capital import get_effective_capital
+        capital_usd = await get_effective_capital(factory)
+    if capital_usd <= Decimal("0"):
+        return DirectionalExecutionResult(
+            executed=False, order=None, trade_id=None,
+            reason="effective capital is $0 — no new positions",
+        )
+    position_usd = float(capital_usd) * size_frac
 
     # Always select from the real chain — handles strike increments, missing
     # strikes, and budget constraints in one pass for every ticker.
