@@ -55,6 +55,10 @@ MODEL_MAP: dict[TaskType, tuple[str, str]] = {
 FALLBACK_MAP: dict[TaskType, tuple[str, str]] = {
     TaskType.INTRADAY_SCAN: ("anthropic", "claude-haiku-4-5-20251001"),
     TaskType.OPTIONS_STRATEGY: ("anthropic", "claude-haiku-4-5-20251001"),
+    # Gemini 2.5 Pro returns 503 "high demand" intermittently. Premarket fires
+    # once at 8 AM ET — no fallback means a missed briefing for the whole day.
+    # Use Claude Sonnet for the fallback since the prompt is long-form synthesis.
+    TaskType.PRE_MARKET_RESEARCH: ("anthropic", "claude-sonnet-4-6"),
 }
 
 
