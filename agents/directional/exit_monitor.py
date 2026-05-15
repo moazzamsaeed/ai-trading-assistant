@@ -1,13 +1,19 @@
-"""Directional options exit monitor — hybrid intelligent exit.
+"""Directional options exit monitor — indicator-driven intelligent exit.
 
 Runs every 5 min during RTH. For each open directional Trade row:
 
   1. Hard floor (−30%): exit immediately, no LLM needed.
   2. Force close on expiry day at 15:30 ET (0DTE every day, weekly on Friday).
-  3. Rule-based trigger: fetch bars, compute indicators, check exit signals.
-     BUY_CALL rules: price < VWAP, RSI > 70, EMA20 < EMA50, volume fading
-     BUY_PUT rules:  price > VWAP, RSI < 30, EMA20 > EMA50, volume fading
-  4. If any rule fires → DeepSeek V4-Flash confirms EXIT or HOLD with reasoning.
+  3. Stop premium: hard stop set at entry (−50% aggressive / −30% selective).
+  4. Indicator scan + LLM confirmation — two triggers:
+       a. Any reversal rule fires (thesis protection, loss or gain)
+       b. P&L ≥ PROFIT_LOCK_PCT (75%): always consult LLM even if no rules fired
+     BUY_CALL rules: price < VWAP, RSI > 75, EMA20 < EMA50, volume fading
+     BUY_PUT rules:  price > VWAP, RSI < 25, EMA20 > EMA50, volume fading
+  5. LLM decides EXIT or HOLD with full context: P&L, indicators, mode, expiry.
+     - No hard profit target — LLM + indicators govern when to take profit.
+     - Selective mode: one fading indicator in profit zone is enough to exit.
+     - Aggressive mode: require ≥2 confirming signals before exiting a winner.
 
 On a close fill:
   - updates the Trade row
@@ -44,6 +50,7 @@ FORCE_CLOSE_AFTER = time(15, 30)
 DIRECTIONAL_STRATEGIES = {"directional_call", "directional_put"}
 HARD_FLOOR_PCT = Decimal("0.30")   # −30%: exit unconditionally, no LLM
 VOLUME_FADE_THRESHOLD = 0.7        # volume_ratio below this = momentum fading
+PROFIT_LOCK_PCT = 75.0             # always consult LLM above this P&L even with no indicator triggers
 
 _EXIT_CONFIRM_PROMPT = """You manage an open options position. Decide EXIT or HOLD.
 
@@ -51,18 +58,37 @@ Position:
   Ticker: {ticker} | Action: {action} | Mode: {mode}
   Entry: ${entry_premium}/share | Current bid: ${current_bid}/share
   P&L: {pnl_sign}{pnl_pct}% | Held: {mins_held} min | Expiry: {expiry}
+  Reference targets: PT ≥${profit_target}/share · Stop ≤${stop_ref}/share
 
 {ticker} indicators right now:
   Price: ${price} | VWAP: {vwap}
-  RSI(14): {rsi} | EMA20: {ema20} | EMA50: {ema50}
+  RSI(9): {rsi} | EMA20: {ema20} | EMA50: {ema50}
   Volume ratio: {vol_ratio}
 
-Rules that triggered: {rules}
+Rules triggered: {rules}
 
 Original entry reasoning: "{entry_reasoning}"
 
-EXIT if thesis is broken, momentum reversed, or remaining upside is minimal.
-HOLD if momentum is intact and further gain is reasonably likely.
+--- EXIT FRAMEWORK ---
+
+LOSS SIDE — exit if thesis is broken:
+  • Price broke VWAP against position direction
+  • EMA cross confirmed reversal
+  • RSI flipped extreme opposite direction + volume fading
+
+PROFIT SIDE — no hard target, use indicator confluence:
+  • P&L 30–74%: exit if ≥2 indicators show fading momentum
+  • P&L ≥75%: exit if ANY single indicator shows fading momentum
+  • P&L ≥150%: EXIT unless ALL indicators unanimously confirm continuation (rare — capture the gain)
+  • Volume fade alone while in profit = smart money distributing into your position → EXIT
+  • RSI exhaustion + volume fade = momentum spent → EXIT
+
+MODE CONTEXT — {mode_guidance}
+
+TIME CONTEXT — factor in expiry. Theta accelerates in final 90 min.
+  If expiry is today and P&L is positive, lean EXIT over HOLD.
+
+HOLD only if: momentum is intact across multiple indicators, thesis unchanged, and remaining upside clearly justifies the risk of giving back current gains.
 
 Respond with JSON only: {{"decision": "EXIT"|"HOLD", "reason": "one brief sentence"}}"""
 
@@ -183,25 +209,38 @@ async def _llm_exit_confirm(
         if opened_at else "?"
     )
 
+    profit_target = extra.get("profit_target_premium", "N/A")
+    stop_ref = extra.get("stop_premium", "N/A")
+    mode_guidance = (
+        "AGGRESSIVE — let winners run. Require confluence of ≥2 fading indicators "
+        "before exiting a profitable position. Single signals are noise."
+        if mode == "aggressive" else
+        "SELECTIVE — protect gains. A single strong reversal signal while in profit "
+        "is sufficient to EXIT. Don't give back gains chasing more."
+    )
+
     pnl_sign = "+" if pnl_pct >= 0 else "-"
     prompt = _EXIT_CONFIRM_PROMPT.format(
         ticker=ticker,
         action=action,
-        mode=mode,
+        mode=mode.upper(),
         entry_premium=str(entry_premium),
         current_bid=str(current_bid),
         pnl_sign=pnl_sign,
         pnl_pct=f"{abs(pnl_pct):.1f}",
         mins_held=mins_held,
         expiry=expiry,
+        profit_target=profit_target,
+        stop_ref=stop_ref,
         price=snap.get("last_close", "?"),
         vwap=snap.get("vwap", "N/A"),
         rsi=snap.get("rsi9", "N/A"),
         ema20=snap.get("ema20", "N/A"),
         ema50=snap.get("ema50", "N/A"),
         vol_ratio=snap.get("volume_ratio_20", "N/A"),
-        rules=", ".join(triggered_rules),
+        rules=", ".join(triggered_rules) if triggered_rules else "none — profit zone check",
         entry_reasoning=entry_reasoning,
+        mode_guidance=mode_guidance,
     )
 
     try:
@@ -258,7 +297,8 @@ def _format_exit_combined(
     reason_text = {
         "hard_floor_stop": "🛑 hard floor −30%",
         "stop_premium": "🛑 stop premium hit",
-        "smart_exit": "🧠 smart exit",
+        "smart_exit": "🧠 smart exit — thesis reversed",
+        "smart_profit_exit": "💰 smart profit exit — indicators say take it",
         "force_close": "⏰ closing before market close",
     }.get(reason, f"closing ({reason})")
 
@@ -371,7 +411,7 @@ async def run_directional_exit_monitor(
             )
 
         else:
-            # Rule-based trigger: fetch bars + indicators for underlying
+            # Fetch bars + indicators once — used for both reversal and profit checks.
             snap: dict = {}
             try:
                 bars = await bars_fetcher(ticker, timeframe_minutes=5, limit=60)
@@ -380,7 +420,11 @@ async def run_directional_exit_monitor(
                 log.warning("exit_monitor_bars_failed", trade_id=trade.id, error=str(e))
 
             triggered = _check_exit_rules(action, snap)
-            if triggered:
+            in_strong_profit = pnl_pct >= PROFIT_LOCK_PCT
+
+            # Consult LLM if: (a) any indicator rule fired, OR (b) P&L is high enough
+            # that we should proactively check whether to take the gain.
+            if triggered or in_strong_profit:
                 should_exit, llm_reasoning = await _llm_exit_confirm(
                     trade=trade,
                     snap=snap,
@@ -391,7 +435,15 @@ async def run_directional_exit_monitor(
                     llm_caller=llm_caller,
                 )
                 if should_exit:
-                    reason = "smart_exit"
+                    reason = "smart_profit_exit" if pnl_pct > 0 else "smart_exit"
+                    log.info(
+                        "directional_exit_smart",
+                        trade_id=trade.id,
+                        reason=reason,
+                        pnl_pct=f"{pnl_pct:+.1f}%",
+                        triggered_rules=triggered,
+                        in_strong_profit=in_strong_profit,
+                    )
 
         if not should_exit:
             results.append({
