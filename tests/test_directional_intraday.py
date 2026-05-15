@@ -284,8 +284,8 @@ async def test_scan_empty_watchlist_returns_empty():
     assert messages == []
 
 
-async def test_scan_aggressive_filters_medium_conviction(monkeypatch, session_factory):
-    """In aggressive mode, MEDIUM conviction signals are suppressed."""
+async def test_scan_aggressive_passes_medium_and_high_conviction(monkeypatch, session_factory):
+    """Bug 2 regression: aggressive mode must pass MEDIUM + HIGH, block LOW."""
 
     async def fake_bars(t, *, timeframe_minutes, limit):
         return _bars()
@@ -294,11 +294,11 @@ async def test_scan_aggressive_filters_medium_conviction(monkeypatch, session_fa
         return []
 
     async def fake_route(_task_type, _prompt, **_k):
-        # SPY = HIGH, QQQ = MEDIUM BUY_CALL — only SPY should pass in aggressive
+        # SPY = HIGH, QQQ = MEDIUM — both should pass in aggressive mode
         return _llm(
             '[{"ticker":"SPY","action":"BUY_CALL","strike":745,"expiry":"0DTE",'
             '"conviction":"HIGH","reasoning":"strong"},'
-            '{"ticker":"QQQ","action":"BUY_CALL","strike":400,"expiry":"0DTE",'
+            '{"ticker":"QQQ","action":"BUY_CALL","strike":400,"expiry":"WEEKLY",'
             '"conviction":"MEDIUM","reasoning":"moderate"}]'
         )
 
@@ -311,14 +311,44 @@ async def test_scan_aggressive_filters_medium_conviction(monkeypatch, session_fa
         news_fetcher=fake_news,
         mode="aggressive",
     )
-    # QQQ MEDIUM filtered out; only SPY HIGH passes
-    assert len(messages) == 1
-    assert "SPY" in messages[0]
-    assert "+100%" in messages[0]  # aggressive exit targets
+    # Both HIGH and MEDIUM pass in aggressive mode
+    assert len(messages) == 2
+    tickers = {m.split("**")[1].split(" ")[0] for m in messages}
+    assert "SPY" in tickers
+    assert "QQQ" in tickers
+    assert all("+100%" in m for m in messages)  # aggressive exit targets
 
 
-async def test_scan_selective_passes_medium_conviction(monkeypatch, session_factory):
-    """In selective mode, MEDIUM conviction signals are allowed."""
+async def test_scan_selective_blocks_medium_conviction(monkeypatch, session_factory):
+    """Bug 2 regression: selective mode must only pass HIGH conviction signals."""
+
+    async def fake_bars(t, *, timeframe_minutes, limit):
+        return _bars()
+
+    async def fake_news(*_a, **_k):
+        return []
+
+    async def fake_route(_task_type, _prompt, **_k):
+        # MEDIUM conviction — selective mode should block this
+        return _llm(
+            '[{"ticker":"SPY","action":"BUY_CALL","strike":745,"expiry":"0DTE",'
+            '"conviction":"MEDIUM","reasoning":"moderate setup"}]'
+        )
+
+    monkeypatch.setattr(agent, "route_to_model", fake_route)
+
+    decisions, messages, _report = await agent.run_directional_scan(
+        watchlist=("SPY",),
+        session_factory=session_factory,
+        bars_fetcher=fake_bars,
+        news_fetcher=fake_news,
+        mode="selective",
+    )
+    assert len(messages) == 0, "MEDIUM conviction must be blocked in selective mode"
+
+
+async def test_scan_selective_passes_high_conviction(monkeypatch, session_factory):
+    """Selective mode executes HIGH conviction signals with tighter exit targets."""
 
     async def fake_bars(t, *, timeframe_minutes, limit):
         return _bars()
@@ -329,7 +359,7 @@ async def test_scan_selective_passes_medium_conviction(monkeypatch, session_fact
     async def fake_route(_task_type, _prompt, **_k):
         return _llm(
             '[{"ticker":"SPY","action":"BUY_CALL","strike":745,"expiry":"0DTE",'
-            '"conviction":"MEDIUM","reasoning":"moderate setup"}]'
+            '"conviction":"HIGH","reasoning":"strong breakout"}]'
         )
 
     monkeypatch.setattr(agent, "route_to_model", fake_route)

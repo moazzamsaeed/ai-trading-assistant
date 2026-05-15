@@ -426,9 +426,9 @@ async def test_monitor_smart_exit_on_rule_and_llm_confirms(session_factory):
         llm_caller=fake_llm,
         force_close=False,
     )
-    # With volume_fading rule triggered and LLM saying EXIT → smart_exit
+    # +30% P&L + LLM says EXIT → smart_profit_exit (positive P&L)
     if results[0]["status"] == "closed":
-        assert results[0]["reason"] == "smart_exit"
+        assert results[0]["reason"] == "smart_profit_exit"
         assert "combined_text" in results[0]
 
 
@@ -587,3 +587,217 @@ async def test_weekly_force_closed_on_expiry_day(session_factory):
     )
     assert results[0]["status"] == "closed"
     assert results[0]["reason"] == "force_close"
+
+
+# ---------------------------------------------------------------------------
+# Bug fixes — regression tests
+# ---------------------------------------------------------------------------
+
+
+def _open_trade_mode(session_factory, *, entry_premium: float = 2.00, mode: str) -> Trade:
+    with session_factory() as session:
+        trade = Trade(
+            symbol="SPY260101C00500000",
+            asset_class="option",
+            side="buy",
+            strategy="directional_call",
+            qty=Decimal("1"),
+            entry_price=Decimal(str(entry_premium)),
+            opened_at=datetime.now(UTC),
+            extra={
+                "ticker": "SPY",
+                "action": "BUY_CALL",
+                "occ_symbol": "SPY260101C00500000",
+                "mode": mode,
+                "stop_premium": str(
+                    Decimal(str(entry_premium)) * (
+                        Decimal("0.50") if mode == "aggressive" else Decimal("0.70")
+                    )
+                ),
+            },
+        )
+        session.add(trade)
+        session.commit()
+        return trade
+
+
+async def test_hard_floor_selective_triggers_at_30pct(session_factory):
+    """Bug 5: selective hard floor is -30% (entry=2.00, floor=1.40)."""
+    _open_trade_mode(session_factory, entry_premium=2.00, mode="selective")
+
+    async def quote_at_floor(_occ):
+        return _quote(bid=1.40)
+
+    async def no_bars(*_a, **_k):
+        return []
+
+    async def fake_sell(**_kw):
+        return _filled(price=1.40)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=1.40)
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        quote_fetcher=quote_at_floor,
+        bars_fetcher=no_bars,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        force_close=False,
+    )
+    assert results[0]["reason"] == "hard_floor_stop"
+
+
+async def test_hard_floor_aggressive_does_not_trigger_at_30pct(session_factory):
+    """Bug 5: aggressive hard floor is -50%, not -30%. A -30% loss must not auto-exit."""
+    _open_trade_mode(session_factory, entry_premium=2.00, mode="aggressive")
+
+    async def quote_at_30pct(_occ):
+        return _quote(bid=1.40)  # -30% — within tolerance for aggressive
+
+    async def no_bars(*_a, **_k):
+        return []
+
+    async def fake_llm(*_a, **_k):
+        return _fake_llm("HOLD", "still in range")
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        quote_fetcher=quote_at_30pct,
+        bars_fetcher=no_bars,
+        llm_caller=fake_llm,
+        force_close=False,
+    )
+    assert results[0]["status"] == "hold"
+
+
+async def test_hard_floor_aggressive_triggers_at_50pct(session_factory):
+    """Bug 5: aggressive hard floor fires at -50% (entry=2.00, floor=1.00)."""
+    _open_trade_mode(session_factory, entry_premium=2.00, mode="aggressive")
+
+    async def quote_at_50pct(_occ):
+        return _quote(bid=1.00)  # exactly -50%
+
+    async def no_bars(*_a, **_k):
+        return []
+
+    async def fake_sell(**_kw):
+        return _filled(price=1.00)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=1.00)
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        quote_fetcher=quote_at_50pct,
+        bars_fetcher=no_bars,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        force_close=False,
+    )
+    assert results[0]["reason"] == "hard_floor_stop"
+
+
+async def test_profit_lock_triggers_llm_without_indicator_rules(session_factory):
+    """At >=75% P&L the LLM is always consulted even when no indicators fired."""
+    _open_trade(session_factory, entry_premium=2.00)
+
+    async def high_quote(_occ):
+        return _quote(bid=3.51)  # +75.5% — above PROFIT_LOCK_PCT
+
+    async def no_bars(*_a, **_k):
+        return []  # no bars -> no indicator rules fire
+
+    llm_called = []
+
+    async def fake_llm(*_a, **_k):
+        llm_called.append(True)
+        return _fake_llm("HOLD", "momentum intact")
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        quote_fetcher=high_quote,
+        bars_fetcher=no_bars,
+        llm_caller=fake_llm,
+        force_close=False,
+    )
+    assert llm_called == [True], "LLM must be consulted at >=75% P&L even with no indicator triggers"
+    assert results[0]["status"] == "hold"
+
+
+async def test_smart_profit_exit_reason_when_pnl_positive(session_factory):
+    """Exit in profit uses reason='smart_profit_exit', not 'smart_exit'."""
+    _open_trade(session_factory, entry_premium=2.00)
+
+    async def profitable_quote(_occ):
+        return _quote(bid=2.60)  # +30%
+
+    from integrations.alpaca_client import Bar
+    from decimal import Decimal as D
+
+    async def fading_bars(*_a, **_k):
+        return [Bar(
+            timestamp=datetime.now(UTC),
+            open=D("500"), high=D("501"), low=D("499"), close=D("500"),
+            volume=3000, vwap=D("502"),  # price < vwap fires rule
+        )] * 60
+
+    async def fake_sell(**_kw):
+        return _filled(price=2.60)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=2.60)
+
+    async def exit_llm(*_a, **_k):
+        return _fake_llm("EXIT", "thesis reversed")
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        quote_fetcher=profitable_quote,
+        bars_fetcher=fading_bars,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        llm_caller=exit_llm,
+        force_close=False,
+    )
+    if results[0]["status"] == "closed":
+        assert results[0]["reason"] == "smart_profit_exit"
+
+
+async def test_smart_exit_reason_when_pnl_negative(session_factory):
+    """Exit at a loss uses reason='smart_exit', not 'smart_profit_exit'."""
+    _open_trade(session_factory, entry_premium=2.00)
+
+    async def losing_quote(_occ):
+        return _quote(bid=1.80)  # -10%
+
+    from integrations.alpaca_client import Bar
+    from decimal import Decimal as D
+
+    async def fading_bars(*_a, **_k):
+        return [Bar(
+            timestamp=datetime.now(UTC),
+            open=D("500"), high=D("501"), low=D("499"), close=D("498"),
+            volume=3000, vwap=D("502"),  # price < vwap fires rule
+        )] * 60
+
+    async def fake_sell(**_kw):
+        return _filled(price=1.80)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=1.80)
+
+    async def exit_llm(*_a, **_k):
+        return _fake_llm("EXIT", "thesis reversed")
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        quote_fetcher=losing_quote,
+        bars_fetcher=fading_bars,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        llm_caller=exit_llm,
+        force_close=False,
+    )
+    if results[0]["status"] == "closed":
+        assert results[0]["reason"] == "smart_exit"

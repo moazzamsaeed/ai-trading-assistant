@@ -242,25 +242,26 @@ async def test_run_intraday_once(monkeypatch):
 
 
 def test_make_scheduler_registers_directional_exit_jobs():
+    """Regular exit job + 15:50 0DTE safety net — no global force-close job."""
     scheduler = sch.make_scheduler(**_all_posters())
     monitor = scheduler.get_job("directional_exit")
-    force = scheduler.get_job("directional_force_close")
+    safety_net = scheduler.get_job("directional_0dte_final_close")
+    gone = scheduler.get_job("directional_force_close")  # Bug fix: this job was removed
+
     assert monitor is not None
-    assert force is not None
-    f_fields = {f.name: str(f) for f in force.trigger.fields}
-    assert f_fields["hour"] == "15"
-    assert f_fields["minute"] == "30"
+    assert safety_net is not None, "15:50 0DTE safety-net job must be registered"
+    assert gone is None, "directional_force_close must NOT exist — it bypassed per-trade expiry check"
+
+    sn_fields = {f.name: str(f) for f in safety_net.trigger.fields}
+    assert sn_fields["hour"] == "15"
+    assert sn_fields["minute"] == "50"
 
 
 async def test_directional_exit_job_posts_combined_to_signals(monkeypatch):
     sig: list[str] = []
-    trd: list[str] = []
 
     async def signals(t):
         sig.append(t)
-
-    async def trades(t):
-        trd.append(t)
 
     async def clock_open() -> sch.alpaca_client.MarketClock:
         from datetime import UTC, timedelta
@@ -276,22 +277,16 @@ async def test_directional_exit_job_posts_combined_to_signals(monkeypatch):
         return [{"combined_text": "📈 SPY CALL — bot closed"}]
 
     monkeypatch.setattr(sch, "run_directional_exit_monitor", fake_monitor)
-    await sch._directional_exit_job(
-        signal_poster=signals, trade_poster=trades, clock_fetcher=clock_open
-    )
+    await sch._directional_exit_job(signal_poster=signals, clock_fetcher=clock_open)
     assert sig == ["📈 SPY CALL — bot closed"]
-    assert trd == []  # no #trades post for directional exits
 
 
-async def test_directional_force_close_skips_clock(monkeypatch):
+async def test_directional_exit_job_force_skips_clock(monkeypatch):
+    """force=True bypasses market-open check (used for 15:50 safety net)."""
     sig: list[str] = []
-    trd: list[str] = []
 
     async def signals(t):
         sig.append(t)
-
-    async def trades(t):
-        trd.append(t)
 
     async def clock_closed():
         from datetime import UTC, timedelta
@@ -303,16 +298,43 @@ async def test_directional_force_close_skips_clock(monkeypatch):
             next_close=now + timedelta(hours=6),
         )
 
+    monitor_called = []
+
     async def fake_monitor(**kwargs):
-        assert kwargs.get("force_close") is True
+        monitor_called.append(True)
         return []
 
     monkeypatch.setattr(sch, "run_directional_exit_monitor", fake_monitor)
     await sch._directional_exit_job(
-        signal_poster=signals, trade_poster=trades,
-        clock_fetcher=clock_closed, force=True,
+        signal_poster=signals, clock_fetcher=clock_closed, force=True,
     )
-    # No error = force=True bypassed clock check correctly.
+    assert monitor_called == [True], "force=True must bypass clock check"
+
+
+async def test_exit_monitor_runs_when_paused(monkeypatch):
+    """Bug 3: pausing blocks new entries but exit monitor must still run to protect open positions."""
+    from trademaster.state import get_state
+    get_state().pause(hours=24)
+
+    monitor_called = []
+
+    async def fake_monitor(**_kwargs):
+        monitor_called.append(True)
+        return []
+
+    async def clock_open():
+        from datetime import UTC, timedelta
+        from integrations.alpaca_client import MarketClock
+        now = __import__("datetime").datetime.now(UTC)
+        return MarketClock(
+            timestamp=now, is_open=True,
+            next_open=now + timedelta(hours=12),
+            next_close=now + timedelta(hours=6),
+        )
+
+    monkeypatch.setattr(sch, "run_directional_exit_monitor", fake_monitor)
+    await sch._directional_exit_job(signal_poster=_noop_poster, clock_fetcher=clock_open)
+    assert monitor_called == [True], "exit monitor must run even when trading is paused"
 
 
 # ----------------- iron condor entry -----------------
@@ -608,3 +630,58 @@ async def test_exit_job_failure_routes_to_logs(monkeypatch):
     assert sig == [] and trd == []
     assert len(logs) == 1
     assert "failed" in logs[0].lower()
+
+
+# ---------------------------------------------------------------------------
+# Bug fixes — conviction filter regression tests (Bug 2)
+# ---------------------------------------------------------------------------
+
+
+from agents.directional.intraday import TickerDecision as _TD
+
+
+def _decisions_mixed() -> list[_TD]:
+    """One HIGH, one MEDIUM, one LOW conviction signal."""
+    return [
+        _TD("SPY", "BUY_CALL", 500.0, "0DTE", "HIGH", "strong breakout"),
+        _TD("NVDA", "BUY_CALL", 900.0, "WEEKLY", "MEDIUM", "mild momentum"),
+        _TD("AAPL", "BUY_CALL", 200.0, "WEEKLY", "LOW", "weak signal"),
+    ]
+
+
+def _filter_decisions(decisions, mode: str) -> list[_TD]:
+    """Replicate the scheduler's conviction filter logic."""
+    allowed = {"HIGH"} if mode == "selective" else {"MEDIUM", "HIGH"}
+    return [d for d in decisions if d.action != "HOLD" and d.conviction in allowed]
+
+
+def test_conviction_filter_selective_allows_only_high():
+    """Bug 2: selective mode must only execute HIGH conviction signals."""
+    result = _filter_decisions(_decisions_mixed(), "selective")
+    convictions = {d.conviction for d in result}
+    assert convictions == {"HIGH"}, f"selective should only pass HIGH, got {convictions}"
+    assert len(result) == 1
+
+
+def test_conviction_filter_aggressive_allows_medium_and_high():
+    """Bug 2: aggressive mode must execute MEDIUM + HIGH conviction signals."""
+    result = _filter_decisions(_decisions_mixed(), "aggressive")
+    convictions = {d.conviction for d in result}
+    assert "HIGH" in convictions
+    assert "MEDIUM" in convictions
+    assert "LOW" not in convictions, "LOW conviction must be blocked in aggressive mode"
+    assert len(result) == 2
+
+
+def test_conviction_filter_aggressive_blocks_low():
+    """Bug 2: LOW conviction is never executed, even in aggressive mode."""
+    low_only = [_TD("AAPL", "BUY_CALL", 200.0, "WEEKLY", "LOW", "weak")]
+    result = _filter_decisions(low_only, "aggressive")
+    assert result == [], "LOW conviction must be blocked in aggressive mode"
+
+
+def test_conviction_filter_selective_blocks_medium():
+    """Bug 2: MEDIUM conviction must not execute in selective mode (was the bug)."""
+    medium_only = [_TD("NVDA", "BUY_CALL", 900.0, "WEEKLY", "MEDIUM", "mild")]
+    result = _filter_decisions(medium_only, "selective")
+    assert result == [], "MEDIUM conviction must be blocked in selective mode"

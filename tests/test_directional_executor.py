@@ -92,13 +92,24 @@ def _rejected_order() -> OrderResult:
 
 
 def test_resolve_expiry_0dte():
-    today = date(2026, 5, 11)  # Monday
-    # SPY has daily options — 0DTE resolves to today
-    assert _resolve_expiry("0DTE", today, "SPY") == today
-    # AMD only has weekly options — 0DTE resolves to next Friday
-    assert _resolve_expiry("0DTE", today, "AMD") == date(2026, 5, 15)
+    monday = date(2026, 5, 11)  # Monday
+    tuesday = date(2026, 5, 12)
+    wednesday = date(2026, 5, 13)
+
+    # SPY has true daily 0DTE — every weekday
+    assert _resolve_expiry("0DTE", monday, "SPY") == monday
+    assert _resolve_expiry("0DTE", tuesday, "SPY") == tuesday
+
+    # QQQ/IWM only have 0DTE on Mon/Wed/Fri — Bug 8 regression
+    assert _resolve_expiry("0DTE", monday, "QQQ") == monday       # Mon: allowed
+    assert _resolve_expiry("0DTE", wednesday, "QQQ") == wednesday  # Wed: allowed
+    assert _resolve_expiry("0DTE", tuesday, "QQQ") == date(2026, 5, 15)   # Tue: redirect to Friday
+    assert _resolve_expiry("0DTE", tuesday, "IWM") == date(2026, 5, 15)   # Tue: redirect to Friday
+
+    # AMD only has weekly options
+    assert _resolve_expiry("0DTE", monday, "AMD") == date(2026, 5, 15)
     # No ticker given — defaults to next Friday (safe fallback)
-    assert _resolve_expiry("0DTE", today) == date(2026, 5, 15)
+    assert _resolve_expiry("0DTE", monday) == date(2026, 5, 15)
 
 
 def test_resolve_expiry_weekly_from_monday():
@@ -328,3 +339,91 @@ async def test_execute_aggressive_sizing(session_factory):
         waiter=fake_wait,
     )
     assert submitted_kwargs["qty"] == 2  # floor(500 / 200) = 2
+
+
+# ---------------------------------------------------------------------------
+# Bug fixes — regression tests
+# ---------------------------------------------------------------------------
+
+
+async def test_ghost_position_calls_seller_not_submitter(session_factory):
+    """Bug 1: ghost position recovery must call SELL, not BUY again."""
+    buy_calls = []
+    sell_calls = []
+
+    async def fake_submit(**kwargs):
+        buy_calls.append(kwargs)
+        return _filled_order(price=2.00)
+
+    async def fake_sell(**kwargs):
+        sell_calls.append(kwargs)
+        return _filled_order(price=2.00)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled_order(price=2.00)
+
+    # Simulate ghost: position never appears in Alpaca book
+    async def no_positions():
+        return []
+
+    import agents.directional.executor as _ex
+    original = _ex.alpaca_client.get_positions
+    _ex.alpaca_client.get_positions = no_positions
+
+    try:
+        result = await execute_directional_signal(
+            _decision(action="BUY_CALL", expiry="0DTE", conviction="HIGH"),
+            today=date(2026, 1, 2),
+            mode="aggressive",
+            session_factory=session_factory,
+            strike_selector=_selected(ask=2.00),
+            submitter=fake_submit,
+            seller=fake_sell,
+            waiter=fake_wait,
+        )
+    finally:
+        _ex.alpaca_client.get_positions = original
+
+    assert not result.executed
+    assert "ghost" in result.reason
+    assert len(buy_calls) == 1   # only the original BUY
+    assert len(sell_calls) == 1  # recovery used SELL, not BUY again
+
+
+async def test_pt_sl_computed_from_fill_price_not_ask(session_factory):
+    """Bug 4: PT/SL must use actual fill price, not the pre-order ask."""
+    ask_price = 2.00
+    fill_price = 1.85  # better fill than ask
+
+    async def fake_submit(**_kw):
+        return _filled_order(price=fill_price)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled_order(price=fill_price)
+
+    result = await execute_directional_signal(
+        _decision(action="BUY_CALL", expiry="0DTE", conviction="HIGH"),
+        today=date(2026, 1, 2),
+        mode="selective",
+        session_factory=session_factory,
+        strike_selector=_selected(ask=ask_price),
+        submitter=fake_submit,
+        waiter=fake_wait,
+    )
+    assert result.executed
+
+    with session_factory() as session:
+        trade = session.get(__import__("trademaster.db", fromlist=["Trade"]).Trade, result.trade_id)
+        extra = trade.extra or {}
+        stop = float(extra["stop_premium"])
+        pt = float(extra["profit_target_premium"])
+
+        # selective: stop=-30%, pt=+50% — both from FILL price, not ask
+        expected_stop = fill_price * 0.70
+        expected_pt = fill_price * 1.50
+        assert abs(stop - expected_stop) < 0.001, f"stop {stop} should be ~{expected_stop} (from fill)"
+        assert abs(pt - expected_pt) < 0.001, f"pt {pt} should be ~{expected_pt} (from fill)"
+
+        # Sanity: if computed from ask they'd be different
+        ask_stop = ask_price * 0.70
+        assert abs(stop - ask_stop) > 0.001, "stop must NOT match the pre-order ask price"
