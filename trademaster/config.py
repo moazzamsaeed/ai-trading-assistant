@@ -84,13 +84,6 @@ class Settings(BaseSettings):
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
-    @property
-    def daily_loss_limit_usd(self) -> Decimal:
-        """Derived from daily_loss_limit_pct × trading_capital_usd."""
-        return (self.trading_capital_usd * Decimal(str(self.daily_loss_limit_pct))).quantize(
-            Decimal("0.01")
-        )
-
     @field_validator("account_type", mode="before")
     @classmethod
     def _cash_only(cls, v: object) -> object:

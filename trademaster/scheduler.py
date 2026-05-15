@@ -252,7 +252,7 @@ async def _directional_scan_job(
     conviction_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     to_execute = sorted(
         [d for d in decisions if d.action != "HOLD"
-         and (mode != "aggressive" or d.conviction == "HIGH")
+         and d.conviction in ({"HIGH"} if mode == "selective" else {"MEDIUM", "HIGH"})
          and (not high_conviction_only_day or d.conviction == "HIGH")],
         key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
     )[:3]
@@ -335,15 +335,13 @@ async def _directional_scan_job(
 async def _directional_exit_job(
     *,
     signal_poster: Poster,
-    trade_poster: Poster,
     log_poster: Poster = _noop_poster,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
     force: bool = False,
 ) -> None:
-    """Check open directional positions; post exits to #signals and #trades."""
-    if get_state().is_paused():
-        log.info("directional_exit_skipped_paused")
-        return
+    """Check open directional positions; post exits to #signals."""
+    # Do NOT skip when paused — pausing blocks new entries, not exit monitoring.
+    # Open positions still need stop-loss and force-close protection.
 
     if not force:
         try:
@@ -546,7 +544,6 @@ def make_scheduler(
         ),
         kwargs={
             "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
             "log_poster": log_post,
         },
         id="directional_exit",
@@ -554,6 +551,26 @@ def make_scheduler(
         misfire_grace_time=120,
     )
 
+    # Safety net: re-run at 15:50 ET so any 0DTE position that failed to close
+    # at 15:45 gets one final attempt. force=False — market is still open at
+    # 15:50 so clock check passes, and per-trade expiry==today guard still
+    # applies so weekly positions are never touched.
+    scheduler.add_job(
+        _directional_exit_job,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour=15,
+            minute=50,
+            timezone=PREMARKET_TZ,
+        ),
+        kwargs={
+            "signal_poster": signal_poster,
+            "log_poster": log_post,
+        },
+        id="directional_0dte_final_close",
+        replace_existing=True,
+        misfire_grace_time=120,
+    )
 
     if enable_iron_condor:
         # Iron-condor entry: 9:45 ET Mon-Fri (STRATEGIES.md 9:45-10:30 window).
@@ -703,7 +720,6 @@ async def run_directional_once(
 
 async def run_directional_exit_once(
     signal_poster: Poster,
-    trade_poster: Poster,
     *,
     log_poster: Poster | None = None,
     force: bool = False,
@@ -712,7 +728,6 @@ async def run_directional_exit_once(
     """Trigger the directional exit monitor immediately."""
     await _directional_exit_job(
         signal_poster=signal_poster,
-        trade_poster=trade_poster,
         log_poster=log_poster or _noop_poster,
         force=force,
         clock_fetcher=clock_fetcher,

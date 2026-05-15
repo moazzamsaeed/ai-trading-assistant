@@ -133,8 +133,9 @@ STEP 4 — STRIKE & EXPIRY:
       after 2 PM ET, bid-ask spreads blow out, and the option can go no-bid entirely in the
       final 30 minutes. Theta risk makes OTM 0DTE a near-certain loss even when direction is right.
     The system validates strikes against the real options chain — pick the nearest whole number.
-  • Expiry: "0DTE" only for SPY/QQQ/IWM (ETFs with daily options) when HIGH conviction
-    AND time before 14:00 ET. All other tickers or MEDIUM conviction: "WEEKLY".
+  • Expiry: "0DTE" only when HIGH conviction AND time before 14:00 ET AND the ticker has
+    a 0DTE expiry today. SPY has daily 0DTE (Mon–Fri). QQQ and IWM only have 0DTE on
+    Mon/Wed/Fri — use "WEEKLY" for QQQ/IWM on Tue/Thu. All other tickers: "WEEKLY".
   • Opening Range tip: if price just broke above ORH → strike near ORH is strong support.
     If price just broke below ORL → strike near ORL is strong resistance.
 

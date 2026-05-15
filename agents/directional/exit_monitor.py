@@ -393,11 +393,15 @@ async def run_directional_exit_monitor(
 
         stop_p_raw = extra.get("stop_premium")
         stop_p = Decimal(str(stop_p_raw)) if stop_p_raw else None
+        trade_mode = extra.get("mode", "selective")
+        # Hard floor is mode-aware: selective uses −30% (same as its stop), aggressive
+        # uses −50% to match its wider stop. Both act as unconditional floors with no LLM.
+        hard_floor = Decimal("0.50") if trade_mode == "aggressive" else HARD_FLOOR_PCT
 
         if trade_force:
             should_exit, reason = True, "force_close"
 
-        elif current_bid <= entry_p * (Decimal("1") - HARD_FLOOR_PCT):
+        elif current_bid <= entry_p * (Decimal("1") - hard_floor):
             should_exit, reason = True, "hard_floor_stop"
 
         elif stop_p is not None and current_bid <= stop_p:

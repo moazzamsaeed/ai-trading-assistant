@@ -75,10 +75,10 @@ class DirectionalExecutionResult:
 # ---------------------------------------------------------------------------
 
 
-# Only SPY (and QQQ) have true daily 0DTE options. All other tickers only
-# expire on Fridays — using today's date for them produces an OCC symbol
-# that doesn't exist and the chain snap finds nothing.
-_DAILY_OPTION_TICKERS = {"SPY", "QQQ", "IWM"}  # ETFs with Mon/Wed/Fri 0DTE options
+# SPY has true daily 0DTE (Mon–Fri). QQQ and IWM only have 0DTE on Mon/Wed/Fri.
+# Using today's date on an off-day produces an OCC symbol that doesn't exist.
+_DAILY_OPTION_TICKERS = {"SPY"}
+_MWF_OPTION_TICKERS = {"QQQ", "IWM"}  # 0DTE only on Mon(0)/Wed(2)/Fri(4)
 
 
 def _next_friday(today: date) -> date:
@@ -89,9 +89,12 @@ def _next_friday(today: date) -> date:
 
 
 def _resolve_expiry(expiry_str: str, today: date, ticker: str = "") -> date:
-    if expiry_str == "0DTE" and ticker.upper() in _DAILY_OPTION_TICKERS:
-        return today
-    # All other tickers: always use next Friday regardless of 0DTE/WEEKLY
+    t = ticker.upper()
+    if expiry_str == "0DTE":
+        if t in _DAILY_OPTION_TICKERS:
+            return today
+        if t in _MWF_OPTION_TICKERS and today.weekday() in (0, 2, 4):
+            return today
     return _next_friday(today)
 
 
@@ -242,6 +245,7 @@ async def execute_directional_signal(
     session_factory: Callable[[], Session] | None = None,
     strike_selector: Callable[..., object] = select_best_strike,
     submitter: Callable[..., object] = alpaca_client.submit_single_option_buy,
+    seller: Callable[..., object] = alpaca_client.submit_single_option_sell,
     waiter: Callable[..., object] = alpaca_client.wait_for_order,
     fill_timeout_s: float = 10.0,
 ) -> DirectionalExecutionResult:
@@ -328,13 +332,6 @@ async def execute_directional_signal(
     qty = max(1, math.floor(position_usd / one_contract_cost))
 
     entry_premium = quote.ask
-    profit_target_premium = (
-        entry_premium * (Decimal("1") + exit_pcts["pt"])
-    ).quantize(Decimal("0.0001"))
-    stop_premium = (
-        entry_premium * (Decimal("1") - exit_pcts["sl"])
-    ).quantize(Decimal("0.0001"))
-
     order = await submitter(qty=qty, occ_symbol=occ, limit_price=entry_premium)
     final = await waiter(order.order_id, timeout_s=fill_timeout_s)
 
@@ -362,6 +359,13 @@ async def execute_directional_signal(
     filled_premium = (
         final.filled_avg_price if final.filled_avg_price is not None else entry_premium
     )
+    # Compute PT/SL from actual fill price, not the pre-order ask.
+    profit_target_premium = (
+        filled_premium * (Decimal("1") + exit_pcts["pt"])
+    ).quantize(Decimal("0.0001"))
+    stop_premium = (
+        filled_premium * (Decimal("1") - exit_pcts["sl"])
+    ).quantize(Decimal("0.0001"))
 
     # ---- Post-fill position verification ----
     # Alpaca paper sometimes fills an option order but never registers it as a
@@ -385,7 +389,7 @@ async def execute_directional_signal(
         )
         # Try to sell immediately — if Alpaca accepts it we close flat and avoid the loss.
         try:
-            sell_order = await submitter(qty=qty, occ_symbol=occ, limit_price=filled_premium)
+            sell_order = await seller(qty=qty, occ_symbol=occ, limit_price=filled_premium)
             sell_final = await waiter(sell_order.order_id, timeout_s=10.0)
             log.info(
                 "directional_execute_ghost_sell_attempted",

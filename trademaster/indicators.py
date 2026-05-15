@@ -217,21 +217,21 @@ def snapshot(bars: list[Bar]) -> dict:
     rsi_val = rsi(bars, 9)
     atr_val = atr(bars, 10)
     macd_val, macd_sig = macd(bars, fast=6, slow=13, signal=4)
+    vwap_val = vwap(bars)
+    ema20_val = ema(bars, 20)
+    ema50_val = ema(bars, 50)
+    vol_ratio_val = volume_ratio(bars, 20)
 
     return {
         "bars": len(bars),
         "last_close": str(last.close),
         "last_volume": last.volume,
-        "vwap": str(vwap(bars)) if vwap(bars) is not None else None,
+        "vwap": str(vwap_val) if vwap_val is not None else None,
         "rsi9": str(rsi_val) if rsi_val is not None else None,
-        "ema20": str(ema(bars, 20)) if ema(bars, 20) is not None else None,
-        "ema50": str(ema(bars, 50)) if ema(bars, 50) is not None else None,
+        "ema20": str(ema20_val) if ema20_val is not None else None,
+        "ema50": str(ema50_val) if ema50_val is not None else None,
         "atr10": str(atr_val) if atr_val is not None else None,
         "macd": str(macd_val) if macd_val is not None else None,
         "macd_signal": str(macd_sig) if macd_sig is not None else None,
-        "volume_ratio_20": (
-            str(volume_ratio(bars, 20))
-            if volume_ratio(bars, 20) is not None
-            else None
-        ),
+        "volume_ratio_20": str(vol_ratio_val) if vol_ratio_val is not None else None,
     }
