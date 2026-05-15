@@ -37,6 +37,7 @@ class TaskType(StrEnum):
     OPTIONS_STRATEGY = "options_strategy"
     CRYPTO_REGIME = "crypto_regime"
     EXECUTION_DECISION = "execution_decision"
+    EXIT_DECISION = "exit_decision"
 
 
 MODEL_MAP: dict[TaskType, tuple[str, str]] = {
@@ -47,6 +48,7 @@ MODEL_MAP: dict[TaskType, tuple[str, str]] = {
     TaskType.OPTIONS_STRATEGY: ("deepseek", "deepseek-v4-pro"),
     TaskType.CRYPTO_REGIME: ("deepseek", "deepseek-v4-pro"),
     TaskType.EXECUTION_DECISION: ("anthropic", "claude-opus-4-7"),
+    TaskType.EXIT_DECISION: ("anthropic", "claude-sonnet-4-6"),
 }
 
 # Fallback providers used when the primary raises ProviderError (timeout, 5xx).

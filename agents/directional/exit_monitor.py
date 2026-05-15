@@ -245,7 +245,7 @@ async def _llm_exit_confirm(
 
     try:
         response = await llm_caller(
-            TaskType.INTRADAY_SCAN, prompt, session_factory=session_factory
+            TaskType.EXIT_DECISION, prompt, session_factory=session_factory
         )
         text = response.text.strip()
         if text.startswith("```"):
