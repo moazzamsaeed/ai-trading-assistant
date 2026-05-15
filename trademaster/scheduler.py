@@ -554,25 +554,6 @@ def make_scheduler(
         misfire_grace_time=120,
     )
 
-    # Force-close all directional positions at 15:30 ET — 30 min before bell.
-    scheduler.add_job(
-        _directional_exit_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour=15,
-            minute=30,
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={
-            "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
-            "log_poster": log_post,
-            "force": True,
-        },
-        id="directional_force_close",
-        replace_existing=True,
-        misfire_grace_time=120,
-    )
 
     if enable_iron_condor:
         # Iron-condor entry: 9:45 ET Mon-Fri (STRATEGIES.md 9:45-10:30 window).
