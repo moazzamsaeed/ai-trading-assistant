@@ -642,10 +642,10 @@ async def run_directional_scan(
                 overridden.append(d)
         decisions = overridden
 
-    if mode == "aggressive":
+    if mode == "selective":
         actionable = [d for d in decisions if d.action != "HOLD" and d.conviction == "HIGH"]
-    else:
-        actionable = [d for d in decisions if d.action != "HOLD"]
+    else:  # aggressive
+        actionable = [d for d in decisions if d.action != "HOLD" and d.conviction in ("MEDIUM", "HIGH")]
 
     # Near-miss logging: for every HOLD, check if it would have triggered
     # BUY at a relaxed 1.0× volume threshold. Persisted for post-hoc analysis
