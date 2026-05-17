@@ -48,6 +48,20 @@ class Settings(BaseSettings):
     # ≈ $652 on a $5k account, not the nominal $750. Conservative by design.
     daily_loss_limit_pct: float = Field(default=0.15, gt=0, le=1.0)
 
+    # Weekly loss limit: 25% of effective capital Mon–Sun (ET). Prevents a
+    # string of bad days compounding into a full account wipeout. Halts trading
+    # for the remainder of the week when hit.
+    weekly_loss_limit_pct: float = Field(default=0.25, gt=0, le=1.0)
+
+    # Max directional trades per calendar day (ET). Prevents overtrading after
+    # a bad open — repeated small losses on many trades is worse than one stop.
+    max_trades_per_day: int = Field(default=6, gt=0)
+
+    # Max bid/ask spread as a fraction of mid price. Options with wider spreads
+    # are illiquid — you pay too much slippage entering and exiting.
+    # 0.50 = reject any option where spread > 50% of mid (e.g. bid=0.80, ask=1.20).
+    max_bid_ask_spread_pct: float = Field(default=0.50, gt=0, le=1.0)
+
     # Iron-condor-only legacy caps (risk_manager path). The directional flow
     # uses dynamic capital sizing in capital.py + scheduler.py and ignores
     # these. Keep them for the iron-condor strategist if/when it's re-enabled.

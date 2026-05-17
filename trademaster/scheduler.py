@@ -33,7 +33,8 @@ from decimal import Decimal
 from integrations import alpaca_client
 from trademaster.capital import directional_deployed_usd, get_effective_capital
 from trademaster.config import get_settings
-from trademaster.db import get_today_realized_pnl, make_session_factory
+from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, make_session_factory
+from trademaster.event_calendar import is_blackout_day
 from trademaster.logging import get_logger
 from trademaster.state import get_state
 from trademaster.timeutils import today_et
@@ -166,6 +167,7 @@ async def _directional_scan_job(
         log.warning("scan_skipped_capital_zero")
         return
 
+    # ---- Daily loss limit ----
     limit_usd = capital * Decimal(str(settings.daily_loss_limit_pct))
     realized = get_today_realized_pnl(make_session_factory())
     unrealized = await alpaca_client.get_unrealized_pnl()
@@ -187,6 +189,43 @@ async def _directional_scan_job(
             realized=float(realized),
             unrealized=float(unrealized),
         )
+        return
+
+    # ---- Weekly loss limit ----
+    weekly_limit_usd = capital * Decimal(str(settings.weekly_loss_limit_pct))
+    weekly_realized = get_this_week_realized_pnl(make_session_factory())
+    weekly_total = weekly_realized + unrealized
+    if weekly_total <= -weekly_limit_usd:
+        days_until_monday = (7 - today_et().weekday()) % 7 or 7
+        get_state().pause(hours=days_until_monday * 24)
+        pct = float(-weekly_total / capital * 100)
+        await log_poster(
+            f"🛑 Weekly loss limit hit: **${float(weekly_total):.0f}** loss "
+            f"({pct:.0f}% of ${float(capital):.0f} capital). "
+            f"Trading halted until Monday."
+        )
+        log.warning(
+            "weekly_loss_limit_hit",
+            weekly_total=float(weekly_total),
+            weekly_limit_usd=float(weekly_limit_usd),
+            capital=float(capital),
+        )
+        return
+
+    # ---- Max trades per day ----
+    today_count = get_today_trade_count(make_session_factory())
+    if today_count >= settings.max_trades_per_day:
+        log.info(
+            "scan_skipped_max_trades_per_day",
+            today_count=today_count,
+            limit=settings.max_trades_per_day,
+        )
+        return
+
+    # ---- Event blackout calendar ----
+    blackout_event = is_blackout_day(today_et())
+    if blackout_event:
+        log.info("scan_skipped_event_blackout", blackout=blackout_event)
         return
 
     try:

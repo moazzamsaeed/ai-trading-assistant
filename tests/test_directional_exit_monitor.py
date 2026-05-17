@@ -801,3 +801,27 @@ async def test_smart_exit_reason_when_pnl_negative(session_factory):
     )
     if results[0]["status"] == "closed":
         assert results[0]["reason"] == "smart_exit"
+
+
+async def test_broken_quote_skipped(session_factory):
+    """Stale/corrupted quotes (ask > 5x bid) must not trigger exits."""
+    _open_trade(session_factory, entry_premium=2.00)
+
+    async def broken_quote(_occ):
+        from integrations.alpaca_client import OptionQuote
+        from decimal import Decimal as D
+        from datetime import date
+        return OptionQuote(
+            occ_symbol="SPY260101C00500000", underlying="SPY",
+            strike=D("500"), expiry=date(2026, 1, 1), option_type="call",
+            bid=D("0.10"), ask=D("50.00"), mid=D("25.05"),  # ask = 500x bid = corrupt
+            delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
+        )
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        quote_fetcher=broken_quote,
+        bars_fetcher=lambda *a, **k: __import__("asyncio").coroutine(lambda: [])(),
+        force_close=False,
+    )
+    assert results[0]["status"] == "stale_quote"

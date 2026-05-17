@@ -424,6 +424,8 @@ async def test_daily_loss_limit_does_not_pause_below_threshold(session_factory, 
     async def fake_scan():
         return ([], [], "scan report")
     monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
+    # Disable event blackout so the test date (May 13 = CPI day) doesn't block
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
 
     await sch._directional_scan_job(
         signal_poster=_async_noop,

@@ -427,3 +427,44 @@ async def test_pt_sl_computed_from_fill_price_not_ask(session_factory):
         # Sanity: if computed from ask they'd be different
         ask_stop = ask_price * 0.70
         assert abs(stop - ask_stop) > 0.001, "stop must NOT match the pre-order ask price"
+
+
+async def test_bid_ask_spread_filter_rejects_wide_spread(monkeypatch):
+    """Options with spread > 50% of mid are filtered out in select_best_strike."""
+    from agents.directional.executor import select_best_strike
+    from integrations.alpaca_client import OptionQuote
+    from decimal import Decimal as D
+    from datetime import date
+
+    # bid=0.50, ask=3.00 → spread=2.50, mid=1.75, spread_pct=143% — too wide
+    wide = OptionQuote(
+        occ_symbol="SPY260101C00500000", underlying="SPY",
+        strike=D("500"), expiry=date(2026, 1, 1), option_type="call",
+        bid=D("0.50"), ask=D("3.00"), mid=D("1.75"),
+        delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
+    )
+    # tight spread: bid=1.80, ask=2.20 → spread=0.40, mid=2.00, pct=20% — OK
+    tight = OptionQuote(
+        occ_symbol="SPY260101C00500000", underlying="SPY",
+        strike=D("500"), expiry=date(2026, 1, 1), option_type="call",
+        bid=D("1.80"), ask=D("2.20"), mid=D("2.00"),
+        delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
+    )
+
+    import integrations.alpaca_client as _ac
+
+    async def chain_wide(_ticker, **_k):
+        return [wide]
+
+    async def chain_tight(_ticker, **_k):
+        return [tight]
+
+    # Wide spread: select_best_strike should return None
+    monkeypatch.setattr(_ac, "get_options_chain", chain_wide)
+    result_wide = await select_best_strike("SPY", date(2026, 1, 1), "call", 500.0, 500.0)
+    assert result_wide is None, "wide spread must be rejected"
+
+    # Tight spread: should be accepted
+    monkeypatch.setattr(_ac, "get_options_chain", chain_tight)
+    result_tight = await select_best_strike("SPY", date(2026, 1, 1), "call", 500.0, 500.0)
+    assert result_tight is not None, "tight spread must be accepted"

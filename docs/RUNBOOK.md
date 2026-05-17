@@ -2,12 +2,11 @@
 
 ## Current Phase
 
-**Phase 2.3 (a + b) complete — dual-channel output.** Iron-condor strategist
-runs at 9:45 ET, emits a broker-ready **manual signal** to `#signals` AND
-auto-executes in paper mode with telemetry posted to `#trades`. Exit monitor
-sweeps every 5 min with the same dual output (manual exit instructions +
-automated close telemetry), and force-closes at 15:50 ET. Scheduler errors
-route to `#logs`.
+**Phase 4 ecosystem built. 30-day paper run in progress (started 2026-05-13).**
+TradeMaster directional options flow is live in paper mode — scanning for
+CALL/PUT signals, auto-executing, and monitoring exits via indicator+LLM loop.
+Hermes Agent and Mission Control dashboard are built and operational.
+Live deployment pending 30-day paper run completion and LIVE_READINESS_CHECKLIST.
 
 ## Build Phases
 
@@ -23,12 +22,24 @@ route to `#logs`.
 | 2.1 | Options chain wrapper + iron-condor leg construction | Done |
 | 2.2 | Options strategist agent + entry-window scheduler (alert-only) | Done |
 | 2.3a | Multi-leg order submission + paper-mode auto-execute | Done |
-| 2.3b | Exit monitor (50% PT / 2x stop / 15:50 force-close) | Done |
+| 2.3b | Exit monitor (indicator+LLM hybrid — no hard PT cap, smart profit exit) | Done |
 | 2.3c | Live-mode approval flow (Discord /approve, /reject, /pending) | Done |
 | 2.4 | Backtest harness (BS pricing + GBM paths) | Done |
 | 3 | Crypto trend-follow + equity alerts | Not started |
-| 4 | Dashboard + 30-day paper run + Nous Hermes Agent (D-010) | Not started |
-| 5 | Live deployment review | Not started |
+| 4 | Dashboard + 30-day paper run + Hermes Agent ecosystem | **In progress** |
+| 5 | Live deployment review | Not started — pending LIVE_READINESS_CHECKLIST |
+
+### Correct Component Status (2026-05-17)
+
+| Area | Status |
+|---|---|
+| TradeMaster core daemon | Phase 2.4 complete — running in paper mode |
+| Directional options flow | Live in paper — CALL/PUT auto-execution active |
+| Iron condor strategy | Paper-only experimental — not production-ready |
+| Crypto/equity alerts | Phase 3 — not started |
+| Phase 4 ecosystem (Hermes + Mission Control) | Built and operational |
+| 30-day paper run | In progress (started 2026-05-13) |
+| Live deployment | Not approved — pending live readiness review |
 
 ## How to Start the System
 
@@ -129,7 +140,7 @@ This:
 
 ### TradeMaster crashes mid-trade
 - Check `data/trademaster.log` for the last action
-- Run `python -m trademaster.recover` (planned for Phase 4) — reconciles in-memory state with Alpaca
+- On startup, `trademaster.reconciler` automatically compares DB open trades vs Alpaca positions and repairs mismatches (posts warnings to `#logs`)
 - If positions are open and you can't recover, use Alpaca dashboard to flatten manually
 
 ### Discord bot is offline
@@ -142,7 +153,7 @@ This:
 - Trading does not resume until next trading day OR manual `/resume`
 
 ### NUC reboots
-- systemd restarts TradeMaster automatically (configured in Phase 4)
+- systemd restarts TradeMaster automatically (`trademaster.service` enabled)
 - On startup, TradeMaster reconciles position state with Alpaca before accepting new signals
 
 ## Monitoring

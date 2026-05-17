@@ -223,3 +223,45 @@ def get_today_realized_pnl(session_factory) -> Decimal:
             .where(Trade.closed_at < day_end)
         ).scalar()
     return Decimal(str(result or 0))
+
+
+def get_this_week_realized_pnl(session_factory) -> Decimal:
+    """Sum of realized_pnl_usd for trades closed this week (Mon–Sun, ET).
+
+    Resets Monday 00:00 ET. Used for the weekly loss limit gate.
+    """
+    today = today_et()
+    week_start_date = today - timedelta(days=today.weekday())  # Monday
+    week_start = datetime.combine(week_start_date, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    week_end = week_start + timedelta(days=7)
+    reset_at = get_settings().baseline_reset_at
+    effective_start = max(week_start, reset_at) if reset_at is not None else week_start
+
+    with session_factory() as session:
+        result = session.execute(
+            select(func.coalesce(func.sum(func.cast(Trade.realized_pnl_usd, Numeric)), 0))
+            .where(Trade.closed_at >= effective_start)
+            .where(Trade.closed_at < week_end)
+        ).scalar()
+    return Decimal(str(result or 0))
+
+
+def get_today_trade_count(session_factory) -> int:
+    """Count of directional trades opened today (ET calendar day).
+
+    Used for the max-trades-per-day gate.
+    """
+    today = today_et()
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    day_end = day_start + timedelta(days=1)
+    reset_at = get_settings().baseline_reset_at
+    effective_start = max(day_start, reset_at) if reset_at is not None else day_start
+
+    with session_factory() as session:
+        result = session.execute(
+            select(func.count(Trade.id))
+            .where(Trade.strategy.in_(["directional_call", "directional_put"]))
+            .where(Trade.opened_at >= effective_start)
+            .where(Trade.opened_at < day_end)
+        ).scalar()
+    return int(result or 0)

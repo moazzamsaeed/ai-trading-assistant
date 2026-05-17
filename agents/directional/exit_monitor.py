@@ -383,6 +383,19 @@ async def run_directional_exit_monitor(
             results.append({"trade_id": trade.id, "status": "no_quote"})
             continue
 
+        # Broken quote guard: if ask > 5× bid the data feed is corrupted
+        # (e.g. stale last-trade price, crossed market, or Alpaca data gap).
+        # Trading on corrupt quotes would compute a wildly wrong P&L and
+        # potentially trigger a false hard-floor exit.
+        if quote.ask > quote.bid * 5 and quote.bid > 0:
+            log.warning(
+                "directional_exit_quote_sanity_fail",
+                trade_id=trade.id, occ=occ,
+                bid=str(quote.bid), ask=str(quote.ask),
+            )
+            results.append({"trade_id": trade.id, "status": "stale_quote"})
+            continue
+
         current_bid = quote.bid
         pnl_pct = float((current_bid - entry_p) / entry_p * 100)
 

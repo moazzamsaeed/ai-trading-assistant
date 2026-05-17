@@ -43,7 +43,10 @@ def test_defaults_load_without_env(monkeypatch, tmp_path):
     s = cfg.get_settings()
     assert s.trading_mode == "paper"
     assert s.account_type == "cash"
-    assert s.daily_loss_limit_usd > 0
+    assert s.daily_loss_limit_pct > 0
+    assert s.weekly_loss_limit_pct > 0
+    assert s.max_trades_per_day > 0
+    assert s.max_bid_ask_spread_pct > 0
     assert s.max_concurrent_positions > 0
 
 

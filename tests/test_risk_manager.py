@@ -349,7 +349,7 @@ async def test_reject_when_daily_loss_limit_hit(session_factory):
                 qty=Decimal("1"),
                 entry_price=Decimal("100"),
                 exit_price=Decimal("0"),
-                realized_pnl_usd=-(settings.daily_loss_limit_usd + Decimal("10")),
+                realized_pnl_usd=-(settings.trading_capital_usd * Decimal(str(settings.daily_loss_limit_pct)) + Decimal("10")),
                 closed_at=now,
             )
         )
@@ -362,7 +362,7 @@ async def test_reject_when_daily_loss_limit_hit(session_factory):
             session_factory=session_factory,
             now=now,
         )
-    assert "daily_loss_limit_usd" in str(exc.value).lower()
+    assert "daily_loss" in str(exc.value).lower()
 
 
 async def test_daily_loss_ignores_prior_day_loss(session_factory):
@@ -379,7 +379,7 @@ async def test_daily_loss_ignores_prior_day_loss(session_factory):
                 qty=Decimal("1"),
                 entry_price=Decimal("100"),
                 exit_price=Decimal("0"),
-                realized_pnl_usd=-(settings.daily_loss_limit_usd + Decimal("100")),
+                realized_pnl_usd=-(settings.trading_capital_usd * Decimal(str(settings.daily_loss_limit_pct)) + Decimal("100")),
                 closed_at=yesterday,
             )
         )

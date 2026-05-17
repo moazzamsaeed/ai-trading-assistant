@@ -24,6 +24,7 @@ import signal as _signal
 from integrations.discord_bot import TradeMasterBot
 from trademaster.config import get_settings
 from trademaster.logging import configure_logging, get_logger
+from trademaster.reconciler import reconcile_positions
 from trademaster.risk_manager import validate_account_is_cash
 from trademaster.scheduler import (
     make_directional_trigger,
@@ -46,6 +47,11 @@ async def _run() -> None:
     await validate_account_is_cash()
 
     async with TradeMasterBot() as bot:
+        # Reconcile DB open trades against live Alpaca positions before starting
+        # the scheduler. Repairs any mismatch from a crash or manual close.
+        recon_warnings = await reconcile_positions()
+        for w in recon_warnings:
+            await bot.post_log(w)
         scheduler = make_scheduler(
             research_poster=bot.post_research,
             signal_poster=bot.post_signal,

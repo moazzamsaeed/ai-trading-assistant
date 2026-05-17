@@ -27,16 +27,13 @@ This file captures the *why* behind architectural and tooling choices, so a V2 b
 
 ---
 
-## D-003 — Alpaca only for data and execution
+## D-003 — Alpaca only for data and execution ⚠️ SUPERSEDED by D-009
 
-**Decision:** Use Alpaca's official MCP server for all data, news, and execution. No Polygon.io, no Bloomberg, no premium news feeds.
+**Original decision:** Use Alpaca's official MCP server for all data, news, and execution.
 
-**Why:** Alpaca's Algo Trader Plus tier covers real-time stock + options + news + crypto on one bill. Their official MCP server eliminates the need to build custom data fetchers. Fewer providers = fewer failure modes.
+**Superseded by D-009 (2025-12):** TradeMaster uses the `alpaca-py` SDK directly, not the MCP server. See D-009 for the full rationale. The MCP server is not part of the trading daemon — it can be used for ad-hoc Claude Desktop conversations with the account but is independent of TradeMaster.
 
-**Alternatives considered:**
-- Polygon.io for equity data — rejected. Alpaca covers it.
-- Benzinga news — rejected. Alpaca's news is sufficient until proven otherwise.
-- TradingView MCP — rejected. Community tool, browser-automation based, fragile. User can view charts manually on TradingView while agents send analysis to Discord.
+**Still valid:** Alpaca-only for data. No Polygon.io, no Bloomberg, no premium news feeds.
 
 ---
 
@@ -91,7 +88,7 @@ This file captures the *why* behind architectural and tooling choices, so a V2 b
 
 **Why:** MCP servers are designed for MCP *clients* (Claude Desktop and similar) and run as separate subprocesses, talking over stdio. Inside a long-running Python orchestrator, importing `alpaca-py` directly is simpler, faster, and removes a process boundary plus a serialization layer. The MCP server remains a useful tool for ad-hoc Claude-Desktop conversations with the account, but that workflow is independent of TradeMaster and does not need to live in the same codebase.
 
-**Implication:** `integrations/alpaca_client.py` (Phase 1) wraps `alpaca-py` for data and execution. `ARCHITECTURE.md` previously showed an "Alpaca MCP Server" box in the data-flow diagram — that should be read as "Alpaca (via `alpaca-py` SDK)" until the diagram is updated.
+**Implication:** `integrations/alpaca_client.py` wraps `alpaca-py` for all data and execution. `ARCHITECTURE.md` reflects this — the diagram shows Alpaca via `alpaca-py` SDK, not MCP.
 
 **When to revisit:** If TradeMaster itself needs to be exposed as a tool host to MCP clients, or if Alpaca ships a substantially richer surface in the MCP server than in the SDK.
 

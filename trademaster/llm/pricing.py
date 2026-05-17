@@ -21,6 +21,14 @@ PRICING: dict[str, dict[str, Decimal]] = {
         "input": Decimal("5.00"),
         "output": Decimal("25.00"),
     },
+    "claude-sonnet-4-6": {
+        "input": Decimal("3.00"),
+        "output": Decimal("15.00"),
+    },
+    "claude-haiku-4-5-20251001": {
+        "input": Decimal("0.80"),
+        "output": Decimal("4.00"),
+    },
     # Google — tier 1 (≤200k input). Tier 2 doubles roughly.
     # https://ai.google.dev/gemini-api/docs/models
     "gemini-3.1-pro-preview": {

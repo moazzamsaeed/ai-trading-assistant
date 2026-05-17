@@ -685,3 +685,107 @@ def test_conviction_filter_selective_blocks_medium():
     medium_only = [_TD("NVDA", "BUY_CALL", 900.0, "WEEKLY", "MEDIUM", "mild")]
     result = _filter_decisions(medium_only, "selective")
     assert result == [], "MEDIUM conviction must be blocked in selective mode"
+
+
+# ---------------------------------------------------------------------------
+# New risk controls — regression tests
+# ---------------------------------------------------------------------------
+
+from decimal import Decimal as _D
+from datetime import UTC as _UTC, datetime as _dt
+from trademaster.db import Base as _Base, Trade as _Trade, make_engine as _make_engine, make_session_factory as _make_sf
+
+
+def _fresh_db():
+    engine = _make_engine("sqlite:///:memory:")
+    _Base.metadata.create_all(engine)
+    return _make_sf(engine)
+
+
+async def test_weekly_loss_limit_halts_scan(monkeypatch):
+    """Weekly loss exceeding 25% of capital pauses trading until Monday."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+
+    with sf() as session:
+        session.add(_Trade(
+            symbol="SPY", asset_class="option", side="buy", strategy="directional_call",
+            qty=_D("1"), entry_price=_D("5.00"), exit_price=_D("0.50"),
+            realized_pnl_usd=_D("-2000"),  # exceeds 25% of $5k capital
+            opened_at=_dt(2026, 5, 11, 14, 0, tzinfo=_UTC),
+            closed_at=_dt(2026, 5, 11, 15, 0, tzinfo=_UTC),
+        ))
+        session.commit()
+
+    async def fake_unrealized(): return _D("0")
+    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
+
+    logs: list[str] = []
+
+    async def log_capture(t): logs.append(t)
+
+    await sch._directional_scan_job(
+        signal_poster=_noop_poster, trade_poster=_noop_poster,
+        research_poster=_noop_poster, log_poster=log_capture,
+    )
+    assert get_state().is_paused(), "weekly loss limit must pause trading"
+    assert any("weekly" in m.lower() for m in logs)
+
+
+async def test_max_trades_per_day_blocks_scan(monkeypatch):
+    """After max_trades_per_day trades, scan is skipped for the rest of the day."""
+    from trademaster.timeutils import today_et
+    import datetime as _datetime_mod
+
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+
+    today = today_et()
+    opened = _dt.combine(today, _datetime_mod.time(14, 0), tzinfo=_UTC)
+
+    with sf() as session:
+        for i in range(6):  # default max = 6
+            session.add(_Trade(
+                symbol=f"SPY260101C0050000{i}",
+                asset_class="option", side="buy", strategy="directional_call",
+                qty=_D("1"), entry_price=_D("2.00"),
+                opened_at=opened,
+            ))
+        session.commit()
+
+    async def fake_unrealized(): return _D("0")
+    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
+
+    scan_called = []
+
+    async def fake_scan(**_): return ([], [], "")
+    monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
+
+    await sch._directional_scan_job(
+        signal_poster=_noop_poster, trade_poster=_noop_poster,
+        research_poster=_noop_poster, log_poster=_noop_poster,
+    )
+    assert not scan_called, "scan must be blocked after max_trades_per_day"
+
+
+async def test_event_blackout_blocks_scan(monkeypatch):
+    """On a CPI/FOMC/NFP day the scan is skipped entirely."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+
+    async def fake_unrealized(): return _D("0")
+    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: "FOMC Decision")
+
+    scan_called = []
+
+    async def fake_scan(**_): return ([], [], "")
+    monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
+
+    await sch._directional_scan_job(
+        signal_poster=_noop_poster, trade_poster=_noop_poster,
+        research_poster=_noop_poster, log_poster=_noop_poster,
+    )
+    assert not scan_called, "scan must be blocked on blackout event days"

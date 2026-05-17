@@ -209,6 +209,7 @@ async def select_best_strike(
     # positions — the buy fills but the position never appears, so every
     # close attempt gets rejected as a naked sell.
     MIN_ASK = Decimal("0.50")
+    max_spread_pct = get_settings().max_bid_ask_spread_pct
 
     candidates = [
         q for q in quotes
@@ -216,14 +217,24 @@ async def select_best_strike(
         and q.ask is not None
         and q.ask >= MIN_ASK
         and float(q.ask) * 100 <= budget
+        and q.mid > 0
+        and float(q.spread / q.mid) <= max_spread_pct
     ]
     if not candidates:
+        # Log whether the spread filter was the cause (vs. budget/min_ask)
+        pre_spread = [
+            q for q in quotes
+            if q.option_type == option_type and q.ask is not None and q.ask >= MIN_ASK
+            and float(q.ask) * 100 <= budget
+        ]
         log.info(
             "directional_no_qualifying_strike",
             ticker=ticker,
             target_strike=target_strike,
             budget=budget,
             min_ask=float(MIN_ASK),
+            max_spread_pct=max_spread_pct,
+            spread_filtered_count=len(pre_spread),
         )
         return None
 

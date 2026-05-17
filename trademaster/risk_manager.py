@@ -297,10 +297,11 @@ async def validate_signal(
 
         # 8. Daily realized loss.
         realized = realized_pnl_today_usd(session, now=now)
-        if realized < 0 and (-realized) >= settings.daily_loss_limit_usd:
+        daily_limit_usd = settings.trading_capital_usd * Decimal(str(settings.daily_loss_limit_pct))
+        if realized < 0 and (-realized) >= daily_limit_usd:
             _reject(
-                f"daily loss ${(-realized):.2f} ≥ DAILY_LOSS_LIMIT_USD "
-                f"${settings.daily_loss_limit_usd}",
+                f"daily loss ${(-realized):.2f} ≥ daily_loss_limit "
+                f"${daily_limit_usd}",
                 {"realized_pnl_usd": str(realized)},
             )
 

@@ -16,7 +16,7 @@
    ┌────────▼────────┐  ┌────────────▼─┐  ┌──▼──────────┐  ┌────▼────────┐
    │  Pre-market     │  │ Quant scans  │  │ Options     │  │  Crypto     │
    │  Research       │  │ (intraday)   │  │ strategist  │  │  regime     │
-   │  Gemini 3.1 Pro │  │ DSV4-Flash   │  │ DSV4-Pro    │  │  DSV4-Pro   │
+   │  Gemini 2.5 Pro │  │ DSV4-Flash   │  │ DSV4-Pro    │  │  DSV4-Pro   │
    └────────┬────────┘  └─────┬────────┘  └─────┬───────┘  └─────┬───────┘
             │                 │                 │                 │
             └────────┬────────┴────────┬────────┴────────┬────────┘
@@ -53,15 +53,23 @@
 
 ## Model Routing Table
 
-| Task type | Model | Provider |
+| Task type | API model ID | Provider |
 |---|---|---|
-| `orchestrate` | Claude Opus 4.7 | Anthropic |
-| `pre_market_research` | Gemini 3.1 Pro | Google AI Studio |
-| `intraday_scan` | DeepSeek V4-Flash | DeepSeek |
-| `format_alert` | DeepSeek V4-Flash | DeepSeek |
-| `options_strategy` | DeepSeek V4-Pro | DeepSeek |
-| `crypto_regime` | DeepSeek V4-Pro | DeepSeek |
-| `execution_decision` | Claude Opus 4.7 | Anthropic |
+| `orchestrate` | `claude-opus-4-7` | Anthropic |
+| `pre_market_research` | `gemini-2.5-pro` | Google AI Studio |
+| `intraday_scan` | `deepseek-v4-flash` | DeepSeek |
+| `format_alert` | `deepseek-v4-flash` | DeepSeek |
+| `options_strategy` | `deepseek-v4-pro` | DeepSeek |
+| `crypto_regime` | `deepseek-v4-pro` | DeepSeek |
+| `execution_decision` | `claude-opus-4-7` | Anthropic |
+| `exit_decision` | `claude-sonnet-4-6` | Anthropic |
+
+Fallbacks (automatic on provider error):
+- `intraday_scan` → `claude-haiku-4-5-20251001`
+- `options_strategy` → `claude-haiku-4-5-20251001`
+- `pre_market_research` → `claude-sonnet-4-6`
+
+Source of truth: `trademaster/router.py` `MODEL_MAP`.
 
 ## Risk Manager (Hard-Coded, Non-LLM)
 
@@ -71,7 +79,12 @@ Responsibilities:
 - Verify `ACCOUNT_TYPE=cash` (refuses to start otherwise)
 - Verify cash availability ≥ order notional
 - Reject naked options (must be defined-risk structure)
-- Track daily P&L; halt trading if `DAILY_LOSS_LIMIT_USD` breached
+- Track daily P&L; halt trading if daily loss limit (`DAILY_LOSS_LIMIT_PCT`) breached
+- Track weekly P&L; halt until Monday if weekly loss limit (`WEEKLY_LOSS_LIMIT_PCT`) breached
+- Max trades per day gate (`MAX_TRADES_PER_DAY`)
+- Event blackout calendar (FOMC/CPI/NFP — blocks new entries on high-impact macro days)
+- Bid/ask spread filter (rejects illiquid options where spread > `MAX_BID_ASK_SPREAD_PCT` of mid)
+- Startup reconciliation: compares DB open trades vs Alpaca live positions, repairs mismatches
 - Track open positions count
 - Provide `/kill` command handler that flattens all positions immediately
 
