@@ -420,6 +420,15 @@ async def _build_market_context(
         except Exception:  # noqa: BLE001
             ticker_perf[t] = {"pct": 0.0, "rel_vs_spy": 0.0, "above_vwap": False}
 
+    # VIX — proxy for market-wide IV. Fetch last close from recent bars (fail-open).
+    vix_level: float | None = None
+    try:
+        vix_bars = await bars_fetcher("VIX", timeframe_minutes=5, limit=5)
+        if vix_bars:
+            vix_level = float(vix_bars[-1].close)
+    except Exception:  # noqa: BLE001
+        pass
+
     return {
         "spy_regime": spy_regime,
         "spy_price": round(spy_price, 2),
@@ -431,6 +440,7 @@ async def _build_market_context(
         "orb_low": round(orb_low, 2),
         "vol_regime": vol_regime,
         "spy_15min_bias": spy_15min_bias,
+        "vix": round(vix_level, 2) if vix_level else None,
     }
 
 
@@ -443,6 +453,8 @@ def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> st
         f"15-min: {ctx.get('spy_15min_bias','?')}",
         f"Opening Range: H=${ctx.get('orb_high',0):.2f} L=${ctx.get('orb_low',0):.2f} "
         f"(price {'ABOVE ORH — breakout bullish' if ctx['spy_price'] > ctx.get('orb_high',0) else 'BELOW ORL — breakout bearish' if ctx['spy_price'] < ctx.get('orb_low',0) else 'INSIDE range — wait for breakout'})",
+        f"Volatility: {ctx.get('vol_regime','NORMAL')} | VIX: {ctx['vix']:.1f} | Breadth: {ctx['tickers_above_vwap']} tickers above VWAP"
+        if ctx.get('vix') else
         f"Volatility: {ctx.get('vol_regime','NORMAL')} | Breadth: {ctx['tickers_above_vwap']} tickers above VWAP",
         "",
         "Relative performance vs SPY today:",
@@ -559,6 +571,18 @@ async def run_directional_scan(
     # Market context: SPY regime + relative strength across watchlist
     market_ctx = await _build_market_context(tickers, bars_fetcher)
 
+    # VIX gate: skip the scan if IV is dangerously elevated or dead quiet.
+    # VIX > 35: violent whipsaw, options gaps make entries unreliable.
+    # VIX < 12: too quiet, moves too small to overcome bid/ask spread costs.
+    vix = market_ctx.get("vix")
+    if vix is not None:
+        if vix > 35:
+            log.info("scan_skipped_vix_too_high", vix=vix)
+            return [], [], f"Scan skipped — VIX {vix:.1f} too high (>35), whipsaw risk"
+        if vix < 12:
+            log.info("scan_skipped_vix_too_low", vix=vix)
+            return [], [], f"Scan skipped — VIX {vix:.1f} too low (<12), moves too small for options"
+
     # Macro context: Trump/China/Fed headlines written by Hermes cron (fail-open)
     try:
         from integrations.macro_context_client import get_macro_headlines
@@ -566,7 +590,17 @@ async def run_directional_scan(
     except Exception:  # noqa: BLE001
         truth_posts = []
 
+    # Daily bias: written by 8 AM premarket briefing, read here (fail-open)
+    try:
+        from integrations.daily_bias import get_daily_bias, format_bias_block
+        bias = get_daily_bias()
+        daily_bias_line = format_bias_block(bias) if bias else ""
+    except Exception:  # noqa: BLE001
+        daily_bias_line = ""
+
     market_context_block = _format_market_context_block(market_ctx, truth_posts)
+    if daily_bias_line:
+        market_context_block = daily_bias_line + "\n\n" + market_context_block
 
     # Per-ticker context (bars + news + indicators) — gather in parallel-ish.
     # Also retain snaps for post-LLM near-miss analysis.
@@ -622,6 +656,36 @@ async def run_directional_scan(
         session_factory=factory,
     )
     decisions = _parse_decisions(response.text, tickers)
+
+    # Hard-override: direction must align with rel_vs_spy.
+    # BUY_CALL on a ticker underperforming SPY = fighting momentum.
+    # BUY_PUT on a ticker outperforming SPY = fighting momentum.
+    # Enforces what Step 2 of the prompt already instructs — prevents LLM drift.
+    ticker_perf = market_ctx.get("ticker_perf", {})
+    rel_overridden = []
+    for d in decisions:
+        if d.action == "HOLD":
+            rel_overridden.append(d)
+            continue
+        rel = ticker_perf.get(d.ticker, {}).get("rel_vs_spy", None)
+        if rel is None:
+            rel_overridden.append(d)
+            continue
+        wrong_direction = (d.action == "BUY_CALL" and rel < 0) or (d.action == "BUY_PUT" and rel > 0)
+        if wrong_direction:
+            log.info(
+                "directional_decision_overridden_rel_vs_spy",
+                ticker=d.ticker,
+                action=d.action,
+                rel_vs_spy=rel,
+            )
+            rel_overridden.append(
+                TickerDecision(d.ticker, "HOLD", None, None, "LOW",
+                               f"rel_vs_spy {rel:+.1f}% opposes {d.action} — overridden to HOLD")
+            )
+        else:
+            rel_overridden.append(d)
+    decisions = rel_overridden
 
     # Hard-override: any BUY on a ticker with no bar data becomes HOLD.
     # This prevents hallucinated "RSI looks bullish" from slipping through

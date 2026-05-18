@@ -426,6 +426,10 @@ async def test_daily_loss_limit_does_not_pause_below_threshold(session_factory, 
     monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
     # Disable event blackout so the test date (May 13 = CPI day) doesn't block
     monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
+    # Disable time-of-day filter so the test passes regardless of clock time
+    from trademaster.timeutils import to_et as _to_et
+    from datetime import datetime as _dt2, UTC as _UTC2
+    monkeypatch.setattr(sch, "to_et", lambda dt: _dt2(2026, 5, 13, 12, 0, tzinfo=_to_et(_dt2.now(_UTC2)).tzinfo))
 
     await sch._directional_scan_job(
         signal_poster=_async_noop,

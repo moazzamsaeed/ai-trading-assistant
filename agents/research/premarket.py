@@ -13,7 +13,10 @@ from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
+import json as _json
+
 from integrations.alpaca_client import NewsArticle, get_recent_news
+from integrations.daily_bias import write_daily_bias
 from trademaster.db import Signal as SignalRow
 from trademaster.db import make_session_factory
 from trademaster.logging import get_logger
@@ -33,18 +36,22 @@ Watchlist: {watchlist}
 Overnight news (last {hours} hours, {count} articles):
 {news_block}
 
-Produce a concise pre-market briefing in five short sections, in this exact order:
+Produce a concise pre-market briefing in six short sections, in this exact order:
 
 1. **Overnight Summary** — what moved, what to watch.
 2. **Earnings Today** — companies reporting and consensus, only if mentioned in the news.
 3. **Macro Events** — FOMC, CPI, NFP, jobless claims, etc. that are mentioned or implied.
 4. **Sector Signals** — sector ETF moves and rotation cues if discernible.
 5. **Synthesis** — one paragraph: what today looks like and what to pay attention to.
+6. **BIAS_JSON** — output a single JSON object (no markdown, no code fence) on its own line:
+   {{"bias":"BULLISH"|"BEARISH"|"NEUTRAL","summary":"one sentence thesis","catalysts":["...","..."],"risks":["...","..."]}}
+   bias must be exactly one of: BULLISH, BEARISH, NEUTRAL.
+   catalysts and risks are each a list of up to 3 short strings.
 
 Rules:
 - Stay grounded in the news provided. Do not fabricate tickers, prices, or events.
 - If a section has no relevant content, write "No notable items." for that section.
-- Keep the whole briefing under 1200 words.
+- Keep the whole briefing (excluding BIAS_JSON) under 1200 words.
 - Use markdown. Bold section headers. Bullet points within sections.
 """
 
@@ -131,6 +138,23 @@ async def run_premarket_briefing(
         )
         session.add(row)
         session.commit()
+
+    # Extract BIAS_JSON line and write daily bias file for intraday scans.
+    try:
+        for line in response.text.splitlines():
+            line = line.strip()
+            if line.startswith("{") and "bias" in line and "summary" in line:
+                bias_data = _json.loads(line)
+                write_daily_bias(
+                    bias=bias_data.get("bias", "NEUTRAL"),
+                    summary=bias_data.get("summary", ""),
+                    catalysts=bias_data.get("catalysts", []),
+                    risks=bias_data.get("risks", []),
+                    date_str=now.strftime("%Y-%m-%d"),
+                )
+                break
+    except Exception as e:  # noqa: BLE001
+        log.debug("premarket_bias_extract_failed", error=str(e))
 
     log.info(
         "premarket_briefing_generated",

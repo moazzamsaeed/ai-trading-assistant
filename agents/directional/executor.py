@@ -109,6 +109,7 @@ def _persist_entry(
     profit_target_premium: Decimal,
     stop_premium: Decimal,
     mode: str,
+    conviction: str = "HIGH",
     order: OrderResult,
     entry_reasoning: str = "",
 ) -> int:
@@ -127,6 +128,7 @@ def _persist_entry(
             "action": action,
             "occ_symbol": occ,
             "mode": mode,
+            "conviction": conviction,
             "profit_target_premium": str(profit_target_premium),
             "stop_premium": str(stop_premium),
             "entry_reasoning": entry_reasoning[:300],
@@ -425,6 +427,7 @@ async def execute_directional_signal(
             profit_target_premium=profit_target_premium,
             stop_premium=stop_premium,
             mode=mode,
+            conviction=decision.conviction or "HIGH",
             order=final,
             entry_reasoning=decision.reasoning,
         )

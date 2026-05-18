@@ -43,6 +43,19 @@ def _bars(n: int = 30, start: float = 100.0) -> list[Bar]:
     return [_bar(t + timedelta(minutes=i * 5), start + i * 0.1) for i in range(n)]
 
 
+def _vix_bars(level: float = 18.0, n: int = 5) -> list[Bar]:
+    """Return fake VIX bars in the safe range (12–35)."""
+    t = datetime(2026, 5, 11, 14, 0, tzinfo=UTC)
+    return [_bar(t + timedelta(minutes=i * 5), level) for i in range(n)]
+
+
+async def _fake_bars_with_vix(t: str, *, timeframe_minutes: int, limit: int) -> list[Bar]:
+    """Bars fetcher that returns VIX=18 for 'VIX' and normal bars for everything else."""
+    if t == "VIX":
+        return _vix_bars()
+    return _bars()
+
+
 def _llm(text: str) -> LLMResponse:
     return LLMResponse(
         text=text, provider="deepseek", model="deepseek-v4-flash",
@@ -197,7 +210,7 @@ async def test_scan_actionable_returns_messages(monkeypatch, session_factory):
     decisions, messages, _report = await agent.run_directional_scan(
         watchlist=("SPY", "QQQ"),
         session_factory=session_factory,
-        bars_fetcher=fake_bars,
+        bars_fetcher=_fake_bars_with_vix,
         news_fetcher=fake_news,
     )
     assert len(decisions) == 2
@@ -235,7 +248,7 @@ async def test_scan_all_hold_returns_no_messages(monkeypatch, session_factory):
     decisions, messages, _report = await agent.run_directional_scan(
         watchlist=("SPY",),
         session_factory=session_factory,
-        bars_fetcher=fake_bars,
+        bars_fetcher=_fake_bars_with_vix,
         news_fetcher=fake_news,
     )
     assert decisions[0].action == "HOLD"
@@ -270,7 +283,7 @@ async def test_scan_handles_bars_fetch_failure(monkeypatch, session_factory):
     decisions, _, _report = await agent.run_directional_scan(
         watchlist=("BROKEN", "SPY"),
         session_factory=session_factory,
-        bars_fetcher=fake_bars,
+        bars_fetcher=_fake_bars_with_vix,
         news_fetcher=fake_news,
     )
     # The broken ticker still appears in decisions; bars just empty.
@@ -307,7 +320,7 @@ async def test_scan_aggressive_passes_medium_and_high_conviction(monkeypatch, se
     decisions, messages, _report = await agent.run_directional_scan(
         watchlist=("SPY", "QQQ"),
         session_factory=session_factory,
-        bars_fetcher=fake_bars,
+        bars_fetcher=_fake_bars_with_vix,
         news_fetcher=fake_news,
         mode="aggressive",
     )
@@ -340,7 +353,7 @@ async def test_scan_selective_blocks_medium_conviction(monkeypatch, session_fact
     decisions, messages, _report = await agent.run_directional_scan(
         watchlist=("SPY",),
         session_factory=session_factory,
-        bars_fetcher=fake_bars,
+        bars_fetcher=_fake_bars_with_vix,
         news_fetcher=fake_news,
         mode="selective",
     )
@@ -367,7 +380,7 @@ async def test_scan_selective_passes_high_conviction(monkeypatch, session_factor
     decisions, messages, _report = await agent.run_directional_scan(
         watchlist=("SPY",),
         session_factory=session_factory,
-        bars_fetcher=fake_bars,
+        bars_fetcher=_fake_bars_with_vix,
         news_fetcher=fake_news,
         mode="selective",
     )

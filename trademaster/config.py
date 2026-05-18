@@ -53,9 +53,17 @@ class Settings(BaseSettings):
     # for the remainder of the week when hit.
     weekly_loss_limit_pct: float = Field(default=0.25, gt=0, le=1.0)
 
-    # Max directional trades per calendar day (ET). Prevents overtrading after
-    # a bad open — repeated small losses on many trades is worse than one stop.
-    max_trades_per_day: int = Field(default=6, gt=0)
+    # Tiered daily trade caps. MEDIUM conviction trades are capped lower to
+    # throttle noise signals. HIGH conviction always gets more room.
+    # Total cap (any conviction): max_trades_per_day.
+    # MEDIUM-only cap: max_medium_trades_per_day.
+    max_trades_per_day: int = Field(default=4, gt=0)
+    max_medium_trades_per_day: int = Field(default=2, gt=0)
+
+    # No entries before this ET time (opening volatility) or after no_entry_after_et.
+    # Format: "HH:MM" 24-hour ET.
+    no_entry_before_et: str = Field(default="10:00")
+    no_entry_after_et: str = Field(default="14:30")
 
     # Max bid/ask spread as a fraction of mid price. Options with wider spreads
     # are illiquid — you pay too much slippage entering and exiting.

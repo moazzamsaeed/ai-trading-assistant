@@ -247,10 +247,7 @@ def get_this_week_realized_pnl(session_factory) -> Decimal:
 
 
 def get_today_trade_count(session_factory) -> int:
-    """Count of directional trades opened today (ET calendar day).
-
-    Used for the max-trades-per-day gate.
-    """
+    """Count of directional trades opened today (ET calendar day)."""
     today = today_et()
     day_start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
     day_end = day_start + timedelta(days=1)
@@ -265,3 +262,29 @@ def get_today_trade_count(session_factory) -> int:
             .where(Trade.opened_at < day_end)
         ).scalar()
     return int(result or 0)
+
+
+def get_today_trade_count_by_conviction(session_factory) -> dict[str, int]:
+    """Count of today's directional trades split by conviction level.
+
+    Returns {"HIGH": n, "MEDIUM": n, "LOW": n}. Used for the tiered cap:
+    MEDIUM trades are capped at 2/day; HIGH trades are capped at 4/day total.
+    """
+    today = today_et()
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    day_end = day_start + timedelta(days=1)
+    reset_at = get_settings().baseline_reset_at
+    effective_start = max(day_start, reset_at) if reset_at is not None else day_start
+
+    counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    with session_factory() as session:
+        rows = session.execute(
+            select(Trade)
+            .where(Trade.strategy.in_(["directional_call", "directional_put"]))
+            .where(Trade.opened_at >= effective_start)
+            .where(Trade.opened_at < day_end)
+        ).scalars().all()
+        for row in rows:
+            conviction = (row.extra or {}).get("conviction", "HIGH")
+            counts[conviction] = counts.get(conviction, 0) + 1
+    return counts

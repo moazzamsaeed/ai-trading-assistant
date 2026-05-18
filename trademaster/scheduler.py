@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time as _time
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -33,11 +33,11 @@ from decimal import Decimal
 from integrations import alpaca_client
 from trademaster.capital import directional_deployed_usd, get_effective_capital
 from trademaster.config import get_settings
-from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, make_session_factory
+from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, get_today_trade_count_by_conviction, make_session_factory
 from trademaster.event_calendar import is_blackout_day
 from trademaster.logging import get_logger
 from trademaster.state import get_state
-from trademaster.timeutils import today_et
+from trademaster.timeutils import today_et, to_et
 from trademaster.watchlist import load_tickers
 
 # Prevents concurrent directional scans (stream + scheduler can both trigger).
@@ -212,20 +212,27 @@ async def _directional_scan_job(
         )
         return
 
-    # ---- Max trades per day ----
-    today_count = get_today_trade_count(make_session_factory())
-    if today_count >= settings.max_trades_per_day:
-        log.info(
-            "scan_skipped_max_trades_per_day",
-            today_count=today_count,
-            limit=settings.max_trades_per_day,
-        )
+    # ---- Tiered max trades per day ----
+    conviction_counts = get_today_trade_count_by_conviction(make_session_factory())
+    total_today = sum(conviction_counts.values())
+    if total_today >= settings.max_trades_per_day:
+        log.info("scan_skipped_max_trades_per_day", total=total_today, limit=settings.max_trades_per_day)
         return
 
     # ---- Event blackout calendar ----
     blackout_event = is_blackout_day(today_et())
     if blackout_event:
         log.info("scan_skipped_event_blackout", blackout=blackout_event)
+        return
+
+    # ---- Time of day filter ----
+    et_now = to_et(datetime.now(UTC))
+    h, m = settings.no_entry_before_et.split(":")
+    no_entry_before = _time(int(h), int(m))
+    h, m = settings.no_entry_after_et.split(":")
+    no_entry_after = _time(int(h), int(m))
+    if et_now.time() < no_entry_before or et_now.time() > no_entry_after:
+        log.info("scan_skipped_time_filter", et_time=et_now.strftime("%H:%M"), window=f"{settings.no_entry_before_et}–{settings.no_entry_after_et}")
         return
 
     try:
@@ -299,6 +306,19 @@ async def _directional_scan_job(
     global _last_trade_open, _last_signal_posted
 
     for decision in to_execute:
+        # Tiered conviction cap: MEDIUM signals are limited to max_medium_trades_per_day.
+        # Re-query each iteration since a previous trade in this loop may have incremented it.
+        if decision.conviction == "MEDIUM":
+            current_counts = get_today_trade_count_by_conviction(make_session_factory())
+            if current_counts.get("MEDIUM", 0) >= settings.max_medium_trades_per_day:
+                log.info(
+                    "directional_execute_skipped_medium_cap",
+                    ticker=decision.ticker,
+                    medium_today=current_counts.get("MEDIUM", 0),
+                    limit=settings.max_medium_trades_per_day,
+                )
+                continue
+
         # 60-min per-ticker cooldown
         last_open = _last_trade_open.get(decision.ticker)
         now_ts = datetime.now(UTC)
