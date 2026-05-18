@@ -48,7 +48,7 @@ async def reconcile_positions(session_factory=None) -> list[str]:
     live_occs: set[str] = {
         getattr(p, "symbol", "")
         for p in live_positions
-        if getattr(p, "asset_class", "") in ("us_option", "option")
+        if "option" in str(getattr(p, "asset_class", "")).lower()
     }
 
     # Fetch DB open directional trades
