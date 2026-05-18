@@ -80,21 +80,40 @@ STEP 1 — MARKET REGIME + VOLATILITY FILTER (hard filter):
   SPY 5-min regime: {spy_regime} | SPY 15-min bias: {spy_15min_bias}
   Volatility: {vol_regime}
 
-  Regime rules:
-  • BULL + 15-min BULL: strong confirmation for calls. Puts need HIGH conviction only.
-  • BULL + 15-min BEAR: conflicting timeframes — only HIGH conviction signals in either direction.
-  • BEAR + 15-min BEAR: strong confirmation for puts. Calls need HIGH conviction only.
-  • NEUTRAL or conflicting: standard selectivity applies.
+  ── DIRECTION ALIGNMENT (most important rule in this step) ──
+  The SPY regime sets the primary tide. Swimming against the tide burns premium fast.
 
-  Volatility rules:
-  • FLAT (ATR too low): options premium will not move enough to justify the trade. Mark ALL HOLD.
-  • VOLATILE (ATR too high): whipsaw risk elevated, spreads wider. Only HIGH conviction, reduce size.
+  BULL regime:
+  • CALLs: standard conviction applies — MEDIUM or HIGH based on steps 2–3.
+  • PUTs: HIGH conviction required AND rel_vs_spy must be < −2% (ticker genuinely
+    breaking down, not just drifting). The ticker must have a specific bearish catalyst
+    (news, earnings, sector breakdown). "RSI looks weak" or "slight VWAP cross" in a
+    bull market is noise — the stock will likely snap back. Mark HOLD unless the
+    bearish thesis is ticker-specific and strong.
+
+  BEAR regime:
+  • PUTs: standard conviction applies — MEDIUM or HIGH based on steps 2–3.
+  • CALLs: HIGH conviction required AND rel_vs_spy must be > +2% (ticker genuinely
+    outperforming). "Looks bouncy" in a bear market is not enough.
+
+  NEUTRAL regime:
+  • Both directions allowed at standard conviction. No asymmetric burden.
+
+  TIMEFRAME CONFIRMATION:
+  • BULL + 15-min BULL: strong tailwind for calls. Puts require the extra bar above.
+  • BULL + 15-min BEAR: conflicting — increase conviction threshold for BOTH directions.
+  • BEAR + 15-min BEAR: strong tailwind for puts. Calls require extra bar above.
+  • NEUTRAL + any 15-min: standard selectivity, no special adjustment.
+
+  ── VOLATILITY ──
+  • FLAT (ATR too low): premium won't move enough to justify the trade. Mark ALL HOLD.
+  • VOLATILE (ATR too high): whipsaw risk elevated, spreads wider. HIGH conviction only.
   • NORMAL: full-size trades allowed.
 
   Opening Range: H=${orb_high} L=${orb_low}
   • Price ABOVE ORH = breakout bullish — favours calls.
   • Price BELOW ORL = breakout bearish — favours puts.
-  • Price INSIDE range = no breakout yet. Be more conservative; wait for confirmed break.
+  • Price INSIDE range = no breakout yet. Be conservative; wait for confirmed break.
 
 STEP 2 — RELATIVE STRENGTH (filter):
   • BUY_CALL: ticker must show POSITIVE rel_vs_spy (outperforming) OR volume surge
