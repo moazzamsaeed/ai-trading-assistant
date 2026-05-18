@@ -707,18 +707,29 @@ async def test_weekly_loss_limit_halts_scan(monkeypatch):
     sf = _fresh_db()
     monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
 
+    import datetime as _dmod
+    from trademaster.timeutils import today_et
+    today = today_et()
+    week_start = today - _dmod.timedelta(days=today.weekday())  # Monday this week
+    # Use Wednesday of this week so the loss is this week but NOT today —
+    # daily limit won't fire; only weekly limit fires.
+    wednesday = week_start + _dmod.timedelta(days=2)
+    closed_mid_week = _dt.combine(wednesday, _dmod.time(15, 0), tzinfo=_UTC)
+
     with sf() as session:
         session.add(_Trade(
             symbol="SPY", asset_class="option", side="buy", strategy="directional_call",
             qty=_D("1"), entry_price=_D("5.00"), exit_price=_D("0.50"),
-            realized_pnl_usd=_D("-2000"),  # exceeds 25% of $5k capital
-            opened_at=_dt(2026, 5, 11, 14, 0, tzinfo=_UTC),
-            closed_at=_dt(2026, 5, 11, 15, 0, tzinfo=_UTC),
+            realized_pnl_usd=_D("-2000"),  # exceeds 25% of $5k = $1,250 weekly limit
+            opened_at=closed_mid_week - _dmod.timedelta(hours=1),
+            closed_at=closed_mid_week,
         ))
         session.commit()
 
     async def fake_unrealized(): return _D("0")
+    async def fake_capital(*_a, **_k): return _D("5000")  # weekly limit = $1,250; loss=$2,000 > limit
     monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "get_effective_capital", fake_capital)
     monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
 
     logs: list[str] = []

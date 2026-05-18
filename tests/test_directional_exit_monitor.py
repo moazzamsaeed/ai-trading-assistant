@@ -825,3 +825,152 @@ async def test_broken_quote_skipped(session_factory):
         force_close=False,
     )
     assert results[0]["status"] == "stale_quote"
+
+
+# ---------------------------------------------------------------------------
+# Trailing stop tests
+# ---------------------------------------------------------------------------
+
+from agents.directional.exit_monitor import (
+    _trailing_stop_premium,
+    _maybe_ratchet_trailing_stop,
+    TRAILING_STOP_LEVELS,
+)
+
+
+def test_trailing_stop_premium_below_first_tier():
+    """Below +30% no trailing stop applies."""
+    entry = Decimal("2.00")
+    assert _trailing_stop_premium(entry, 29.9) is None
+
+
+def test_trailing_stop_premium_at_30pct():
+    """At +30% locks in +10% → stop at entry × 1.10."""
+    entry = Decimal("2.00")
+    result = _trailing_stop_premium(entry, 30.0)
+    assert result == Decimal("2.00") * Decimal("1.10")
+
+
+def test_trailing_stop_premium_at_50pct():
+    """At +50% locks in +25% → stop at entry × 1.25."""
+    entry = Decimal("2.00")
+    result = _trailing_stop_premium(entry, 50.0)
+    assert result == (Decimal("2.00") * Decimal("1.25")).quantize(Decimal("0.0001"))
+
+
+def test_trailing_stop_premium_at_75pct():
+    """At +75% locks in +40% → stop at entry × 1.40."""
+    entry = Decimal("2.00")
+    result = _trailing_stop_premium(entry, 75.0)
+    assert result == (Decimal("2.00") * Decimal("1.40")).quantize(Decimal("0.0001"))
+
+
+def test_trailing_stop_premium_at_100pct():
+    """At +100% locks in +60% → stop at entry × 1.60."""
+    entry = Decimal("2.00")
+    result = _trailing_stop_premium(entry, 100.0)
+    assert result == (Decimal("2.00") * Decimal("1.60")).quantize(Decimal("0.0001"))
+
+
+def test_trailing_stop_uses_highest_tier():
+    """At +120% should use the +100% tier (locks in +60%), not +75% tier."""
+    entry = Decimal("2.00")
+    result = _trailing_stop_premium(entry, 120.0)
+    assert result == (Decimal("2.00") * Decimal("1.60")).quantize(Decimal("0.0001"))
+
+
+def test_maybe_ratchet_updates_db_when_new_peak(session_factory):
+    """Ratchet persists peak_pnl_pct and new stop_premium to DB."""
+    with session_factory() as session:
+        trade = Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call", qty=Decimal("1"),
+            entry_price=Decimal("2.00"), opened_at=datetime.now(UTC),
+            extra={"occ_symbol": "SPY260101C00500000", "mode": "aggressive",
+                   "stop_premium": "1.00"},
+        )
+        session.add(trade)
+        session.commit()
+        trade_id = trade.id
+
+    # Position hits +35% → should lock in +10%
+    result = _maybe_ratchet_trailing_stop(session_factory, trade, 35.0, Decimal("2.00"))
+    expected_stop = (Decimal("2.00") * Decimal("1.10")).quantize(Decimal("0.0001"))
+    assert result == expected_stop
+
+    with session_factory() as session:
+        row = session.get(Trade, trade_id)
+        assert float(row.extra["peak_pnl_pct"]) == pytest.approx(35.0)
+        assert Decimal(row.extra["stop_premium"]) == expected_stop
+        assert row.extra["trailing_stop_active"] is True
+
+
+def test_maybe_ratchet_stop_never_moves_down(session_factory):
+    """Once ratcheted, the stop cannot be lowered even if P&L drops."""
+    high_stop = str((Decimal("2.00") * Decimal("1.25")).quantize(Decimal("0.0001")))  # already at +50% tier
+
+    with session_factory() as session:
+        trade = Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call", qty=Decimal("1"),
+            entry_price=Decimal("2.00"), opened_at=datetime.now(UTC),
+            extra={"occ_symbol": "SPY260101C00500000", "mode": "aggressive",
+                   "stop_premium": high_stop, "peak_pnl_pct": 55.0,
+                   "trailing_stop_active": True},
+        )
+        session.add(trade)
+        session.commit()
+        trade_id = trade.id
+
+    # P&L has fallen to +35% — still above +30% tier but stop was at +50% tier
+    result = _maybe_ratchet_trailing_stop(session_factory, trade, 35.0, Decimal("2.00"))
+    # Stop must NOT be lowered — returns None (no ratchet happened)
+    assert result is None
+
+    with session_factory() as session:
+        row = session.get(Trade, trade_id)
+        assert Decimal(row.extra["stop_premium"]) == Decimal(high_stop)
+
+
+async def test_trailing_stop_triggers_exit_in_monitor(session_factory):
+    """When bid falls below the ratcheted trailing stop, position is closed."""
+    # Entry $2.00, position hit +50% (stop ratcheted to +25% = $2.50)
+    ratcheted_stop = str((Decimal("2.00") * Decimal("1.25")).quantize(Decimal("0.0001")))
+    with session_factory() as session:
+        trade = Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call", qty=Decimal("1"),
+            entry_price=Decimal("2.00"), opened_at=datetime.now(UTC),
+            extra={
+                "ticker": "SPY", "action": "BUY_CALL",
+                "occ_symbol": "SPY260101C00500000", "mode": "aggressive",
+                "stop_premium": ratcheted_stop,
+                "peak_pnl_pct": 55.0,
+                "trailing_stop_active": True,
+            },
+        )
+        session.add(trade)
+        session.commit()
+
+    async def low_quote(_occ):
+        return _quote(bid=2.48)  # below the $2.50 trailing stop
+
+    async def no_bars(*_a, **_k):
+        return []
+
+    async def fake_sell(**_kw):
+        return _filled(price=2.48)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=2.48)
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        quote_fetcher=low_quote,
+        bars_fetcher=no_bars,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        force_close=False,
+    )
+    assert results[0]["status"] == "closed"
+    assert results[0]["reason"] == "trailing_stop"

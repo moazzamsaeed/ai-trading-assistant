@@ -2,15 +2,19 @@
 
 Runs every 5 min during RTH. For each open directional Trade row:
 
-  1. Hard floor (−30%): exit immediately, no LLM needed.
+  1. Hard floor (mode-aware): exit immediately, no LLM.
+       aggressive: −50% | selective: −30%
   2. Force close on expiry day at 15:30 ET (0DTE every day, weekly on Friday).
-  3. Stop premium: hard stop set at entry (−50% aggressive / −30% selective).
-  4. Indicator scan + LLM confirmation — two triggers:
+  3. Trailing stop (ratcheting): once profit hits a tier, stop is raised to
+       lock in gains. Tiers: +30%→+10%, +50%→+25%, +75%→+40%, +100%→+60%.
+       Stop only ever moves UP. Persisted to DB — survives daemon restarts.
+  4. Stop premium: hard stop set at entry (−50% aggressive / −30% selective).
+  5. Indicator scan + LLM confirmation — two triggers:
        a. Any reversal rule fires (thesis protection, loss or gain)
        b. P&L ≥ PROFIT_LOCK_PCT (75%): always consult LLM even if no rules fired
      BUY_CALL rules: price < VWAP, RSI > 75, EMA20 < EMA50, volume fading
      BUY_PUT rules:  price > VWAP, RSI < 25, EMA20 > EMA50, volume fading
-  5. LLM decides EXIT or HOLD with full context: P&L, indicators, mode, expiry.
+  6. LLM decides EXIT or HOLD with full context: P&L, indicators, mode, expiry.
      - No hard profit target — LLM + indicators govern when to take profit.
      - Selective mode: one fading indicator in profit zone is enough to exit.
      - Aggressive mode: require ≥2 confirming signals before exiting a winner.
@@ -51,6 +55,18 @@ DIRECTIONAL_STRATEGIES = {"directional_call", "directional_put"}
 HARD_FLOOR_PCT = Decimal("0.30")   # −30%: exit unconditionally, no LLM
 VOLUME_FADE_THRESHOLD = 0.7        # volume_ratio below this = momentum fading
 PROFIT_LOCK_PCT = 75.0             # always consult LLM above this P&L even with no indicator triggers
+
+# Trailing stop tiers: (profit_trigger_pct, lock_in_pct)
+# Once the position reaches trigger_pct gain, the stop is ratcheted up to
+# lock_in_pct gain. The stop only ever moves UP — never loosens.
+# Example: position hits +50% → stop moves up to entry × 1.25 (+25%).
+#          If price then falls to +24% → exits immediately, locking in gain.
+TRAILING_STOP_LEVELS: list[tuple[float, float]] = [
+    (100.0, 0.60),  # reached +100% → protect +60%
+    (75.0,  0.40),  # reached +75%  → protect +40%
+    (50.0,  0.25),  # reached +50%  → protect +25%
+    (30.0,  0.10),  # reached +30%  → protect +10%
+]
 
 _EXIT_CONFIRM_PROMPT = """You manage an open options position. Decide EXIT or HOLD.
 
@@ -127,6 +143,85 @@ def _close_trade_row(
     extra["close_status"] = order.status if order else "broker_error"
     trade.extra = extra
     session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Indicator-based exit rules
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Trailing stop
+# ---------------------------------------------------------------------------
+
+
+def _trailing_stop_premium(
+    entry_premium: Decimal,
+    peak_pnl_pct: float,
+) -> Decimal | None:
+    """Return the stop price that locks in gains at the current peak level.
+
+    Walks TRAILING_STOP_LEVELS from highest to lowest and returns the first
+    tier whose trigger has been reached. Returns None if peak is below the
+    lowest trigger (+30%).
+    """
+    for trigger_pct, lock_pct in TRAILING_STOP_LEVELS:
+        if peak_pnl_pct >= trigger_pct:
+            return (entry_premium * (Decimal("1") + Decimal(str(lock_pct)))).quantize(
+                Decimal("0.0001")
+            )
+    return None
+
+
+def _maybe_ratchet_trailing_stop(
+    session_factory,
+    trade: Trade,
+    current_pnl_pct: float,
+    entry_premium: Decimal,
+) -> Decimal | None:
+    """Update peak P&L and ratchet the trailing stop if a new high-water mark
+    has been set. Returns the new stop_premium if the stop was ratcheted, else
+    None. The stop only ever moves UP — it never loosens.
+
+    Persists both peak_pnl_pct and stop_premium to the DB so the ratcheted
+    stop survives a daemon restart.
+    """
+    extra = trade.extra or {}
+    old_peak = float(extra.get("peak_pnl_pct", 0.0))
+    new_peak = max(old_peak, current_pnl_pct)
+
+    new_trail = _trailing_stop_premium(entry_premium, new_peak)
+
+    current_stop_raw = extra.get("stop_premium")
+    current_stop = Decimal(str(current_stop_raw)) if current_stop_raw else Decimal("-1")
+
+    peak_moved = new_peak > old_peak
+    stop_ratcheted = new_trail is not None and new_trail > current_stop
+
+    if not peak_moved and not stop_ratcheted:
+        return None
+
+    with session_factory() as session:
+        row = session.get(Trade, trade.id)
+        if row is None:
+            return None
+        new_extra = dict(row.extra or {})
+        new_extra["peak_pnl_pct"] = round(new_peak, 2)
+        if stop_ratcheted:
+            new_extra["stop_premium"] = str(new_trail)
+            new_extra["trailing_stop_active"] = True
+            log.info(
+                "trailing_stop_ratcheted",
+                trade_id=trade.id,
+                peak_pnl_pct=f"{new_peak:.1f}%",
+                old_stop=str(current_stop),
+                new_stop=str(new_trail),
+                entry_premium=str(entry_premium),
+            )
+        row.extra = new_extra
+        session.commit()
+
+    return new_trail if stop_ratcheted else None
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +390,9 @@ def _format_exit_combined(
     pnl_pct = abs(int(pnl_per_share / entry_p * 100)) if entry_p else 0
 
     reason_text = {
-        "hard_floor_stop": "🛑 hard floor −30%",
-        "stop_premium": "🛑 stop premium hit",
+        "hard_floor_stop": "🛑 hard floor stop",
+        "stop_premium": "🛑 stop hit — limiting loss",
+        "trailing_stop": "🔒 trailing stop — locking in gains",
         "smart_exit": "🧠 smart exit — thesis reversed",
         "smart_profit_exit": "💰 smart profit exit — indicators say take it",
         "force_close": "⏰ closing before market close",
@@ -399,13 +495,24 @@ async def run_directional_exit_monitor(
         current_bid = quote.bid
         pnl_pct = float((current_bid - entry_p) / entry_p * 100)
 
+        # ---- trailing stop ratchet ----
+        # Update the high-water mark and tighten stop_premium if a new profit
+        # tier has been reached. Runs every cycle — cheap (no LLM, one DB write
+        # only when the stop actually moves). Must happen before exit checks so
+        # the ratcheted stop is evaluated in the same cycle it was set.
+        ratcheted = _maybe_ratchet_trailing_stop(factory, trade, pnl_pct, entry_p)
+
         # ---- exit decision ----
         should_exit = False
         reason = ""
         llm_reasoning = ""
 
-        stop_p_raw = extra.get("stop_premium")
-        stop_p = Decimal(str(stop_p_raw)) if stop_p_raw else None
+        # Reload stop_p from DB if it was just ratcheted, otherwise use extra.
+        if ratcheted is not None:
+            stop_p = ratcheted
+        else:
+            stop_p_raw = extra.get("stop_premium")
+            stop_p = Decimal(str(stop_p_raw)) if stop_p_raw else None
         trade_mode = extra.get("mode", "selective")
         # Hard floor is mode-aware: selective uses −30% (same as its stop), aggressive
         # uses −50% to match its wider stop. Both act as unconditional floors with no LLM.
@@ -418,11 +525,15 @@ async def run_directional_exit_monitor(
             should_exit, reason = True, "hard_floor_stop"
 
         elif stop_p is not None and current_bid <= stop_p:
-            should_exit, reason = True, "stop_premium"
+            # Distinguish trailing stop (protecting gains) from original hard stop (limiting losses)
+            trailing_active = (extra.get("trailing_stop_active") or ratcheted is not None)
+            reason = "trailing_stop" if trailing_active else "stop_premium"
+            should_exit = True
             log.info(
-                "directional_exit_stop_premium_hit",
+                "directional_exit_stop_hit",
                 trade_id=trade.id,
                 occ=occ,
+                reason=reason,
                 current_bid=str(current_bid),
                 stop_premium=str(stop_p),
             )
