@@ -839,9 +839,16 @@ from agents.directional.exit_monitor import (
 
 
 def test_trailing_stop_premium_below_first_tier():
-    """Below +30% no trailing stop applies."""
+    """Below +20% no trailing stop applies."""
     entry = Decimal("2.00")
-    assert _trailing_stop_premium(entry, 29.9) is None
+    assert _trailing_stop_premium(entry, 19.9) is None
+
+
+def test_trailing_stop_premium_at_20pct():
+    """At +20% locks in +5% → stop at entry × 1.05."""
+    entry = Decimal("2.00")
+    result = _trailing_stop_premium(entry, 20.0)
+    assert result == (Decimal("2.00") * Decimal("1.05")).quantize(Decimal("0.0001"))
 
 
 def test_trailing_stop_premium_at_30pct():

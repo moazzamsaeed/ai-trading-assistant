@@ -66,6 +66,7 @@ TRAILING_STOP_LEVELS: list[tuple[float, float]] = [
     (75.0,  0.40),  # reached +75%  → protect +40%
     (50.0,  0.25),  # reached +50%  → protect +25%
     (30.0,  0.10),  # reached +30%  → protect +10%
+    (20.0,  0.05),  # reached +20%  → protect +5%
 ]
 
 _EXIT_CONFIRM_PROMPT = """You manage an open options position. Decide EXIT or HOLD.
