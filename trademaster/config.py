@@ -78,9 +78,9 @@ class Settings(BaseSettings):
     max_options_contracts_per_trade: int = Field(default=5, gt=0)
 
     # Max total capital deployed across all open directional positions at once.
-    # 20% of trading_capital_usd = $1,000 on a $5k account. There is no count
-    # cap — concurrency is bounded by deployed dollars, not trade count.
-    max_total_exposure_pct: float = Field(default=0.20, gt=0, le=1.0)
+    # 30% of effective capital — the full remaining budget is used per trade
+    # (no per-trade fraction). With SPY-only focus, concentration is the goal.
+    max_total_exposure_pct: float = Field(default=0.30, gt=0, le=1.0)
 
     monthly_llm_budget_usd: Decimal = Field(default=Decimal("100"), gt=0)
 

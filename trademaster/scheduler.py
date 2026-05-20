@@ -330,11 +330,13 @@ async def _directional_scan_job(
             )
             continue
 
-        # 20% max total exposure cap (directional-only deployed)
+        # Exposure cap: deploy the remaining budget (max_exposure - deployed).
+        # No per-trade fraction — the full remaining budget is the position size.
         factory = make_session_factory()
         with factory() as session:
             deployed = directional_deployed_usd(session)
-        if deployed >= max_exposure:
+        available = max_exposure - deployed
+        if available <= Decimal("0"):
             log.info(
                 "directional_execute_skipped_exposure_cap",
                 deployed=float(deployed),
@@ -343,7 +345,7 @@ async def _directional_scan_job(
             continue
 
         try:
-            result = await execute_directional_signal(decision, mode=mode, capital_usd=capital)
+            result = await execute_directional_signal(decision, mode=mode, capital_usd=available)
             if result.executed and result.trade_id is not None:
                 _last_trade_open[decision.ticker] = datetime.now(UTC)
                 entry_premium = result.entry_premium or Decimal("0")

@@ -698,11 +698,12 @@ async def test_exit_monitor_does_not_auto_close_on_unrelated_error(session_facto
 # ---------------------------------------------------------------------------
 
 
-def test_size_fraction_is_10_percent_both_modes():
+def test_no_per_trade_size_fraction():
+    """Position sizing uses full available budget — no per-trade fraction constant."""
     from agents.directional import executor
-
-    assert executor._SIZE_FRACTION["aggressive"] == 0.10
-    assert executor._SIZE_FRACTION["selective"] == 0.10
+    assert not hasattr(executor, "_SIZE_FRACTION"), (
+        "_SIZE_FRACTION was removed — full available budget is position size now"
+    )
 
 
 def test_size_math_yields_floor_capital_div_premium():

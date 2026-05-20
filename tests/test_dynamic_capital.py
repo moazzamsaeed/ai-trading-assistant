@@ -252,7 +252,8 @@ async def test_integration_loss_shrinks_next_position(session_factory, monkeypat
     )
 
     assert result.executed
-    assert captured["budget"] == 450.0  # 10% of $4,500
+    # Full capital passed as budget (no per-trade fraction): $5,000 - $500 loss = $4,500
+    assert captured["budget"] == 4500.0
 
 
 async def test_executor_rejects_when_capital_is_zero(session_factory, monkeypatch):
@@ -361,10 +362,8 @@ async def test_effective_capital_live_returns_zero_on_alpaca_error(
 
 
 async def test_position_sizing_scales_with_capital(session_factory, monkeypatch):
-    """After a $1k realized loss, the 10% position sizing produces a
-    $400 budget (10% of $4k), not the original $500.
-    """
-    from agents.directional.executor import _SIZE_FRACTION, execute_directional_signal
+    """After a $1k realized loss, capital shrinks to $4k — full $4k is the budget."""
+    from agents.directional.executor import execute_directional_signal
     from agents.directional.intraday import TickerDecision
     from agents.directional.executor import _SelectedStrike
     from integrations.alpaca_client import OptionQuote, OrderResult
@@ -418,5 +417,5 @@ async def test_position_sizing_scales_with_capital(session_factory, monkeypatch)
         waiter=fake_wait,
     )
 
-    # 10% of $4k = $400 (was $500 before the loss)
-    assert captured["budget"] == 400.00, f"Expected $400 budget, got ${captured['budget']}"
+    # Full capital as budget — $5k - $1k loss = $4k (no per-trade fraction)
+    assert captured["budget"] == 4000.00, f"Expected $4000 budget, got ${captured['budget']}"

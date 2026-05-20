@@ -216,11 +216,12 @@ async def test_execute_too_expensive_skips(session_factory):
         _decision(),
         today=date(2026, 1, 2),
         mode="aggressive",
+        capital_usd=Decimal("100"),  # $100 budget — $60/contract (ask=0.60) won't fit
         session_factory=session_factory,
-        strike_selector=_selected(ask=6.00),  # $600/contract > $500 cap (10% of $5k)
+        strike_selector=_selected(ask=1.50),  # $150/contract > $100 budget
     )
     assert not result.executed
-    assert "budget" in result.reason
+    assert "budget" in result.reason or "no affordable" in result.reason
 
 
 async def test_execute_no_quote_skips(session_factory):
@@ -319,7 +320,7 @@ async def test_execute_put_persists_correct_strategy(session_factory):
 
 
 async def test_execute_aggressive_sizing(session_factory):
-    """Aggressive mode allocates 10% of $5000 = $500; at $2/share = 2 contracts."""
+    """Full capital_usd is deployed as position size — no per-trade fraction."""
     submitted_kwargs = {}
 
     async def fake_submit(**kwargs):
@@ -338,7 +339,9 @@ async def test_execute_aggressive_sizing(session_factory):
         submitter=fake_submit,
         waiter=fake_wait,
     )
-    assert submitted_kwargs["qty"] == 2  # floor(500 / 200) = 2
+    # Full capital_usd ($5000) is the budget — no per-trade fraction.
+    # floor($5000 / $200) = 25 contracts at $2.00/share ask.
+    assert submitted_kwargs["qty"] == 25
 
 
 # ---------------------------------------------------------------------------

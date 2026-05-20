@@ -36,11 +36,10 @@ log = get_logger(__name__)
 STRATEGY_CALL = "directional_call"
 STRATEGY_PUT = "directional_put"
 
-# 10% of effective capital per trade (capital tracks realized P&L — see
-# trademaster/capital.py). At $5k base: $500/trade. After a $1k loss:
-# $400/trade. Fits ATM weekly contracts on the watchlist at current prices.
-_SIZE_FRACTION = {"aggressive": 0.10, "selective": 0.10}
 # PT and SL pct by mode (mirrors _MODE_CONFIG in intraday.py).
+# Position sizing: the scheduler passes the remaining exposure budget as
+# capital_usd — the executor deploys it in full. The only limit is the
+# max_total_exposure_pct cap enforced in the scheduler.
 _EXIT_PCT = {
     "aggressive": {"pt": Decimal("1.0"), "sl": Decimal("0.5")},
     "selective": {"pt": Decimal("0.5"), "sl": Decimal("0.3")},
@@ -297,10 +296,9 @@ async def execute_directional_signal(
         )
 
     exit_pcts = _EXIT_PCT.get(mode, _EXIT_PCT["selective"])
-    size_frac = _SIZE_FRACTION.get(mode, _SIZE_FRACTION["selective"])
-    # Effective capital scales with actual account performance — losses
-    # shrink it, gains grow it. Scheduler passes its already-computed value
-    # to avoid double-fetching; standalone callers fetch their own.
+    # capital_usd is the available exposure budget passed by the scheduler
+    # (max_total_exposure - already_deployed). The full amount is deployed —
+    # no per-trade fraction. The scheduler's exposure cap is the only limit.
     if capital_usd is None:
         from trademaster.capital import get_effective_capital
         capital_usd = await get_effective_capital(factory)
@@ -309,7 +307,7 @@ async def execute_directional_signal(
             executed=False, order=None, trade_id=None,
             reason="effective capital is $0 — no new positions",
         )
-    position_usd = float(capital_usd) * size_frac
+    position_usd = float(capital_usd)
 
     # Always select from the real chain — handles strike increments, missing
     # strikes, and budget constraints in one pass for every ticker.
