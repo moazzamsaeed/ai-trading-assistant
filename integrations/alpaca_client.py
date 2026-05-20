@@ -790,6 +790,37 @@ def _to_bar(raw) -> Bar:
     )
 
 
+async def get_daily_bars(
+    symbol: str,
+    *,
+    limit: int = 10,
+) -> list[Bar]:
+    """Fetch the last `limit` daily bars (one bar per session).
+
+    Unlike get_recent_bars, this does NOT anchor to today's open —
+    it looks back across multiple calendar days to build multi-session context.
+    Used for week-trend, previous close, MA5/MA10 calculations.
+    """
+    def _fetch() -> list[Bar]:
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            limit=limit,
+            feed=DataFeed.IEX,
+        )
+        resp = _stock_client().get_stock_bars(req)
+        if isinstance(resp, dict):
+            raw_bars = resp.get(symbol, [])
+        elif hasattr(resp, "data"):
+            raw_bars = resp.data.get(symbol, []) if isinstance(resp.data, dict) else resp.data
+        else:
+            raw_bars = []
+        return [_to_bar(b) for b in raw_bars]
+
+    return await asyncio.to_thread(_fetch)
+
+
 async def get_recent_bars(
     symbol: str,
     *,

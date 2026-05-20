@@ -85,6 +85,15 @@ STEP 1 — TREND + VOLATILITY FILTER:
   Volatility: {vol_regime}
   Opening Range: H=${orb_high} L=${orb_low}
 
+  ── MULTI-DAY TREND (from market context above) ──
+  Use week trend, MA5/MA10 position, and prev close/H/L to assess macro bias:
+  • SPY ABOVE MA5 + MA10 + positive WTD → macro bull — favour calls, puts need strong reason.
+  • SPY BELOW MA5 + MA10 + negative WTD → macro bear — favour puts, calls need strong reason.
+  • Prev day high/low = key intraday S/R — price breaking above prev high = bullish; below prev low = bearish.
+  • Gap UP open + already above MA5/MA10 = strong bull context — lean calls.
+  • Gap DOWN open + below MA5/MA10 = strong bear context — lean puts.
+  The multi-day trend is the highest-timeframe bias. Intraday signals should CONFIRM it, not fight it.
+
   ── TREND ALIGNMENT ──
   The 5-min and 15-min regimes must AGREE for a high-conviction trade.
 
@@ -460,6 +469,35 @@ async def _build_market_context(
     except Exception:  # noqa: BLE001
         pass
 
+    # Multi-day context — previous close, key S/R levels, week trend, MA5/MA10.
+    # Uses daily bars anchored to the last 10 sessions (fail-open).
+    multi_day: dict = {}
+    try:
+        daily_bars = await alpaca_client.get_daily_bars("SPY", limit=12)
+        if len(daily_bars) >= 2:
+            closes = [float(b.close) for b in daily_bars]
+            prev_bar = daily_bars[-2]           # yesterday's full session
+            prev_close = float(prev_bar.close)
+            prev_high = float(prev_bar.high)
+            prev_low = float(prev_bar.low)
+            ma5 = sum(closes[-5:]) / min(5, len(closes[-5:]))
+            ma10 = sum(closes[-10:]) / min(10, len(closes[-10:]))
+            wtd_pct = (spy_price - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 else 0.0
+            gap_pct = (spy_price - prev_close) / prev_close * 100 if prev_close else 0.0
+            multi_day = {
+                "prev_close": round(prev_close, 2),
+                "prev_high": round(prev_high, 2),
+                "prev_low": round(prev_low, 2),
+                "ma5": round(ma5, 2),
+                "ma10": round(ma10, 2),
+                "above_ma5": spy_price > ma5,
+                "above_ma10": spy_price > ma10,
+                "week_pct": round(wtd_pct, 2),
+                "gap_pct": round(gap_pct, 2),
+            }
+    except Exception:  # noqa: BLE001
+        pass
+
     return {
         "spy_regime": spy_regime,
         "spy_price": round(spy_price, 2),
@@ -472,6 +510,7 @@ async def _build_market_context(
         "vol_regime": vol_regime,
         "spy_15min_bias": spy_15min_bias,
         "vix": round(vix_level, 2) if vix_level else None,
+        "multi_day": multi_day,
     }
 
 
@@ -490,6 +529,27 @@ def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> st
         "",
         "Relative performance vs SPY today:",
     ]
+    # Multi-day context block
+    md = ctx.get("multi_day", {})
+    if md:
+        week_dir = "▲" if md.get("week_pct", 0) > 0 else "▼"
+        gap_dir = "gap UP" if md.get("gap_pct", 0) > 0.1 else ("gap DOWN" if md.get("gap_pct", 0) < -0.1 else "flat open")
+        ma5_pos = "ABOVE" if md.get("above_ma5") else "BELOW"
+        ma10_pos = "ABOVE" if md.get("above_ma10") else "BELOW"
+        lines.append(
+            f"Week trend: {week_dir}{abs(md.get('week_pct',0)):.1f}% WTD | "
+            f"Today's open: {gap_dir} ({md.get('gap_pct',0):+.2f}%)"
+        )
+        lines.append(
+            f"Prev close: ${md.get('prev_close',0):.2f} | "
+            f"Prev H/L: ${md.get('prev_high',0):.2f} / ${md.get('prev_low',0):.2f}"
+        )
+        lines.append(
+            f"MA5: ${md.get('ma5',0):.2f} ({ma5_pos}) | "
+            f"MA10: ${md.get('ma10',0):.2f} ({ma10_pos})"
+        )
+        lines.append("")
+
     perf = ctx.get("ticker_perf", {})
     leaders = [t for t, v in perf.items() if v["rel_vs_spy"] > 0]
     laggards = [t for t, v in perf.items() if v["rel_vs_spy"] < 0]
