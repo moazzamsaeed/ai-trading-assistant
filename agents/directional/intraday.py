@@ -106,26 +106,47 @@ STEP 1 — TREND + VOLATILITY FILTER:
 STEP 2 — INDICATOR CONFLUENCE:
   RSI uses period 9 — faster signal on 5-min bars.
 
+  ── STANDARD SESSION (after 11:30 ET, EMA50 fully established) ──
   BULLISH — requires ALL of:
     price > VWAP  AND  RSI9 between 45–72  AND  EMA20 > EMA50  AND  volume_ratio > 1.3
 
   BEARISH — requires ALL of:
     price < VWAP  AND  RSI9 between 28–55  AND  EMA20 < EMA50  AND  volume_ratio > 1.3
 
+  Conviction: HIGH = all 4 criteria + MACD aligned. MEDIUM = 3 of 4. LOW = 2 or fewer → HOLD.
+
+  ── EARLY SESSION (before 11:30 ET, EMA50 not yet reliable) ──
+  EMA50 needs 250 min of data — before 11:30 ET it may be null or unreliable.
+  If ema50 is null or time < 11:30 ET, DROP EMA50 from the required set and score on 3 factors:
+
+  BULLISH (early): price > VWAP  AND  RSI9 between 45–72  AND  volume_ratio > 1.3
+  BEARISH (early): price < VWAP  AND  RSI9 between 28–55  AND  volume_ratio > 1.3
+
+  Early conviction: HIGH = all 3 criteria + MACD aligned. MEDIUM = 2 of 3. LOW = 1 or fewer → HOLD.
+
+  ── ORB BREAKOUT OVERRIDE (before 10:30 ET) ──
+  The first 60 minutes produce the day's most explosive moves. If ALL of these are true:
+    • Time is before 10:30 ET
+    • Price has broken ABOVE ORH (for calls) or BELOW ORL (for puts)
+    • volume_ratio ≥ 2.0 (institutional conviction behind the breakout)
+    • price is on the correct side of VWAP
+  → Score as HIGH conviction immediately. EMA requirement is waived.
+    This is a confirmed opening range breakout with institutional volume — the highest
+    probability setup of the day. Do NOT hold waiting for EMA confirmation.
+
+  ── INDICATORS ──
   RSI9 context:
   • > 75: overbought — momentum likely exhausted, put bias.
   • < 25: oversold — potential snap-back, call bias.
-  • 55–72 without full VWAP + EMA confirmation: HOLD.
+  • 55–72 without VWAP + volume confirmation: HOLD.
 
   MACD (6-13-4, intraday optimised):
   • macd > signal AND rising: bullish acceleration — confirms calls.
   • macd < signal AND falling: bearish acceleration — confirms puts.
-  • Price making new high while MACD falling (divergence): weakening — caution on calls.
+  • Divergence (new price high + MACD falling): weakening — caution on calls.
   • Use as confirmation, not standalone trigger.
 
   ATR10: higher = wider expected move = better for directional options.
-
-  Conviction: HIGH = all 4 criteria + MACD aligned. MEDIUM = 3 of 4. LOW = 2 or fewer → HOLD.
 
 STEP 3 — STRIKE & EXPIRY:
   SPY has 0DTE options every trading day (Mon–Fri). Always prefer 0DTE for clean,
