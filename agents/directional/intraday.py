@@ -69,94 +69,85 @@ _MODE_CONFIG = {
     },
 }
 
-PROMPT_TEMPLATE = """You are a professional intraday options trader. Time: {now_iso} | Mode: {mode_upper}
+PROMPT_TEMPLATE = """You are a professional SPY options trader. Time: {now_iso} | Mode: {mode_upper}
+
+You trade SPY options ONLY. SPY IS the market — no relative strength analysis needed.
+Your only job: determine if SPY is likely to move UP (buy call) or DOWN (buy put) in
+the next 30–90 minutes, or stay flat (hold).
 
 {market_context_block}
 
-Evaluate each ticker using this SEQUENTIAL 5-step hierarchy.
-STOP at any failing step and mark that ticker HOLD — do not average conflicting signals.
+Evaluate SPY using this SEQUENTIAL 4-step hierarchy.
+STOP at any failing step and mark HOLD — do not average conflicting signals.
 
-STEP 1 — MARKET REGIME + VOLATILITY FILTER (hard filter):
+STEP 1 — TREND + VOLATILITY FILTER:
   SPY 5-min regime: {spy_regime} | SPY 15-min bias: {spy_15min_bias}
   Volatility: {vol_regime}
+  Opening Range: H=${orb_high} L=${orb_low}
 
-  ── DIRECTION ALIGNMENT (most important rule in this step) ──
-  The SPY regime sets the primary tide. Swimming against the tide burns premium fast.
+  ── TREND ALIGNMENT ──
+  The 5-min and 15-min regimes must AGREE for a high-conviction trade.
 
-  BULL regime:
-  • CALLs: standard conviction applies — MEDIUM or HIGH based on steps 2–3.
-  • PUTs: HIGH conviction required AND rel_vs_spy must be < −2% (ticker genuinely
-    breaking down, not just drifting). The ticker must have a specific bearish catalyst
-    (news, earnings, sector breakdown). "RSI looks weak" or "slight VWAP cross" in a
-    bull market is noise — the stock will likely snap back. Mark HOLD unless the
-    bearish thesis is ticker-specific and strong.
+  BULL + 15-min BULL → strong call setup. Puts need overwhelming evidence.
+  BEAR + 15-min BEAR → strong put setup. Calls need overwhelming evidence.
+  BULL + 15-min BEAR (or vice versa) → conflicting. HIGH conviction only in either direction.
+  NEUTRAL → both directions valid; indicator confluence (Step 2) decides.
 
-  BEAR regime:
-  • PUTs: standard conviction applies — MEDIUM or HIGH based on steps 2–3.
-  • CALLs: HIGH conviction required AND rel_vs_spy must be > +2% (ticker genuinely
-    outperforming). "Looks bouncy" in a bear market is not enough.
-
-  NEUTRAL regime:
-  • Both directions allowed at standard conviction. No asymmetric burden.
-
-  TIMEFRAME CONFIRMATION:
-  • BULL + 15-min BULL: strong tailwind for calls. Puts require the extra bar above.
-  • BULL + 15-min BEAR: conflicting — increase conviction threshold for BOTH directions.
-  • BEAR + 15-min BEAR: strong tailwind for puts. Calls require extra bar above.
-  • NEUTRAL + any 15-min: standard selectivity, no special adjustment.
+  ── OPENING RANGE BIAS ──
+  • Price ABOVE ORH: bullish breakout confirmed — favour calls.
+  • Price BELOW ORL: bearish breakdown confirmed — favour puts.
+  • Price INSIDE range: no confirmed direction — be conservative, require stronger indicators.
 
   ── VOLATILITY ──
-  • FLAT (ATR too low): premium won't move enough to justify the trade. Mark ALL HOLD.
-  • VOLATILE (ATR too high): whipsaw risk elevated, spreads wider. HIGH conviction only.
+  • FLAT (ATR too low): premium won't move enough. HOLD all.
+  • VOLATILE (ATR too high): whipsaw risk, HIGH conviction only.
   • NORMAL: full-size trades allowed.
 
-  Opening Range: H=${orb_high} L=${orb_low}
-  • Price ABOVE ORH = breakout bullish — favours calls.
-  • Price BELOW ORL = breakout bearish — favours puts.
-  • Price INSIDE range = no breakout yet. Be conservative; wait for confirmed break.
+STEP 2 — INDICATOR CONFLUENCE:
+  RSI uses period 9 — faster signal on 5-min bars.
 
-STEP 2 — RELATIVE STRENGTH (filter):
-  • BUY_CALL: ticker must show POSITIVE rel_vs_spy (outperforming) OR volume surge
-    with clear catalyst. Do NOT call a ticker lagging the market without a catalyst.
-  • BUY_PUT: ticker must show NEGATIVE rel_vs_spy (underperforming the market).
-    Never short a ticker that is outperforming SPY — you are fighting momentum.
+  BULLISH — requires ALL of:
+    price > VWAP  AND  RSI9 between 45–72  AND  EMA20 > EMA50  AND  volume_ratio > 1.3
 
-STEP 3 — INDICATOR CONFLUENCE (the setup):
-  RSI uses period 9 (not 14) — faster on 5-min bars. Thresholds are wider accordingly.
+  BEARISH — requires ALL of:
+    price < VWAP  AND  RSI9 between 28–55  AND  EMA20 < EMA50  AND  volume_ratio > 1.3
 
-  Bullish requires ALL of: price > VWAP AND RSI9 45–72 AND EMA20 > EMA50 AND volume_ratio > 1.3
-  Bearish requires ALL of: price < VWAP AND RSI9 28–55 AND EMA20 < EMA50 AND volume_ratio > 1.3
+  RSI9 context:
+  • > 75: overbought — momentum likely exhausted, put bias.
+  • < 25: oversold — potential snap-back, call bias.
+  • 55–72 without full VWAP + EMA confirmation: HOLD.
 
-  RSI9 notes:
-  • 45–72 is unambiguously bullish momentum. RSI9 > 75 = overbought, caution.
-  • 28–55 is unambiguously bearish momentum. RSI9 < 25 = oversold, potential reversal.
-  • RSI9 between 55–72 without VWAP + EMA confirmation → HOLD.
+  MACD (6-13-4, intraday optimised):
+  • macd > signal AND rising: bullish acceleration — confirms calls.
+  • macd < signal AND falling: bearish acceleration — confirms puts.
+  • Price making new high while MACD falling (divergence): weakening — caution on calls.
+  • Use as confirmation, not standalone trigger.
 
-  MACD context (6-13-4 settings — intraday optimised):
-  • macd > macd_signal AND rising: bullish momentum accelerating.
-  • macd < macd_signal AND falling: bearish momentum accelerating.
-  • DIVERGENCE is the key signal: price making new highs while MACD is falling → weakening.
-  • Use MACD as confirmation, not a standalone trigger.
+  ATR10: higher = wider expected move = better for directional options.
 
-  ATR10 context:
-  • Higher ATR = wider expected moves = good for buying directional options.
-  • If ATR is very low relative to recent history, options premium won't move enough.
+  Conviction: HIGH = all 4 criteria + MACD aligned. MEDIUM = 3 of 4. LOW = 2 or fewer → HOLD.
 
-  Conviction: HIGH = all 4 criteria + MACD aligned. MEDIUM = 3 of 4 criteria. LOW = 2 or fewer → HOLD.
+STEP 3 — STRIKE & EXPIRY:
+  SPY has 0DTE options every trading day (Mon–Fri). Always prefer 0DTE for clean,
+  focused intraday exposure with maximum gamma. Weekly only if time > 14:00 ET.
 
-STEP 4 — STRIKE & EXPIRY:
-  • Strike rules:
-    - HIGH conviction → ATM (at-the-money, max gamma, tightest spreads, easiest exit).
-    - MEDIUM conviction + WEEKLY → 1 strike OTM (delta ~0.35–0.40; still fillable, manageable theta).
-    - MEDIUM conviction + 0DTE → HOLD. Do NOT trade. On 0DTE, OTM options decay 15%+/hour
-      after 2 PM ET, bid-ask spreads blow out, and the option can go no-bid entirely in the
-      final 30 minutes. Theta risk makes OTM 0DTE a near-certain loss even when direction is right.
-    The system validates strikes against the real options chain — pick the nearest whole number.
-  • Expiry: "0DTE" only when HIGH conviction AND time before 14:00 ET AND the ticker has
-    a 0DTE expiry today. SPY has daily 0DTE (Mon–Fri). QQQ and IWM only have 0DTE on
-    Mon/Wed/Fri — use "WEEKLY" for QQQ/IWM on Tue/Thu. All other tickers: "WEEKLY".
-  • Opening Range tip: if price just broke above ORH → strike near ORH is strong support.
-    If price just broke below ORL → strike near ORL is strong resistance.
+  Strike rules:
+  • HIGH conviction → ATM (max gamma, tightest spreads, easiest exit).
+  • MEDIUM conviction → 1 strike OTM (delta ~0.35–0.40).
+  • MEDIUM + time > 14:00 ET → HOLD. Theta decay accelerates sharply after 2 PM on 0DTE.
+
+  Expiry rule: always "0DTE" before 14:00 ET. After 14:00 ET: "WEEKLY" only if HIGH conviction.
+
+  Opening Range tips:
+  • Breakout above ORH → ATM strike near ORH level (acts as support on retests).
+  • Breakdown below ORL → ATM strike near ORL level (acts as resistance on retests).
+
+STEP 4 — FINAL SANITY CHECK:
+  Before recommending a trade, ask: "Is SPY actually moving? Or is it choppy/flat?"
+  • If SPY has been ranging ±0.1% for the last 30 min → HOLD. Options decay on flat days.
+  • If volume is fading (volume_ratio < 1.0) → HOLD. No fuel for continuation.
+  • If the signal is only marginally bullish/bearish → HOLD. Wait for a cleaner setup.
+  • {exit_hint}
 
 STEP 5 — CAPITAL EFFICIENCY:
   • Max 3 signals per scan. If more qualify, pick the 3 with strongest setups.
@@ -675,36 +666,6 @@ async def run_directional_scan(
         session_factory=factory,
     )
     decisions = _parse_decisions(response.text, tickers)
-
-    # Hard-override: direction must align with rel_vs_spy.
-    # BUY_CALL on a ticker underperforming SPY = fighting momentum.
-    # BUY_PUT on a ticker outperforming SPY = fighting momentum.
-    # Enforces what Step 2 of the prompt already instructs — prevents LLM drift.
-    ticker_perf = market_ctx.get("ticker_perf", {})
-    rel_overridden = []
-    for d in decisions:
-        if d.action == "HOLD":
-            rel_overridden.append(d)
-            continue
-        rel = ticker_perf.get(d.ticker, {}).get("rel_vs_spy", None)
-        if rel is None:
-            rel_overridden.append(d)
-            continue
-        wrong_direction = (d.action == "BUY_CALL" and rel < 0) or (d.action == "BUY_PUT" and rel > 0)
-        if wrong_direction:
-            log.info(
-                "directional_decision_overridden_rel_vs_spy",
-                ticker=d.ticker,
-                action=d.action,
-                rel_vs_spy=rel,
-            )
-            rel_overridden.append(
-                TickerDecision(d.ticker, "HOLD", None, None, "LOW",
-                               f"rel_vs_spy {rel:+.1f}% opposes {d.action} — overridden to HOLD")
-            )
-        else:
-            rel_overridden.append(d)
-    decisions = rel_overridden
 
     # Hard-override: any BUY on a ticker with no bar data becomes HOLD.
     # This prevents hallucinated "RSI looks bullish" from slipping through

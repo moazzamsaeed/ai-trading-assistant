@@ -1,14 +1,5 @@
 {
   "tickers": [
-    "SPY",
-    "QQQ",
-    "IWM",
-    "AAPL",
-    "NVDA",
-    "AMZN",
-    "QCOM",
-    "PLTR",
-    "XOM",
-    "XLK"
+    "SPY"
   ]
 }
