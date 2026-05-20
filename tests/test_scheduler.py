@@ -711,10 +711,13 @@ async def test_weekly_loss_limit_halts_scan(monkeypatch):
     from trademaster.timeutils import today_et
     today = today_et()
     week_start = today - _dmod.timedelta(days=today.weekday())  # Monday this week
-    # Use Wednesday of this week so the loss is this week but NOT today —
-    # daily limit won't fire; only weekly limit fires.
-    wednesday = week_start + _dmod.timedelta(days=2)
-    closed_mid_week = _dt.combine(wednesday, _dmod.time(15, 0), tzinfo=_UTC)
+    # Use Monday of this week so the loss is this week but never today
+    # (today could be any day Mon-Fri — Monday is always safe as "not today"
+    # unless today IS Monday, handled by falling back to Tuesday).
+    monday = week_start
+    tuesday = week_start + _dmod.timedelta(days=1)
+    seed_day = tuesday if monday == _dt.now(_UTC).date() else monday
+    closed_mid_week = _dt.combine(seed_day, _dmod.time(15, 0), tzinfo=_UTC)
 
     with sf() as session:
         session.add(_Trade(

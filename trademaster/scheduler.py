@@ -572,15 +572,16 @@ def make_scheduler(
         misfire_grace_time=120,
     )
 
-    # Directional fallback scan — every 60 min during RTH.
+    # Directional fallback scan — every 15 min during RTH.
     # Real-time triggers come from the WebSocket stream (alpaca_stream.py).
     # This fallback catches slow-building setups and guards against stream gaps.
+    # SPY 0DTE timing is critical — 15 min ensures no setup is missed between surges.
     scheduler.add_job(
         _directional_scan_job,
         CronTrigger(
             day_of_week="mon-fri",
             hour="9-15",
-            minute="0",
+            minute="0,15,30,45",
             timezone=PREMARKET_TZ,
         ),
         kwargs={
