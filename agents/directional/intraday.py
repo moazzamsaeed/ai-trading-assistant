@@ -159,14 +159,14 @@ STEP 2 — INDICATOR CONFLUENCE:
 
 STEP 3 — STRIKE & EXPIRY:
   SPY has 0DTE options every trading day (Mon–Fri). Always prefer 0DTE for clean,
-  focused intraday exposure with maximum gamma. Weekly only if time > 14:00 ET.
+  focused intraday exposure with maximum gamma. Weekly only if time > 14:30 ET.
 
   Strike rules:
   • HIGH conviction → ATM (max gamma, tightest spreads, easiest exit).
   • MEDIUM conviction → 1 strike OTM (delta ~0.35–0.40).
-  • MEDIUM + time > 14:00 ET → HOLD. Theta decay accelerates sharply after 2 PM on 0DTE.
+  • MEDIUM + time > 14:30 ET → HOLD. Theta decay accelerates sharply after 2:30 PM on 0DTE.
 
-  Expiry rule: always "0DTE" before 14:00 ET. After 14:00 ET: "WEEKLY" only if HIGH conviction.
+  Expiry rule: always "0DTE" before 14:30 ET. After 14:30 ET: "WEEKLY" only if HIGH conviction.
 
   Opening Range tips:
   • Breakout above ORH → ATM strike near ORH level (acts as support on retests).
