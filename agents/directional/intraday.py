@@ -164,9 +164,9 @@ STEP 3 — STRIKE & EXPIRY:
   Strike rules:
   • HIGH conviction → ATM (max gamma, tightest spreads, easiest exit).
   • MEDIUM conviction → 1 strike OTM (delta ~0.35–0.40).
-  • MEDIUM + time > 14:30 ET → HOLD. Theta decay accelerates sharply after 2:30 PM on 0DTE.
+  • MEDIUM + time > 15:15 ET → HOLD. Theta decay is severe in the final 45 min on 0DTE.
 
-  Expiry rule: always "0DTE" before 14:30 ET. After 14:30 ET: "WEEKLY" only if HIGH conviction.
+  Expiry rule: always "0DTE" before 15:15 ET. After 15:15 ET: "WEEKLY" only if HIGH conviction.
 
   Opening Range tips:
   • Breakout above ORH → ATM strike near ORH level (acts as support on retests).
