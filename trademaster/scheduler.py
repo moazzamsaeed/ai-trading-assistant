@@ -48,10 +48,10 @@ _scan_in_progress: bool = False
 _last_research_post: datetime | None = None
 _RESEARCH_POST_INTERVAL_SECONDS = 3600
 
-# Per-ticker 60-min cooldown: prevents re-entering the same ticker after a
-# stop-loss or position close (stops the PLTR-bought-4-times-in-30-min problem).
+# Per-ticker 15-min cooldown: short re-entry gap for SPY 0DTE where
+# missing a 60-min window means missing the entire move.
 _last_trade_open: dict[str, datetime] = {}
-_TICKER_COOLDOWN_SECONDS = 3600
+_TICKER_COOLDOWN_SECONDS = 900
 
 # Per-(ticker, action) signal dedup: suppress Discord #signals spam when the
 # same BUY_CALL/BUY_PUT fires repeatedly within 30 minutes.

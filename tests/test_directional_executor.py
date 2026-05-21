@@ -159,17 +159,21 @@ async def test_execute_hold_returns_no_execute():
     assert "HOLD" in result.reason
 
 
-async def test_execute_medium_conviction_0dte_blocked(session_factory):
-    """MEDIUM conviction 0DTE is blocked — OTM on 0DTE has negative EV
-    due to extreme theta decay and widening bid-ask spreads after 2 PM ET."""
-    d = TickerDecision("SPY", "BUY_CALL", 500.0, "0DTE", "MEDIUM", "test")
+async def test_execute_medium_conviction_0dte_allowed(session_factory):
+    """MEDIUM conviction 0DTE is now allowed for SPY — the 2:30 PM time window
+    in the scheduler is the only theta protection needed."""
+    async def fake_submit(**_k): return _filled_order(price=1.50)
+    async def fake_wait(order_id, **_k): return _filled_order(price=1.50)
+
     result = await execute_directional_signal(
-        d,
+        TickerDecision("SPY", "BUY_CALL", 500.0, "0DTE", "MEDIUM", "test"),
         today=date(2026, 1, 2),
         session_factory=session_factory,
+        strike_selector=_selected(ask=1.50),
+        submitter=fake_submit,
+        waiter=fake_wait,
     )
-    assert not result.executed
-    assert "medium_conviction_0dte" in result.reason
+    assert result.executed
 
 
 async def test_execute_medium_conviction_weekly_allowed(session_factory):

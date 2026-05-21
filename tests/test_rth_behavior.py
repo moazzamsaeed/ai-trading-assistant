@@ -478,25 +478,25 @@ async def test_daily_loss_limit_includes_unrealized(session_factory, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# 5. Per-ticker 60-min cooldown — fix for "PLTR bought 4 times in 30 min"
+# 5. Per-ticker 15-min cooldown — short gap for SPY 0DTE re-entry flexibility
 # ---------------------------------------------------------------------------
 
 
-async def test_ticker_cooldown_blocks_reentry_within_60_min():
-    """A trade opened on PLTR 30 min ago must NOT trigger another execution."""
+async def test_ticker_cooldown_blocks_reentry_within_15_min():
+    """A trade opened on SPY 5 min ago must NOT trigger another execution."""
     now = datetime.now(UTC)
-    sch._last_trade_open["PLTR"] = now - timedelta(minutes=30)
+    sch._last_trade_open["SPY"] = now - timedelta(minutes=5)
 
-    elapsed = (now - sch._last_trade_open["PLTR"]).total_seconds()
+    elapsed = (now - sch._last_trade_open["SPY"]).total_seconds()
     assert elapsed < sch._TICKER_COOLDOWN_SECONDS
 
 
-async def test_ticker_cooldown_allows_reentry_after_60_min():
-    """After 65 min, the cooldown expires and re-entry is allowed."""
+async def test_ticker_cooldown_allows_reentry_after_15_min():
+    """After 20 min, the cooldown expires and re-entry is allowed."""
     now = datetime.now(UTC)
-    sch._last_trade_open["PLTR"] = now - timedelta(minutes=65)
+    sch._last_trade_open["SPY"] = now - timedelta(minutes=20)
 
-    elapsed = (now - sch._last_trade_open["PLTR"]).total_seconds()
+    elapsed = (now - sch._last_trade_open["SPY"]).total_seconds()
     assert elapsed >= sch._TICKER_COOLDOWN_SECONDS
 
 
