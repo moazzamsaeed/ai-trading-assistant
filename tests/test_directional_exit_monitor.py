@@ -839,16 +839,16 @@ from agents.directional.exit_monitor import (
 
 
 def test_trailing_stop_premium_below_first_tier():
-    """Below +20% no trailing stop applies."""
+    """Below +15% no trailing stop applies."""
     entry = Decimal("2.00")
-    assert _trailing_stop_premium(entry, 19.9) is None
+    assert _trailing_stop_premium(entry, 14.9) is None
 
 
-def test_trailing_stop_premium_at_20pct():
-    """At +20% locks in +5% → stop at entry × 1.05."""
+def test_trailing_stop_premium_at_15pct():
+    """At +15% locks in +3% → stop at entry × 1.03."""
     entry = Decimal("2.00")
-    result = _trailing_stop_premium(entry, 20.0)
-    assert result == (Decimal("2.00") * Decimal("1.05")).quantize(Decimal("0.0001"))
+    result = _trailing_stop_premium(entry, 15.0)
+    assert result == (Decimal("2.00") * Decimal("1.03")).quantize(Decimal("0.0001"))
 
 
 def test_trailing_stop_premium_at_30pct():
@@ -940,7 +940,11 @@ def test_maybe_ratchet_stop_never_moves_down(session_factory):
 
 
 async def test_trailing_stop_triggers_exit_in_monitor(session_factory):
-    """When bid falls below the ratcheted trailing stop, position is closed."""
+    """When bid falls below the ratcheted trailing stop, position is closed.
+
+    Uses scale_out_tiers_fired pre-populated to skip the scale-out logic — this
+    test verifies the trailing-stop full-exit path specifically.
+    """
     # Entry $2.00, position hit +50% (stop ratcheted to +25% = $2.50)
     ratcheted_stop = str((Decimal("2.00") * Decimal("1.25")).quantize(Decimal("0.0001")))
     with session_factory() as session:
@@ -954,6 +958,9 @@ async def test_trailing_stop_triggers_exit_in_monitor(session_factory):
                 "stop_premium": ratcheted_stop,
                 "peak_pnl_pct": 55.0,
                 "trailing_stop_active": True,
+                # All scale-out tiers already fired so this test isolates the full-exit path
+                "scale_out_tiers_fired": [15.0, 30.0, 50.0],
+                "original_qty": 4,
             },
         )
         session.add(trade)
@@ -981,3 +988,139 @@ async def test_trailing_stop_triggers_exit_in_monitor(session_factory):
     )
     assert results[0]["status"] == "closed"
     assert results[0]["reason"] == "trailing_stop"
+
+
+# ---------------------------------------------------------------------------
+# Scale-out + 30-sec tick tests
+# ---------------------------------------------------------------------------
+
+from agents.directional.exit_monitor import (
+    _maybe_scale_out,
+    run_trailing_stop_tick,
+)
+
+
+async def test_scale_out_fires_at_15pct_tier(session_factory):
+    """When peak crosses +15%, 25% of original qty is partial-closed."""
+    with session_factory() as session:
+        trade = Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call", qty=Decimal("4"),
+            entry_price=Decimal("2.00"), opened_at=datetime.now(UTC),
+            extra={
+                "ticker": "SPY", "action": "BUY_CALL",
+                "occ_symbol": "SPY260101C00500000", "mode": "aggressive",
+                "stop_premium": "1.00",
+                "peak_pnl_pct": 18.0,  # crossed +15% tier
+                "original_qty": 4,
+            },
+        )
+        session.add(trade)
+        session.commit()
+        trade_id = trade.id
+
+    async def fake_sell(**_kw):
+        return _filled(price=2.30)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=2.30)
+
+    result = await _maybe_scale_out(
+        session_factory, trade,
+        current_bid=Decimal("2.30"),
+        submitter=fake_sell, waiter=fake_wait,
+    )
+    assert result is not None
+    assert result["tier"] == 15.0
+    assert result["sell_qty"] == 1  # 25% of 4 = 1
+
+    with session_factory() as session:
+        row = session.get(Trade, trade_id)
+        assert int(row.qty) == 3  # 4 - 1
+        assert 15.0 in row.extra["scale_out_tiers_fired"]
+
+
+async def test_scale_out_fires_once_per_tier(session_factory):
+    """If a tier was already fired, scale-out doesn't fire it again."""
+    with session_factory() as session:
+        trade = Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call", qty=Decimal("3"),
+            entry_price=Decimal("2.00"), opened_at=datetime.now(UTC),
+            extra={
+                "ticker": "SPY", "action": "BUY_CALL",
+                "occ_symbol": "SPY260101C00500000", "mode": "aggressive",
+                "stop_premium": "2.06",
+                "peak_pnl_pct": 18.0,
+                "original_qty": 4,
+                "scale_out_tiers_fired": [15.0],  # +15% already done
+            },
+        )
+        session.add(trade)
+        session.commit()
+
+    async def boom_sell(**_kw):
+        raise AssertionError("scale-out should not fire again at same tier")
+
+    async def fake_wait(*_a, **_k):
+        return _filled(price=2.30)
+
+    result = await _maybe_scale_out(
+        session_factory, trade,
+        current_bid=Decimal("2.30"),
+        submitter=boom_sell, waiter=fake_wait,
+    )
+    assert result is None
+
+
+async def test_trailing_stop_tick_partial_closes_at_tier(session_factory):
+    """Tick function partial-closes when crossing a tier."""
+    with session_factory() as session:
+        trade = Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call", qty=Decimal("4"),
+            entry_price=Decimal("2.00"), opened_at=datetime.now(UTC),
+            extra={
+                "ticker": "SPY", "action": "BUY_CALL",
+                "occ_symbol": "SPY260101C00500000", "mode": "aggressive",
+                "stop_premium": "1.00",
+                "original_qty": 4,
+            },
+        )
+        session.add(trade)
+        session.commit()
+
+    async def good_quote(_occ):
+        return _quote(bid=2.34)  # +17%
+
+    async def fake_sell(**_kw):
+        return _filled(price=2.34)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=2.34)
+
+    results = await run_trailing_stop_tick(
+        session_factory=session_factory,
+        quote_fetcher=good_quote,
+        submitter=fake_sell,
+        waiter=fake_wait,
+    )
+    assert len(results) == 1
+    assert results[0]["status"] == "scaled_out"
+    assert results[0]["tier"] == 15.0
+
+
+async def test_trailing_stop_tick_skips_when_no_positions(session_factory):
+    """Tick returns empty list with no open positions — no API calls."""
+    quote_called = []
+
+    async def fake_quote(_occ):
+        quote_called.append(True)
+        return None
+
+    results = await run_trailing_stop_tick(
+        session_factory=session_factory,
+        quote_fetcher=fake_quote,
+    )
+    assert results == []
+    assert quote_called == []  # didn't even call quote fetcher

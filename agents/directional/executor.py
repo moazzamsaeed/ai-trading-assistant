@@ -128,6 +128,7 @@ def _persist_entry(
             "occ_symbol": occ,
             "mode": mode,
             "conviction": conviction,
+            "original_qty": qty,
             "profit_target_premium": str(profit_target_premium),
             "stop_premium": str(stop_premium),
             "entry_reasoning": entry_reasoning[:300],

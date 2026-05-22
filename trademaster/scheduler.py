@@ -22,7 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from agents.directional.executor import execute_directional_signal
-from agents.directional.exit_monitor import run_directional_exit_monitor
+from agents.directional.exit_monitor import run_directional_exit_monitor, run_trailing_stop_tick
 from agents.directional.intraday import format_directional_signal, format_entry_combined, run_directional_scan
 from agents.intraday.scan import run_intraday_scan
 from agents.options.exit_monitor import run_exit_monitor
@@ -425,6 +425,45 @@ async def _directional_exit_job(
             await log_poster(r["error_text"])
 
 
+async def _trailing_stop_tick_job(
+    *,
+    signal_poster: Poster,
+    log_poster: Poster = _noop_poster,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+) -> None:
+    """Fast 30-sec trailing stop tick — peak update, scale-out, hard stop only.
+
+    Lightweight version of the exit monitor that runs every 30 seconds during
+    RTH. No indicators, no LLM. Just price-based trailing stop ratchet and
+    partial scale-out at each profit tier. Skips silently when market is closed
+    or there are no open positions.
+    """
+    try:
+        clock = await clock_fetcher()
+    except Exception:  # noqa: BLE001
+        return  # silent fail — next tick will retry
+    if not clock.is_open:
+        return
+
+    try:
+        results = await run_trailing_stop_tick()
+    except Exception as e:  # noqa: BLE001
+        log.warning("trailing_stop_tick_failed", error=str(e))
+        return
+
+    for r in results:
+        if r.get("status") == "scaled_out":
+            tier = r.get("tier", 0)
+            sell_qty = r.get("sell_qty", 0)
+            pnl = r.get("partial_pnl_usd", "?")
+            await signal_poster(
+                f"💰 **Scaled out {sell_qty} contracts at +{tier:.0f}% tier** · "
+                f"partial P&L: ${pnl} · {r.get('remaining_qty', 0)} contracts remaining"
+            )
+        elif r.get("combined_text"):
+            await signal_poster(r["combined_text"])
+
+
 # ----------------- iron-condor strategist -----------------
 
 
@@ -622,6 +661,27 @@ def make_scheduler(
         id="directional_0dte_final_close",
         replace_existing=True,
         misfire_grace_time=120,
+    )
+
+    # Fast trailing stop tick — every 30 sec during RTH for 0DTE responsiveness.
+    # Lightweight: no indicators, no LLM. Just peak update, scale-out, hard stop.
+    scheduler.add_job(
+        _trailing_stop_tick_job,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            minute="*",
+            second="0,30",
+            timezone=PREMARKET_TZ,
+        ),
+        kwargs={
+            "signal_poster": signal_poster,
+            "log_poster": log_post,
+        },
+        id="trailing_stop_tick",
+        replace_existing=True,
+        misfire_grace_time=15,
+        max_instances=1,
     )
 
     if enable_iron_condor:

@@ -5,9 +5,13 @@ Runs every 5 min during RTH. For each open directional Trade row:
   1. Hard floor (mode-aware): exit immediately, no LLM.
        aggressive: −50% | selective: −30%
   2. Force close on expiry day at 15:30 ET (0DTE every day, weekly on Friday).
-  3. Trailing stop (ratcheting): once profit hits a tier, stop is raised to
-       lock in gains. Tiers: +30%→+10%, +50%→+25%, +75%→+40%, +100%→+60%.
-       Stop only ever moves UP. Persisted to DB — survives daemon restarts.
+  3. Trailing stop + scale-out: at each tier, ratchet stop AND sell a portion.
+       +15%→sell 25%, lock +3%   |  +30%→sell 25%, lock +10%
+       +50%→sell 25%, lock +25%  |  +75%→hold, lock +40%   |  +100%→lock +60%
+       Sell fractions sum to 75% — last 25% rides with the highest stop.
+       Stop only ever moves UP. Persisted to DB — survives restarts.
+       Fast 30-sec tick (run_trailing_stop_tick) handles peak/scale-out
+       between 5-min full sweeps for 0DTE responsiveness.
   4. Stop premium: hard stop set at entry (−50% aggressive / −30% selective).
   5. Indicator scan + LLM confirmation — two triggers:
        a. Any reversal rule fires (thesis protection, loss or gain)
@@ -56,17 +60,18 @@ HARD_FLOOR_PCT = Decimal("0.30")   # −30%: exit unconditionally, no LLM
 VOLUME_FADE_THRESHOLD = 0.7        # volume_ratio below this = momentum fading
 PROFIT_LOCK_PCT = 75.0             # always consult LLM above this P&L even with no indicator triggers
 
-# Trailing stop tiers: (profit_trigger_pct, lock_in_pct)
-# Once the position reaches trigger_pct gain, the stop is ratcheted up to
-# lock_in_pct gain. The stop only ever moves UP — never loosens.
-# Example: position hits +50% → stop moves up to entry × 1.25 (+25%).
-#          If price then falls to +24% → exits immediately, locking in gain.
-TRAILING_STOP_LEVELS: list[tuple[float, float]] = [
-    (100.0, 0.60),  # reached +100% → protect +60%
-    (75.0,  0.40),  # reached +75%  → protect +40%
-    (50.0,  0.25),  # reached +50%  → protect +25%
-    (30.0,  0.10),  # reached +30%  → protect +10%
-    (20.0,  0.05),  # reached +20%  → protect +5%
+# Trailing stop + scale-out tiers: (trigger_pct, lock_in_pct, sell_fraction)
+# Walked from highest to lowest. At each crossed tier:
+#   - Ratchet stop on REMAINING position to lock_in_pct
+#   - Sell sell_fraction of ORIGINAL qty to lock that portion in
+# Sell fractions add up to 75%; the final 25% is held with the highest ratcheted
+# stop so big winners still get to run.
+TRAILING_STOP_LEVELS: list[tuple[float, float, float]] = [
+    (100.0, 0.60, 0.00),  # +100% → lock +60%, no further sell (last 25% runs)
+    (75.0,  0.40, 0.00),  # +75%  → lock +40%, no further sell
+    (50.0,  0.25, 0.25),  # +50%  → lock +25% AND sell 25% of original
+    (30.0,  0.10, 0.25),  # +30%  → lock +10% AND sell 25% of original
+    (15.0,  0.03, 0.25),  # +15%  → lock +3%  AND sell 25% of original
 ]
 
 _EXIT_CONFIRM_PROMPT = """You manage an open options position. Decide EXIT or HOLD.
@@ -164,9 +169,9 @@ def _trailing_stop_premium(
 
     Walks TRAILING_STOP_LEVELS from highest to lowest and returns the first
     tier whose trigger has been reached. Returns None if peak is below the
-    lowest trigger (+30%).
+    lowest trigger (+15%).
     """
-    for trigger_pct, lock_pct in TRAILING_STOP_LEVELS:
+    for trigger_pct, lock_pct, _sell_frac in TRAILING_STOP_LEVELS:
         if peak_pnl_pct >= trigger_pct:
             return (entry_premium * (Decimal("1") + Decimal(str(lock_pct)))).quantize(
                 Decimal("0.0001")
@@ -222,7 +227,100 @@ def _maybe_ratchet_trailing_stop(
         row.extra = new_extra
         session.commit()
 
+    # Refresh in-memory trade so callers (scale-out) see the updated peak
+    trade.extra = new_extra
+
     return new_trail if stop_ratcheted else None
+
+
+async def _maybe_scale_out(
+    session_factory,
+    trade: Trade,
+    current_bid: Decimal,
+    submitter,
+    waiter,
+) -> dict | None:
+    """If peak P&L has crossed a new scale-out tier, partial-close that portion.
+
+    Walks TRAILING_STOP_LEVELS from lowest to highest. For each tier with a
+    non-zero sell_fraction not yet fired: sells sell_fraction × original_qty,
+    updates trade.qty and extra. Returns dict on successful partial close, else None.
+
+    Only fires once per tier per trade (tracked in extra.scale_out_tiers_fired).
+    """
+    extra = trade.extra or {}
+    peak = float(extra.get("peak_pnl_pct", 0.0))
+    fired = set(extra.get("scale_out_tiers_fired", []))
+    original_qty = int(extra.get("original_qty", int(trade.qty)))
+
+    # Find the lowest unfired tier the peak has crossed (process lowest first)
+    new_tier = None
+    for trigger, _lock, sell_frac in sorted(TRAILING_STOP_LEVELS, key=lambda t: t[0]):
+        if peak >= trigger and trigger not in fired and sell_frac > 0:
+            new_tier = (trigger, sell_frac)
+            break
+
+    if new_tier is None:
+        return None
+
+    trigger_pct, sell_frac = new_tier
+    sell_qty = max(1, int(original_qty * sell_frac))
+    remaining_qty = int(trade.qty)
+    sell_qty = min(sell_qty, remaining_qty)
+    if sell_qty <= 0:
+        return None
+
+    occ = extra.get("occ_symbol", trade.symbol)
+    try:
+        order = await submitter(qty=sell_qty, occ_symbol=occ, limit_price=current_bid)
+        final = await waiter(order.order_id, timeout_s=30.0)
+    except Exception as e:  # noqa: BLE001
+        log.warning("scale_out_failed", trade_id=trade.id, tier=trigger_pct, error=str(e))
+        return None
+
+    if final.status != "filled":
+        log.warning("scale_out_not_filled", trade_id=trade.id, tier=trigger_pct, status=final.status)
+        return None
+
+    exit_price = final.filled_avg_price if final.filled_avg_price is not None else current_bid
+    entry_p = Decimal(str(trade.entry_price))
+    partial_pnl = (exit_price - entry_p) * Decimal("100") * Decimal(sell_qty)
+
+    with session_factory() as session:
+        row = session.get(Trade, trade.id)
+        if row is None:
+            return None
+        new_extra = dict(row.extra or {})
+        new_extra.setdefault("original_qty", original_qty)
+        fired_list = list(new_extra.get("scale_out_tiers_fired", []))
+        fired_list.append(trigger_pct)
+        new_extra["scale_out_tiers_fired"] = fired_list
+        prior = Decimal(str(new_extra.get("partial_realized_pnl_usd", "0")))
+        new_extra["partial_realized_pnl_usd"] = str(prior + partial_pnl)
+        new_extra["last_partial_close_order_id"] = final.order_id
+        row.extra = new_extra
+        row.qty = Decimal(remaining_qty - sell_qty)
+        session.commit()
+        trade.qty = row.qty
+        trade.extra = new_extra
+
+    log.info(
+        "scale_out_executed",
+        trade_id=trade.id,
+        tier=trigger_pct,
+        sell_qty=sell_qty,
+        exit_price=str(exit_price),
+        partial_pnl_usd=str(partial_pnl),
+        remaining_qty=int(trade.qty),
+    )
+
+    return {
+        "tier": trigger_pct,
+        "sell_qty": sell_qty,
+        "exit_price": str(exit_price),
+        "partial_pnl_usd": str(partial_pnl),
+        "remaining_qty": int(trade.qty),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -496,11 +594,7 @@ async def run_directional_exit_monitor(
         current_bid = quote.bid
         pnl_pct = float((current_bid - entry_p) / entry_p * 100)
 
-        # ---- trailing stop ratchet ----
-        # Update the high-water mark and tighten stop_premium if a new profit
-        # tier has been reached. Runs every cycle — cheap (no LLM, one DB write
-        # only when the stop actually moves). Must happen before exit checks so
-        # the ratcheted stop is evaluated in the same cycle it was set.
+        # ---- trailing stop ratchet (peak update only — no order submission) ----
         ratcheted = _maybe_ratchet_trailing_stop(factory, trade, pnl_pct, entry_p)
 
         # ---- exit decision ----
@@ -540,6 +634,14 @@ async def run_directional_exit_monitor(
             )
 
         else:
+            # Scale-out first: partial-close a chunk if peak crossed a new tier.
+            # Only runs when force/hard_floor/stop checks did NOT fire.
+            partial = await _maybe_scale_out(factory, trade, current_bid, submitter, waiter)
+            if partial:
+                results.append({"trade_id": trade.id, "status": "scaled_out", **partial})
+                if int(trade.qty) <= 0:
+                    continue  # fully scaled out — nothing left for indicators
+
             # Fetch bars + indicators once — used for both reversal and profit checks.
             snap: dict = {}
             try:
@@ -706,6 +808,125 @@ async def run_directional_exit_monitor(
                     f"⚠️ Directional close failed — trade #{trade.id} · "
                     f"reason `{reason}` · order status `{final.status}`"
                 ),
+            })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Lightweight 30-second trailing-stop tick — for fast-moving 0DTE positions
+# ---------------------------------------------------------------------------
+
+
+async def run_trailing_stop_tick(
+    *,
+    session_factory: Callable[[], Session] | None = None,
+    quote_fetcher: Callable[..., object] = get_single_option_quote,
+    submitter: Callable[..., object] = alpaca_client.submit_single_option_sell,
+    waiter: Callable[..., object] = alpaca_client.wait_for_order,
+    fill_timeout_s: float = 30.0,
+) -> list[dict]:
+    """Fast trailing-stop sweep (no indicators, no LLM).
+
+    Runs every 30 seconds during RTH. For each open directional trade:
+      1. Fetch current option bid.
+      2. Update peak P&L and ratchet trailing stop if new tier reached.
+      3. Partial-close (scale out) if a scale-out tier was newly crossed.
+      4. Full exit if current bid <= stop_premium (trailing or hard stop).
+
+    Safe to run alongside the 5-min full exit monitor. The 5-min monitor still
+    handles thesis-reversal exits via indicators + LLM; this tick only handles
+    price-based stop hits and scaling out.
+    """
+    factory = session_factory or make_session_factory()
+    with factory() as session:
+        trades = _open_directional_trades(session)
+
+    results: list[dict] = []
+    if not trades:
+        return results
+
+    for trade in trades:
+        extra = trade.extra or {}
+        occ = extra.get("occ_symbol", trade.symbol)
+        entry_p = Decimal(str(trade.entry_price))
+
+        quote = await quote_fetcher(occ)
+        if quote is None or quote.bid <= 0:
+            continue
+        if quote.ask > quote.bid * 5 and quote.bid > 0:
+            continue  # corrupted quote — skip silently, next tick will retry
+
+        current_bid = quote.bid
+        pnl_pct = float((current_bid - entry_p) / entry_p * 100)
+
+        # 1. Update peak + ratchet stop on remainder
+        _maybe_ratchet_trailing_stop(factory, trade, pnl_pct, entry_p)
+
+        # 2. Scale out partial if a tier was newly crossed
+        partial = await _maybe_scale_out(factory, trade, current_bid, submitter, waiter)
+        if partial:
+            results.append({
+                "trade_id": trade.id,
+                "status": "scaled_out",
+                **partial,
+            })
+
+        # 3. Re-read fresh trade state (qty may have changed)
+        if int(trade.qty) <= 0:
+            continue  # fully exited via scale-out — shouldn't happen but safe
+
+        extra = trade.extra or {}
+        stop_p_raw = extra.get("stop_premium")
+        stop_p = Decimal(str(stop_p_raw)) if stop_p_raw else None
+        trade_mode = extra.get("mode", "selective")
+        hard_floor = Decimal("0.50") if trade_mode == "aggressive" else HARD_FLOOR_PCT
+
+        should_exit = False
+        reason = ""
+        if current_bid <= entry_p * (Decimal("1") - hard_floor):
+            should_exit, reason = True, "hard_floor_stop"
+        elif stop_p is not None and current_bid <= stop_p:
+            trailing_active = extra.get("trailing_stop_active", False)
+            reason = "trailing_stop" if trailing_active else "stop_premium"
+            should_exit = True
+
+        if not should_exit:
+            continue
+
+        # 4. Full exit of remaining qty
+        qty = int(trade.qty)
+        try:
+            order = await submitter(qty=qty, occ_symbol=occ, limit_price=current_bid)
+            final = await waiter(order.order_id, timeout_s=fill_timeout_s)
+        except Exception as e:  # noqa: BLE001
+            log.warning("tick_exit_submit_failed", trade_id=trade.id, error=str(e))
+            continue
+
+        if final.status == "filled":
+            exit_premium = final.filled_avg_price or current_bid
+            with factory() as session:
+                row = session.get(Trade, trade.id)
+                if row is not None:
+                    _close_trade_row(
+                        session, row,
+                        exit_premium=exit_premium,
+                        order=final,
+                        reason=reason,
+                    )
+            combined_text = _format_exit_combined(trade, exit_premium, reason, "")
+            log.info(
+                "tick_exit_terminal",
+                trade_id=trade.id,
+                reason=reason,
+                exit_price=str(exit_premium),
+            )
+            results.append({
+                "trade_id": trade.id,
+                "status": "closed",
+                "reason": reason,
+                "exit_premium": str(exit_premium),
+                "combined_text": combined_text,
             })
 
     return results
