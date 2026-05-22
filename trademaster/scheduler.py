@@ -436,17 +436,18 @@ async def _trailing_stop_tick_job(
     Lightweight version of the exit monitor that runs every 30 seconds during
     RTH. No indicators, no LLM. Just price-based trailing stop ratchet and
     partial scale-out at each profit tier. Skips silently when market is closed
-    or there are no open positions.
+    or there are no open positions. All network calls have hard timeouts to
+    prevent any single tick from hanging and blocking subsequent firings.
     """
     try:
-        clock = await clock_fetcher()
+        clock = await asyncio.wait_for(clock_fetcher(), timeout=5.0)
     except Exception:  # noqa: BLE001
-        return  # silent fail — next tick will retry
+        return  # silent fail (timeout or transient) — next tick will retry
     if not clock.is_open:
         return
 
     try:
-        results = await run_trailing_stop_tick()
+        results = await asyncio.wait_for(run_trailing_stop_tick(), timeout=20.0)
     except Exception as e:  # noqa: BLE001
         log.warning("trailing_stop_tick_failed", error=str(e))
         return
@@ -681,7 +682,8 @@ def make_scheduler(
         id="trailing_stop_tick",
         replace_existing=True,
         misfire_grace_time=15,
-        max_instances=1,
+        max_instances=2,  # tolerate a slow tick without blocking the next
+        coalesce=True,    # collapse missed firings on restart
     )
 
     if enable_iron_condor:
