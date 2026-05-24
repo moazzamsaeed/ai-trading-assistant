@@ -53,6 +53,15 @@ _RESEARCH_POST_INTERVAL_SECONDS = 3600
 _last_trade_open: dict[str, datetime] = {}
 _TICKER_COOLDOWN_SECONDS = 900
 
+# Per-(ticker, action) 30-min cooldown: blocks same-side re-entry (e.g.,
+# BUY_CALL → BUY_CALL on SPY within 30 min). Allows the per-ticker cooldown
+# to still permit a direction flip (BUY_CALL → BUY_PUT) if regime changes.
+# Added after week 2026-W21 review surfaced trades #38/#39 — back-to-back
+# BUY_CALLs on the same SPY 0DTE contract 16 min apart; #38 won +$232, #39
+# lost −$1,215 doubling down on the same setup.
+_last_trade_open_by_action: dict[tuple[str, str], datetime] = {}
+_SAME_ACTION_COOLDOWN_SECONDS = 1800
+
 # Per-(ticker, action) signal dedup: suppress Discord #signals spam when the
 # same BUY_CALL/BUY_PUT fires repeatedly within 30 minutes.
 _last_signal_posted: dict[tuple[str, str], datetime] = {}
@@ -293,7 +302,7 @@ async def _directional_scan_job(
         key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
     )[:3]
 
-    global _last_trade_open, _last_signal_posted
+    global _last_trade_open, _last_trade_open_by_action, _last_signal_posted
 
     for decision in to_execute:
         # Tiered conviction cap: MEDIUM signals are limited to max_medium_trades_per_day.
@@ -309,7 +318,7 @@ async def _directional_scan_job(
                 )
                 continue
 
-        # 60-min per-ticker cooldown
+        # 15-min per-ticker cooldown
         last_open = _last_trade_open.get(decision.ticker)
         now_ts = datetime.now(UTC)
         if last_open and (now_ts - last_open).total_seconds() < _TICKER_COOLDOWN_SECONDS:
@@ -317,6 +326,23 @@ async def _directional_scan_job(
                 "directional_execute_skipped_ticker_cooldown",
                 ticker=decision.ticker,
                 minutes_since_last=int((now_ts - last_open).total_seconds() / 60),
+            )
+            continue
+
+        # 30-min per-(ticker, action) cooldown — blocks same-side re-entry
+        # (e.g., two consecutive BUY_CALLs on SPY). Direction flips still go
+        # through under the per-ticker cooldown alone.
+        action_key = (decision.ticker, decision.action)
+        last_action_open = _last_trade_open_by_action.get(action_key)
+        if (
+            last_action_open
+            and (now_ts - last_action_open).total_seconds() < _SAME_ACTION_COOLDOWN_SECONDS
+        ):
+            log.info(
+                "directional_execute_skipped_same_action_cooldown",
+                ticker=decision.ticker,
+                action=decision.action,
+                minutes_since_last=int((now_ts - last_action_open).total_seconds() / 60),
             )
             continue
 
@@ -338,6 +364,7 @@ async def _directional_scan_job(
             result = await execute_directional_signal(decision, mode=mode, capital_usd=available)
             if result.executed and result.trade_id is not None:
                 _last_trade_open[decision.ticker] = datetime.now(UTC)
+                _last_trade_open_by_action[action_key] = datetime.now(UTC)
                 entry_premium = result.entry_premium or Decimal("0")
                 total_cost = (entry_premium * 100 * result.qty).quantize(Decimal("0.01"))
                 combined = format_entry_combined(

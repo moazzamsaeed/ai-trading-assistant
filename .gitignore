@@ -50,8 +50,9 @@ out/
 .pnp.*
 
 # Databases and data (watchlist.json is tracked — see exception below)
-data/
+data/*
 !data/watchlist.json
+!data/strategy_kb.md
 *.db
 *.sqlite
 *.sqlite3

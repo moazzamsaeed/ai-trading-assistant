@@ -131,6 +131,9 @@ def _persist_entry(
             "original_qty": qty,
             "profit_target_premium": str(profit_target_premium),
             "stop_premium": str(stop_premium),
+            # Initialized at 0 so losing trades (which never positively peak)
+            # are distinguishable from trades where the trailing tick never ran.
+            "peak_pnl_pct": 0.0,
             "entry_reasoning": entry_reasoning[:300],
             "fill_status": order.status,
             "filled_avg_price": (
