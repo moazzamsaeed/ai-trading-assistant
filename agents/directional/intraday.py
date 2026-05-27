@@ -570,6 +570,12 @@ def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> st
     return "\n".join(lines)
 
 
+_MIN_VOLUME_RATIO = 1.3
+"""Production volume threshold. Kept in sync with the LLM prompt at line 120
+(and the SKILL.md docs). The LLM is the actual entry gate — this constant only
+governs the `criteria_met` counter in the near_misses table."""
+
+
 def _log_near_misses(
     hold_decisions: list[TickerDecision],
     *,
@@ -577,10 +583,18 @@ def _log_near_misses(
     spy_regime: str,
     session_factory,
 ) -> None:
-    """Persist near-miss rows for HOLDs that would fire at relaxed 1.0× volume.
+    """Persist near-miss rows for HOLDs that met ≥3 of the 4 production criteria.
 
-    Bullish near-miss: price>VWAP + RSI 45-70 + EMA20>EMA50 + vol>=1.0 → ≥3 criteria.
-    Bearish near-miss: price<VWAP + RSI 30-55 + EMA20<EMA50 + vol>=1.0 → ≥3 criteria.
+    criteria_met counts against PRODUCTION thresholds (vol>=1.3), so it lines up
+    with what the LLM gate sees. A near-miss is logged when the count is ≥3,
+    which still captures the common volume-only-miss case (vol<1.3 but other 3
+    criteria align).
+
+    Bullish: price>VWAP + RSI 45-72 + EMA20>EMA50 + vol>=1.3
+    Bearish: price<VWAP + RSI 28-55 + EMA20<EMA50 + vol>=1.3
+
+    NOTE: Records logged before 2026-05-27 used relaxed vol>=1.0 — older
+    criteria_met values overstate by 1 in the volume-only-miss case.
     """
     rows: list[NearMiss] = []
     for d in hold_decisions:
@@ -598,10 +612,10 @@ def _log_near_misses(
         above_vwap = price > vwap
         ema_bull = ema20 > ema50 > 0
         ema_bear = 0 < ema20 < ema50
-        vol_relaxed = vr >= 1.0
+        vol_meets_threshold = vr >= _MIN_VOLUME_RATIO
 
-        bullish = sum([above_vwap, 45 <= rsi <= 72, ema_bull, vol_relaxed])
-        bearish = sum([not above_vwap, 28 <= rsi <= 55, ema_bear, vol_relaxed])
+        bullish = sum([above_vwap, 45 <= rsi <= 72, ema_bull, vol_meets_threshold])
+        bearish = sum([not above_vwap, 28 <= rsi <= 55, ema_bear, vol_meets_threshold])
 
         if bullish >= 3:
             criteria_met, would_be, ema_flag = bullish, "BUY_CALL", ema_bull
