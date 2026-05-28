@@ -15,9 +15,11 @@ Indicator choices informed by expert research on intraday 5-min options trading:
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 
 from integrations.alpaca_client import Bar
+from trademaster.timeutils import to_et
 
 
 def _typical(b: Bar) -> Decimal:
@@ -200,11 +202,27 @@ def volume_ratio(bars: list[Bar], lookback: int = 20) -> Decimal | None:
 # ----------------- bundle -----------------
 
 
-def snapshot(bars: list[Bar]) -> dict:
+def snapshot(
+    bars: list[Bar],
+    *,
+    session_start_et: datetime | None = None,
+) -> dict:
     """Compute every indicator for the given bar sequence.
 
     Returns a dict of plain types (Decimal/None) ready to be serialized
     into the LLM prompt.
+
+    `bars` may include prior-session warmup bars so trend indicators (EMA,
+    RSI, volume_ratio) have valid values at today's market open. Pass
+    `session_start_et` so VWAP is scoped to today's bars only — VWAP across
+    sessions is mathematically wrong (institutional algos benchmark against
+    same-session VWAP). Other indicators (EMA, RSI, MACD, ATR, vol_ratio_20)
+    use the full bar history; combining sessions is fine for rolling smoothers
+    and means today's first 5-min bar already has valid trend context.
+
+    `session_start_et` should be today's RTH open in ET (e.g.,
+    `datetime.now(ET).replace(hour=9, minute=30, second=0, microsecond=0)`).
+    If omitted, VWAP uses all supplied bars (preserves pre-warmup behavior).
 
     RSI uses period 9 (not 14) — the professional choice for 5-minute intraday bars.
     RSI-14 looks back 70 minutes; RSI-9 covers 45 minutes and captures momentum shifts
@@ -214,10 +232,15 @@ def snapshot(bars: list[Bar]) -> dict:
         return {"bars": 0}
     last = bars[-1]
 
+    if session_start_et is not None:
+        vwap_bars = [b for b in bars if to_et(b.timestamp) >= session_start_et]
+    else:
+        vwap_bars = bars
+
     rsi_val = rsi(bars, 9)
     atr_val = atr(bars, 10)
     macd_val, macd_sig = macd(bars, fast=6, slow=13, signal=4)
-    vwap_val = vwap(bars)
+    vwap_val = vwap(vwap_bars)
     ema20_val = ema(bars, 20)
     ema50_val = ema(bars, 50)
     vol_ratio_val = volume_ratio(bars, 20)

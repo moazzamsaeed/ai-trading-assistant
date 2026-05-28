@@ -384,18 +384,24 @@ async def _build_market_context(
     - 15-min SPY trend bias — multi-timeframe confirmation
     - ATR-based volatility regime — skip if market too flat or too wild
     """
+    now_et = to_et(datetime.now(UTC))
+    session_open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     try:
-        spy_bars = await bars_fetcher("SPY", timeframe_minutes=5, limit=60)
-        spy_snap = indicators.snapshot(spy_bars)
+        # warmup_days=1 → indicators (EMA50, vol_ratio_20) valid at 9:30 open.
+        # session_start_et keeps VWAP scoped to today only.
+        spy_bars = await bars_fetcher("SPY", timeframe_minutes=5, limit=60, warmup_days=1)
+        spy_snap = indicators.snapshot(spy_bars, session_start_et=session_open_et)
         spy_price = float(spy_snap.get("last_close") or 0)
         spy_vwap = float(spy_snap.get("vwap") or spy_price)
-        spy_open = float(spy_bars[0].open) if spy_bars else spy_price
+        # Today-only slice for session-anchored references (open, ORB).
+        today_spy_bars = [b for b in spy_bars if to_et(b.timestamp) >= session_open_et]
+        spy_open = float(today_spy_bars[0].open) if today_spy_bars else spy_price
         spy_pct = (spy_price - spy_open) / spy_open * 100 if spy_open else 0.0
         spy_atr = float(spy_snap.get("atr10") or 0)
 
-        # Opening Range: first 5-min bar's high/low (9:30-9:35 ET)
-        orb_high = float(spy_bars[0].high) if spy_bars else 0.0
-        orb_low = float(spy_bars[0].low) if spy_bars else 0.0
+        # Opening Range: first 5-min bar's high/low (9:30-9:35 ET) — today only.
+        orb_high = float(today_spy_bars[0].high) if today_spy_bars else 0.0
+        orb_low = float(today_spy_bars[0].low) if today_spy_bars else 0.0
 
         # Volatility regime from ATR as % of price
         atr_pct = (spy_atr / spy_price * 100) if spy_price else 0.0
@@ -424,9 +430,9 @@ async def _build_market_context(
     # 15-min SPY bias — multi-timeframe trend confirmation
     spy_15min_bias = "NEUTRAL"
     try:
-        spy_15 = await bars_fetcher("SPY", timeframe_minutes=15, limit=20)
+        spy_15 = await bars_fetcher("SPY", timeframe_minutes=15, limit=20, warmup_days=1)
         if spy_15:
-            snap15 = indicators.snapshot(spy_15)
+            snap15 = indicators.snapshot(spy_15, session_start_et=session_open_et)
             p15 = float(snap15.get("last_close") or 0)
             v15 = float(snap15.get("vwap") or p15)
             e20_15 = float(snap15.get("ema20") or 0)
@@ -443,10 +449,11 @@ async def _build_market_context(
         if t == "SPY":
             continue
         try:
-            bars = await bars_fetcher(t, timeframe_minutes=5, limit=60)
-            snap = indicators.snapshot(bars)
+            bars = await bars_fetcher(t, timeframe_minutes=5, limit=60, warmup_days=1)
+            snap = indicators.snapshot(bars, session_start_et=session_open_et)
             t_price = float(snap.get("last_close") or 0)
-            t_open = float(bars[0].open) if bars else t_price
+            today_bars = [b for b in bars if to_et(b.timestamp) >= session_open_et]
+            t_open = float(today_bars[0].open) if today_bars else t_price
             t_pct = (t_price - t_open) / t_open * 100 if t_open else 0.0
             t_vwap = float(snap.get("vwap") or t_price)
             above = t_price > t_vwap
@@ -709,20 +716,37 @@ async def run_directional_scan(
 
     # Per-ticker context (bars + news + indicators) — gather in parallel-ish.
     # Also retain snaps for post-LLM near-miss analysis.
+    # warmup_days=1 → EMA50 + volume_ratio_20 valid at today's 9:30 open.
+    # session_open_et anchors VWAP to today's bars only inside snapshot().
+    session_open_et = to_et(now).replace(hour=9, minute=30, second=0, microsecond=0)
     ticker_blocks: list[str] = []
     no_bar_tickers: set[str] = set()
+    no_indicators_tickers: set[str] = set()
     ticker_snaps: dict[str, dict] = {}
     for t in tickers:
         try:
             bars: list[Bar] = await bars_fetcher(
-                t, timeframe_minutes=BARS_TIMEFRAME_MIN, limit=BARS_LIMIT
+                t, timeframe_minutes=BARS_TIMEFRAME_MIN, limit=BARS_LIMIT, warmup_days=1
             )
         except Exception as e:  # noqa: BLE001
             log.warning("directional_bars_failed", ticker=t, error=str(e))
             bars = []
-        snap = indicators.snapshot(bars)
+        snap = indicators.snapshot(bars, session_start_et=session_open_et)
         if not bars:
             no_bar_tickers.add(t)
+        elif snap.get("ema50") is None or snap.get("volume_ratio_20") is None:
+            # Fix B: indicators required for entry are not bootstrapped. With
+            # warmup_days=1 this should only happen on the first ~5 minutes of
+            # a session after a multi-day market closure, but log+block either
+            # way so a None never silently becomes 0 in downstream criteria.
+            no_indicators_tickers.add(t)
+            log.warning(
+                "directional_indicators_unbootstrapped",
+                ticker=t,
+                bars=snap.get("bars"),
+                ema50=snap.get("ema50"),
+                volume_ratio_20=snap.get("volume_ratio_20"),
+            )
         try:
             news_articles: list[NewsArticle] = await news_fetcher(
                 (t,),
@@ -739,6 +763,8 @@ async def run_directional_scan(
         block = _format_ticker_block(t, snap, headlines, t_perf)
         if not bars:
             block += "\n⚠️ NO BAR DATA — MUST HOLD (cannot evaluate indicators)"
+        elif t in no_indicators_tickers:
+            block += "\n⚠️ INDICATORS NOT BOOTSTRAPPED (ema50 or vol_ratio_20 is null) — MUST HOLD"
         ticker_blocks.append(block)
         ticker_snaps[t] = snap
 
@@ -762,21 +788,28 @@ async def run_directional_scan(
     )
     decisions = _parse_decisions(response.text, tickers)
 
-    # Hard-override: any BUY on a ticker with no bar data becomes HOLD.
-    # This prevents hallucinated "RSI looks bullish" from slipping through
-    # when the bars feed was unavailable.
-    if no_bar_tickers:
+    # Hard-override: any BUY on a ticker with no bar data OR no bootstrapped
+    # indicators becomes HOLD. Prevents (a) hallucinated "RSI looks bullish"
+    # when bars are missing, and (b) silent-failure entries on the first
+    # 1–4 hours of every session where ema50/volume_ratio_20 default to None.
+    blocked = no_bar_tickers | no_indicators_tickers
+    if blocked:
         overridden = []
         for d in decisions:
-            if d.ticker in no_bar_tickers and d.action != "HOLD":
+            if d.ticker in blocked and d.action != "HOLD":
+                reason = (
+                    "no_bar_data" if d.ticker in no_bar_tickers
+                    else "indicators_unbootstrapped"
+                )
                 log.warning(
-                    "directional_decision_overridden_no_bars",
+                    "directional_decision_overridden",
                     ticker=d.ticker,
                     original_action=d.action,
+                    reason=reason,
                 )
                 overridden.append(
                     TickerDecision(d.ticker, "HOLD", None, None, "LOW",
-                                   "no_bar_data — overridden to HOLD")
+                                   f"{reason} — overridden to HOLD")
                 )
             else:
                 overridden.append(d)
@@ -787,11 +820,12 @@ async def run_directional_scan(
     else:  # aggressive
         actionable = [d for d in decisions if d.action != "HOLD" and d.conviction in ("MEDIUM", "HIGH")]
 
-    # Near-miss logging: for every HOLD, check if it would have triggered
-    # BUY at a relaxed 1.0× volume threshold. Persisted for post-hoc analysis
-    # so we can calibrate the 1.3× volume filter over time.
+    # Near-miss logging: for every HOLD with valid bars + bootstrapped
+    # indicators, check criteria against PRODUCTION thresholds (vol≥1.3).
+    # Skips tickers with missing bars or null indicators — those can't
+    # meaningfully be near-misses, and including them would produce noise.
     _log_near_misses(
-        [d for d in decisions if d.action == "HOLD" and d.ticker not in no_bar_tickers],
+        [d for d in decisions if d.action == "HOLD" and d.ticker not in blocked],
         ticker_snaps=ticker_snaps,
         spy_regime=market_ctx.get("spy_regime", "NEUTRAL"),
         session_factory=factory,

@@ -826,27 +826,41 @@ async def get_recent_bars(
     *,
     timeframe_minutes: int = 5,
     limit: int = 30,
+    warmup_days: int = 0,
 ) -> list[Bar]:
     """Fetch the last `limit` bars at `timeframe_minutes` granularity.
 
-    Returns oldest-first. Always anchors to today's RTH open (9:30 AM ET) so
+    Returns oldest-first.
+
+    By default (warmup_days=0), anchors to today's RTH open (9:30 AM ET) so
     the intraday agent sees real-time price action, not stale pre-market bars.
     Without an explicit start, Alpaca returns extended-hours bars from ~4 AM
     which causes the agent to miss the entire RTH session.
+
+    With warmup_days>0, the fetch spans warmup_days+2 calendar days back so
+    trend indicators that need long lookback (EMA50, volume_ratio_20) have
+    valid values at today's market open instead of None for the first 1–4
+    hours of the session. IEX feed returns only RTH bars, so cross-day spans
+    don't mix RTH with extended hours. VWAP must still be session-anchored
+    by the caller (see indicators.snapshot session_start_et parameter).
     """
     def _fetch() -> list[Bar]:
         tf = TimeFrame(timeframe_minutes, TimeFrameUnit.Minute)
-
-        # Anchor to today's RTH open so we always get intraday bars.
-        # If called before RTH (pre-market), fall back to 4 AM to get some context.
         now_et = to_et(datetime.now(UTC))
         rth_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-        start = rth_open if now_et >= rth_open else now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+
+        if warmup_days > 0:
+            # +2 days covers weekends/holidays; tail in Python to `limit`.
+            start = now_et - timedelta(days=warmup_days + 2)
+            req_limit = max(limit, 250)
+        else:
+            start = rth_open if now_et >= rth_open else now_et.replace(hour=4, minute=0, second=0, microsecond=0)
+            req_limit = limit
 
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
-            limit=limit,
+            limit=req_limit,
             start=start,
             feed=DataFeed.IEX,
         )
@@ -859,6 +873,6 @@ async def get_recent_bars(
         else:
             raw_bars = []
         bars = [_to_bar(b) for b in raw_bars]
-        return bars
+        return bars[-limit:]
 
     return await asyncio.to_thread(_fetch)

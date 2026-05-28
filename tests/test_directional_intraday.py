@@ -38,7 +38,10 @@ def _bar(t: datetime, close: float, vol: int = 1000) -> Bar:
     )
 
 
-def _bars(n: int = 30, start: float = 100.0) -> list[Bar]:
+def _bars(n: int = 60, start: float = 100.0) -> list[Bar]:
+    """Default n=60 so EMA50 + volume_ratio_20 are both populated. Tests of
+    happy-path entry decisions need bootstrapped indicators since the
+    directional scan blocks entries when ema50/volume_ratio_20 are None."""
     t = datetime(2026, 5, 11, 14, 0, tzinfo=UTC)
     return [_bar(t + timedelta(minutes=i * 5), start + i * 0.1) for i in range(n)]
 
@@ -49,7 +52,7 @@ def _vix_bars(level: float = 18.0, n: int = 5) -> list[Bar]:
     return [_bar(t + timedelta(minutes=i * 5), level) for i in range(n)]
 
 
-async def _fake_bars_with_vix(t: str, *, timeframe_minutes: int, limit: int) -> list[Bar]:
+async def _fake_bars_with_vix(t: str, *, timeframe_minutes: int, limit: int, warmup_days: int = 0) -> list[Bar]:
     """Bars fetcher that returns VIX=18 for 'VIX' and normal bars for everything else."""
     if t == "VIX":
         return _vix_bars()
@@ -182,7 +185,7 @@ def test_format_signal_aggressive_mode():
 
 
 async def test_scan_actionable_returns_messages(monkeypatch, session_factory):
-    async def fake_bars(t, *, timeframe_minutes, limit):
+    async def fake_bars(t, *, timeframe_minutes, limit, warmup_days=0):
         return _bars()
 
     async def fake_news(symbols, *, hours_back, limit):
@@ -231,7 +234,7 @@ async def test_scan_actionable_returns_messages(monkeypatch, session_factory):
 
 
 async def test_scan_all_hold_returns_no_messages(monkeypatch, session_factory):
-    async def fake_bars(t, *, timeframe_minutes, limit):
+    async def fake_bars(t, *, timeframe_minutes, limit, warmup_days=0):
         return _bars()
 
     async def fake_news(*_a, **_k):
@@ -259,7 +262,7 @@ async def test_scan_all_hold_returns_no_messages(monkeypatch, session_factory):
 
 async def test_scan_handles_bars_fetch_failure(monkeypatch, session_factory):
     """One ticker fails to fetch bars; agent continues with empty data."""
-    async def fake_bars(t, *, timeframe_minutes, limit):
+    async def fake_bars(t, *, timeframe_minutes, limit, warmup_days=0):
         if t == "BROKEN":
             raise RuntimeError("alpaca 500")
         return _bars()
@@ -300,7 +303,7 @@ async def test_scan_empty_watchlist_returns_empty():
 async def test_scan_aggressive_passes_medium_and_high_conviction(monkeypatch, session_factory):
     """Bug 2 regression: aggressive mode must pass MEDIUM + HIGH, block LOW."""
 
-    async def fake_bars(t, *, timeframe_minutes, limit):
+    async def fake_bars(t, *, timeframe_minutes, limit, warmup_days=0):
         return _bars()
 
     async def fake_news(*_a, **_k):
@@ -335,7 +338,7 @@ async def test_scan_aggressive_passes_medium_and_high_conviction(monkeypatch, se
 async def test_scan_selective_blocks_medium_conviction(monkeypatch, session_factory):
     """Bug 2 regression: selective mode must only pass HIGH conviction signals."""
 
-    async def fake_bars(t, *, timeframe_minutes, limit):
+    async def fake_bars(t, *, timeframe_minutes, limit, warmup_days=0):
         return _bars()
 
     async def fake_news(*_a, **_k):
@@ -363,7 +366,7 @@ async def test_scan_selective_blocks_medium_conviction(monkeypatch, session_fact
 async def test_scan_selective_passes_high_conviction(monkeypatch, session_factory):
     """Selective mode executes HIGH conviction signals with tighter exit targets."""
 
-    async def fake_bars(t, *, timeframe_minutes, limit):
+    async def fake_bars(t, *, timeframe_minutes, limit, warmup_days=0):
         return _bars()
 
     async def fake_news(*_a, **_k):
