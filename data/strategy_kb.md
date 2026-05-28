@@ -52,8 +52,9 @@
 
 **H4. Standard intraday indicators (VWAP/RSI/EMA/MACD) lack edge**
 - Origin: 21% win rate across 33+ trades with this indicator set.
-- Evidence: already strong (n=33+) — borderline confirmed.
-- Disproves if: SPY-only win rate jumps to ≥45% under same indicator set.
+- Evidence: **CONTAMINATED by I7 (indicator bootstrap silent failure).** The 33+ pre-fix trades were taken with `ema50` and `volume_ratio_20` returning None → 0 for the first 1.5–4 hours of every session. The "indicator stack" wasn't actually evaluable during that window — entries mostly fired late in the day when indicators had bootstrapped, which itself selects for trend-exhaustion setups. The 21% win rate reflects a broken pipeline, not the indicators themselves.
+- **Reset the sample.** Treat H4 as un-tested post-2026-05-28. Need ≥30 trades under properly-bootstrapped indicators (including morning sessions) before any verdict.
+- Disproves if: post-fix SPY-only win rate jumps to ≥45% on n≥30. If it stays ≤30% on n≥30 fresh trades, H4 confirmed for real.
 
 **H5. MEDIUM conviction 0DTE on SPY is acceptable (vs blocked for stocks)**
 - Origin: failure mode #4 — MEDIUM block was correct for illiquid stocks; assumed not needed for SPY.
@@ -107,6 +108,18 @@
 - Investigation: not a concurrent-cap-bypass (#38 had closed before #39 opened). Actual failure mode = **same-side re-entry on identical OCC contract just past the 15-min per-ticker cooldown**. Per-(ticker, action) cooldown of 30 min added 2026-05-23 to prevent.
 - **Watch: any back-to-back BUY_CALL or back-to-back BUY_PUT on the same ticker within 30 min should now be blocked at the scheduler.**
 
+**I7. Missed SPY breakout — indicators unbootstrapped (2026-05-28)**
+- SPY 750.23 → 754.84 (+0.61% intraday). Clean breakout bar at 10:10 ET (low 750.13 → high 753.99 in single 5-min bar, 38k vol = 1.7× average).
+- System DID see it: `volume_surge_2.7x` stream trigger fired 10:13 ET, LLM scanned 4 times in 2 min (10:13, 10:14, 10:15, 10:15). All returned HOLD. Zero near-misses logged.
+- Root cause: `ema(bars, 50)` returns None until 50 bars accumulate (≥ 13:35 ET from a 09:30 open at 5-min). `volume_ratio(bars, 20)` returns None until 20 bars (≥ 11:10 ET). In `_log_near_misses`, `float(snap.get("ema50") or 0)` converted None → 0, then `ema_bull = ema20 > ema50 > 0` evaluated False permanently. Max possible criteria_met = 2/4 during the breakout window → below the ≥3 near-miss logging threshold → zero audit trail of what the LLM saw.
+- **This is a STRUCTURAL flaw: every trading day's first 1.5–4 hours were effectively un-tradable.** Explains why every W21 winning trade opened after 13:00 ET — only window where indicators had bootstrapped.
+- **Fix shipped 2026-05-28** (commit `9c7d621`):
+  - `get_recent_bars(warmup_days=1)` spans back 1+2 calendar days; IEX feed returns only RTH bars → cross-day fetches don't mix extended hours.
+  - `indicators.snapshot(session_start_et=...)` keeps VWAP session-anchored; EMA/RSI/MACD/vol_ratio use the full bar history.
+  - ORB and today's open continue to use a today-only slice (`[b for b in bars if to_et(b.timestamp) >= session_open_et]`).
+  - **Fix B guard**: if `snap["ema50"] is None or snap["volume_ratio_20"] is None`, ticker is added to `no_indicators_tickers`, prompt warns "INDICATORS NOT BOOTSTRAPPED — MUST HOLD", any non-HOLD decision hard-overridden to HOLD with `reason=indicators_unbootstrapped`. None can no longer silently become 0 in the criteria gate.
+- **Watch:** if `directional_indicators_unbootstrapped` log line appears after market open Mon-Fri, prior-day bar fetch failed — escalate.
+
 **I6. First weekly review validated the loop (2026-05-23)**
 - Week 1 of the strategy KB + weekly review skill (review at `data/reviews/2026-W21.md`).
 - Surfaced 2 real code bugs that were invisible without the structured review:
@@ -140,6 +153,8 @@
 - **`get_recent_bars` anchored to RTH open** (2026-05-13, 5856363) — Without `start` param, Alpaca returned pre-market bars → directional agent blind to intraday action.
 - **BARS_LIMIT 30 → 60** (2026-05-12, dc62f5b) — EMA50 needed more history than was being fetched.
 - **RSI key mismatch** (2026-05-14, 416a916) — Indicator field renamed but exit monitor still read old key, thresholds applied to wrong value.
+- **Indicators unbootstrapped — first 1.5–4 hours of every session** (2026-05-28, 9c7d621) — `ema50` returned None until 50 5-min bars accumulated (~13:35 ET); `volume_ratio_20` returned None until 20 bars (~11:10 ET). `_log_near_misses` converted None→0 via `float(snap.get("ema50") or 0)`, capping max criteria_met at 2/4 during morning sessions. Fixed by adding `warmup_days=1` to `get_recent_bars` + session-anchored VWAP in `indicators.snapshot` + hard-block guard `no_indicators_tickers` when either field is None at scan time. See incident I7.
+- **criteria_met counter against relaxed vs production threshold** (2026-05-27, f2783af) — `_log_near_misses` computed criteria_met using `vol_relaxed = vr >= 1.0`, overstating by 1 for HOLDs with vol in [1.0, 1.3). Now uses production `vol_meets_threshold = vr >= 1.3` so criteria_met=4 genuinely means "all 4 met". Historical records pre-fix overstate by 1 in the vol-only-miss case.
 
 ### Order execution — Alpaca SDK quirks
 *Audit any new alpaca-py call against these.*
@@ -217,3 +232,5 @@
 - **2026-05-23** — Seeded from `project_lessons_learned.md` + `project_current_focus.md` + 90-commit history. Includes engineering evolution log so Hermes has full institutional context, not just last 2 weeks of failures.
 - **2026-05-23** — Applied 3 KB edits proposed by weekly review `data/reviews/2026-W21.md`: added incident I5 (trade #39, $1,215 loss, split-entry watch); added two open questions (split-entry cap bypass; peak data completeness).
 - **2026-05-23** — Investigated all 3 code-side findings from the W21 review. Fixed Bug A (per-(ticker, action) 30-min cooldown in `trademaster/scheduler.py`) and Bug B (`peak_pnl_pct: 0.0` initialized at entry in `agents/directional/executor.py::_persist_entry`). Third finding (`UNKNOWN` conviction) was historical artifact, no fix needed. Added incident I6 documenting the loop validation. Updated I5 with revised root cause. 450 tests pass.
+- **2026-05-27** — Fixed `near_misses.criteria_met` counter bug (commit `f2783af`): was computing against relaxed `vol >= 1.0`, now uses production `vol >= 1.3`. Surfaced by the daily analysis when two 4/4 records had LLM reasoning that said 3/4 or 2/4. Daemon restarted 14:54 CDT same day.
+- **2026-05-28** — Fixed indicator bootstrap silent failure (commit `9c7d621`, incident I7): added `warmup_days=1` to `get_recent_bars`, session-anchored VWAP via `session_start_et` in `indicators.snapshot`, hard-block guard for null `ema50`/`volume_ratio_20`. Daemon restarted 17:24 CDT. Root cause discovered investigating "why we missed the SPY up-run today": system saw the breakout in real time but the criteria gate couldn't evaluate it because indicators were structurally unavailable in the first 1.5–4 hours of every session.
