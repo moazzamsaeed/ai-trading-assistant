@@ -117,10 +117,10 @@ STEP 2 — INDICATOR CONFLUENCE:
 
   ── STANDARD SESSION (after 11:30 ET, EMA50 fully established) ──
   BULLISH — requires ALL of:
-    price > VWAP  AND  RSI9 between 45–72  AND  EMA20 > EMA50  AND  volume_ratio > 1.3
+    price > VWAP  AND  RSI9 between 45–72  AND  EMA20 > EMA50  AND  volume_ratio > 1.0
 
   BEARISH — requires ALL of:
-    price < VWAP  AND  RSI9 between 28–55  AND  EMA20 < EMA50  AND  volume_ratio > 1.3
+    price < VWAP  AND  RSI9 between 28–55  AND  EMA20 < EMA50  AND  volume_ratio > 1.0
 
   Conviction: HIGH = all 4 criteria + MACD aligned. MEDIUM = 3 of 4. LOW = 2 or fewer → HOLD.
 
@@ -128,8 +128,8 @@ STEP 2 — INDICATOR CONFLUENCE:
   EMA50 needs 250 min of data — before 11:30 ET it may be null or unreliable.
   If ema50 is null or time < 11:30 ET, DROP EMA50 from the required set and score on 3 factors:
 
-  BULLISH (early): price > VWAP  AND  RSI9 between 45–72  AND  volume_ratio > 1.3
-  BEARISH (early): price < VWAP  AND  RSI9 between 28–55  AND  volume_ratio > 1.3
+  BULLISH (early): price > VWAP  AND  RSI9 between 45–72  AND  volume_ratio > 1.0
+  BEARISH (early): price < VWAP  AND  RSI9 between 28–55  AND  volume_ratio > 1.0
 
   Early conviction: HIGH = all 3 criteria + MACD aligned. MEDIUM = 2 of 3. LOW = 1 or fewer → HOLD.
 
@@ -577,10 +577,15 @@ def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> st
     return "\n".join(lines)
 
 
-_MIN_VOLUME_RATIO = 1.3
-"""Production volume threshold. Kept in sync with the LLM prompt at line 120
-(and the SKILL.md docs). The LLM is the actual entry gate — this constant only
-governs the `criteria_met` counter in the near_misses table."""
+_MIN_VOLUME_RATIO = 1.0
+"""TEMPORARY (2026-05-29) — lowered from 1.3 → 1.0 to validate the end-to-end
+trading pipeline. After 5 trading days with 0 trades, the 1.3 threshold has
+been the bottleneck on SPY (sustained ≥1.3x volume on 5-min bars is rare for
+an index ETF). LLM prompt at lines 120/123/131/132 also lowered to 1.0.
+
+REVERT before Monday open 2026-06-01 if no validation completes today, or
+keep at the empirically-validated level if at least one trade fires cleanly.
+Tracked in KB change log entry 2026-05-29."""
 
 
 def _log_near_misses(
