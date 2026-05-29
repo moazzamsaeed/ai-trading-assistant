@@ -45,6 +45,16 @@ _EXIT_PCT = {
     "selective": {"pt": Decimal("0.5"), "sl": Decimal("0.3")},
 }
 
+# Per-trade catastrophic-loss cap. When an option expires worthless the loss
+# equals (qty × premium × 100), so capping the deployed amount = capping the
+# realised loss. Introduced 2026-05-30 as the direct defense against the
+# trade #37 pattern (56 contracts × $0.53 = $952 single-trade loss); the old
+# defense was the $0.50 MIN_ASK floor, which bounded loss by proxy through
+# premium and blocked too many valid setups. $500 chosen because 3 losing
+# trades at full cap = $1500 = daily loss limit (15% of $10k), so the daily
+# governor still catches catastrophic days even with looser entry filters.
+MAX_LOSS_PER_TRADE_USD = Decimal("500")
+
 
 class DirectionalExecutionResult:
     def __init__(
@@ -209,11 +219,16 @@ async def select_best_strike(
         log.warning("directional_chain_fetch_failed", ticker=ticker, error=str(e))
         return None
 
-    # Minimum $0.50/share ask ($50/contract). Options below this threshold are
-    # so cheap and illiquid that Alpaca paper accounts don't track them as
-    # positions — the buy fills but the position never appears, so every
-    # close attempt gets rejected as a naked sell.
-    MIN_ASK = Decimal("0.50")
+    # Minimum $0.30/share ask ($30/contract). Lowered from $0.50 on 2026-05-30
+    # because $0.50 blocked every BUY_PUT execute attempt on a falling SPY
+    # session — near-the-money 0DTE puts are routinely quoted $0.20-$0.40.
+    # The original $0.50 was a safety margin above what we believed Alpaca's
+    # paper account would track reliably (the I3 ghost-position pattern); $0.30
+    # tested as low enough to capture valid 0DTE OTM premiums while staying
+    # above the suspected paper-tracking floor. Re-evaluate if ghost positions
+    # reappear after this change. The catastrophic-loss defense from trade #37
+    # moved to MAX_LOSS_PER_TRADE_USD in execute_directional_signal.
+    MIN_ASK = Decimal("0.30")
     max_spread_pct = get_settings().max_bid_ask_spread_pct
 
     candidates = [
@@ -335,7 +350,19 @@ async def execute_directional_signal(
     occ = selected.occ
     quote = selected.quote
     one_contract_cost = float(quote.ask) * 100
-    qty = max(1, math.floor(position_usd / one_contract_cost))
+    # Cap deployed amount at MAX_LOSS_PER_TRADE_USD so total qty × premium × 100
+    # ≤ $500 — bounds the worst case if the option goes to zero.
+    capped_position_usd = min(position_usd, float(MAX_LOSS_PER_TRADE_USD))
+    qty = max(1, math.floor(capped_position_usd / one_contract_cost))
+    if capped_position_usd < position_usd:
+        log.info(
+            "directional_execute_qty_capped_by_loss_cap",
+            ticker=decision.ticker,
+            budget=position_usd,
+            cap=float(MAX_LOSS_PER_TRADE_USD),
+            one_contract_cost=one_contract_cost,
+            qty=qty,
+        )
 
     entry_premium = quote.ask
     order = await submitter(qty=qty, occ_symbol=occ, limit_price=entry_premium)

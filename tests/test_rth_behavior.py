@@ -716,14 +716,17 @@ def test_size_math_yields_floor_capital_div_premium():
     assert qty == 2
 
 
-async def test_select_best_strike_rejects_sub_50_cent_strikes(monkeypatch):
-    """Behavioral guard for the $0.50 min — fix for the PLTR $0.15 puts incident
-    where dirt-cheap options filled but never appeared as positions in paper.
+async def test_select_best_strike_rejects_sub_30_cent_strikes(monkeypatch):
+    """Behavioral guard for the $0.30 MIN_ASK floor — lowered from $0.50 on
+    2026-05-30 after $0.50 blocked every BUY_PUT execute attempt on a falling
+    SPY session. Strikes below $0.30 are still rejected to stay above the
+    suspected Alpaca paper-account position-tracking threshold (the PLTR
+    $0.15 ghost-position incident from I3).
     """
     from datetime import date
     from agents.directional.executor import select_best_strike
 
-    # Mock the chain to return only cheap strikes (all below $0.50)
+    # Mock the chain to return only cheap strikes (all below $0.30)
     async def fake_chain(ticker, *, expiry, strike_lo, strike_hi):
         return [
             OptionQuote(
@@ -737,7 +740,7 @@ async def test_select_best_strike_rejects_sub_50_cent_strikes(monkeypatch):
                 occ_symbol="PLTR260515P00115000",
                 underlying="PLTR", strike=Decimal("115"),
                 expiry=expiry, option_type="put",
-                bid=Decimal("0.20"), ask=Decimal("0.30"), mid=Decimal("0.25"),
+                bid=Decimal("0.15"), ask=Decimal("0.20"), mid=Decimal("0.17"),
                 delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
             ),
         ]
@@ -751,7 +754,7 @@ async def test_select_best_strike_rejects_sub_50_cent_strikes(monkeypatch):
         target_strike=120,
         budget=500,
     )
-    assert selected is None, "Sub-$0.50 strikes must be rejected even with plenty of budget"
+    assert selected is None, "Sub-$0.30 strikes must be rejected even with plenty of budget"
 
 
 async def test_executor_detects_ghost_position_and_blocks_trade(session_factory, monkeypatch):

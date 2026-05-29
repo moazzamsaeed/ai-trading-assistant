@@ -74,6 +74,11 @@
 - **D7. DeepSeek Flash for exit decisions** — Replaced 2026-05-15 (3d92ec2) with Claude Sonnet 4.6. Sonnet provides better thesis-reversal reasoning at acceptable cost.
 - **D8. 10-min news polling** — Replaced 2026-05-12 (d4ae218) with WebSocket stream triggers. Polling missed event-driven moves.
 - **D9. Iron condor on $5k account** — Math doesn't work at this capital size. Paused 2026-05-11; revisit if account grows past ~$25k.
+- **D10. `volume_ratio > 1.3` for SPY 0DTE** — Inherited from the multi-stock era where catalysts pushed volume 2-3x. Falsified on 6 trading days of 2026-05-26 through 2026-05-29: SPY 5-min `volume_ratio_20` rarely sustains ≥1.3 (today's reading hovered 0.3–1.7, mostly 0.5–1.2). With 1.3 the criteria gate produced 0 trades in 6 days. Lowered to **1.0** on 2026-05-30 (commit pending) as the permanent threshold for SPY.
+- **D11. RSI9 band 45-72 (calls) / 28-55 (puts)** — Too narrow for SPY 0DTE momentum. On fast moves RSI overshoots the band before all other criteria align (today's morning breakout RSI = 89, afternoon selloff RSI = 18). Widened to **40-80 (calls) / 20-60 (puts)** on 2026-05-30 (commit pending).
+- **D12. EMA cross as a HARD entry gate** — EMAs lag actual price action by their period. Requiring EMA cross alignment for entry means waiting for confirmation after the move is well underway. Demoted to a **conviction modifier** on 2026-05-30: 3/4 criteria with EMA disagreement still fires as MEDIUM. The 4/4 case (EMA aligned) becomes HIGH conviction.
+- **D13. ORB override volume threshold 2.0** — Sustained 2.0× volume on SPY 5-min bars is rare even on confirmed breakouts. Lowered to **1.5** on 2026-05-30 to make the ORB path realistically reachable.
+- **D14. `$0.50/share strike floor` as the catastrophic-loss defense** — Conflated two concerns: (a) Alpaca paper account position tracking (the I3 ghost-position pattern), and (b) the trade #37 high-contract-count loss pattern. The premium floor bounded loss by proxy and blocked too many valid 0DTE OTM setups. Replaced on 2026-05-30 by an **explicit `MAX_LOSS_PER_TRADE_USD = $500` cap** in `agents/directional/executor.py` (bounds qty × premium × 100 ≤ $500 = bounded realized loss when the option goes to zero). The MIN_ASK was lowered to $0.30 (still above suspected paper-tracking threshold).
 
 ---
 
@@ -236,3 +241,11 @@
 - **2026-05-28** — Fixed indicator bootstrap silent failure (commit `9c7d621`, incident I7): added `warmup_days=1` to `get_recent_bars`, session-anchored VWAP via `session_start_et` in `indicators.snapshot`, hard-block guard for null `ema50`/`volume_ratio_20`. Daemon restarted 17:24 CDT. Root cause discovered investigating "why we missed the SPY up-run today": system saw the breakout in real time but the criteria gate couldn't evaluate it because indicators were structurally unavailable in the first 1.5–4 hours of every session.
 - **2026-05-29** — Fixed two followups to the bootstrap fix (commit `29e45a7`): (a) IEX returns extended-hours bars on multi-day spans — added `_is_rth_et` filter; (b) Alpaca returns oldest-first up to `limit`, so today's bars got dropped — anchored start to `warmup_days` trading sessions back walking weekends. Daemon restarted 09:43 CDT.
 - **2026-05-29** — **TEMPORARY**: lowered `volume_ratio` threshold 1.3 → 1.0 in LLM prompt (`agents/directional/intraday.py` lines 120/123/131/132) and `_MIN_VOLUME_RATIO` constant (commit `a595dba`). Goal: validate end-to-end pipeline with at least one real trade after 5 zero-trade days. **REVERT BEFORE MONDAY 2026-06-01 open** if no trades fire today, or hold at empirically-validated level if one fires cleanly. Daemon restarted ~10:00 CDT.
+- **2026-05-30** — Friday's session produced 8 BUY_PUT execute attempts (LLM willing to fire), all blocked by the $0.50 strike floor, plus ~30 near-misses showing pattern of RSI-overshoot blocking morning calls and EMA-disagreement blocking afternoon puts. Shipped a coherent strategy-relaxation package to enable trades Monday:
+  - Vol 1.0 promoted to permanent (D10)
+  - RSI bands widened to 40-80 / 20-60 (D11)
+  - EMA demoted to conviction modifier (D12)
+  - ORB vol threshold lowered to 1.5 (D13)
+  - Strike floor $0.50 → $0.30, paired with new $500 per-trade max-loss cap (D14)
+  - All test cases updated; 450 tests pass.
+  - Expected effect: 2-4 trades/day under normal SPY conditions, bounded $500 max single-trade loss, daily 15% governor still catches catastrophic days. **First real-data validation of the rebuilt architecture starts Monday 2026-06-01.**

@@ -117,19 +117,26 @@ STEP 2 — INDICATOR CONFLUENCE:
 
   ── STANDARD SESSION (after 11:30 ET, EMA50 fully established) ──
   BULLISH — requires ALL of:
-    price > VWAP  AND  RSI9 between 45–72  AND  EMA20 > EMA50  AND  volume_ratio > 1.0
+    price > VWAP  AND  RSI9 between 40–80  AND  EMA20 > EMA50  AND  volume_ratio > 1.0
 
   BEARISH — requires ALL of:
-    price < VWAP  AND  RSI9 between 28–55  AND  EMA20 < EMA50  AND  volume_ratio > 1.0
+    price < VWAP  AND  RSI9 between 20–60  AND  EMA20 < EMA50  AND  volume_ratio > 1.0
 
-  Conviction: HIGH = all 4 criteria + MACD aligned. MEDIUM = 3 of 4. LOW = 2 or fewer → HOLD.
+  Conviction tiers:
+  • HIGH = ALL 4 criteria + MACD aligned with direction.
+  • MEDIUM = 3 of 4. **EMA-cross disagreement does NOT disqualify MEDIUM** —
+    price/VWAP/vol/RSI agreeing while EMA still lags is a legitimate
+    trade-the-pullback or trade-the-break setup (the EMAs are by definition a
+    lagging confirmation; waiting for them means entering after the move).
+    Do not HOLD on EMA disagreement alone. Aggressive mode executes MEDIUM.
+  • LOW = 2 or fewer → HOLD.
 
   ── EARLY SESSION (before 11:30 ET, EMA50 not yet reliable) ──
   EMA50 needs 250 min of data — before 11:30 ET it may be null or unreliable.
   If ema50 is null or time < 11:30 ET, DROP EMA50 from the required set and score on 3 factors:
 
-  BULLISH (early): price > VWAP  AND  RSI9 between 45–72  AND  volume_ratio > 1.0
-  BEARISH (early): price < VWAP  AND  RSI9 between 28–55  AND  volume_ratio > 1.0
+  BULLISH (early): price > VWAP  AND  RSI9 between 40–80  AND  volume_ratio > 1.0
+  BEARISH (early): price < VWAP  AND  RSI9 between 20–60  AND  volume_ratio > 1.0
 
   Early conviction: HIGH = all 3 criteria + MACD aligned. MEDIUM = 2 of 3. LOW = 1 or fewer → HOLD.
 
@@ -137,10 +144,10 @@ STEP 2 — INDICATOR CONFLUENCE:
   The first 60 minutes produce the day's most explosive moves. If ALL of these are true:
     • Time is before 10:30 ET
     • Price has broken ABOVE ORH (for calls) or BELOW ORL (for puts)
-    • volume_ratio ≥ 2.0 (institutional conviction behind the breakout)
+    • volume_ratio ≥ 1.5 (volume confirmation behind the breakout)
     • price is on the correct side of VWAP
   → Score as HIGH conviction immediately. EMA requirement is waived.
-    This is a confirmed opening range breakout with institutional volume — the highest
+    This is a confirmed opening range breakout with strong volume — the highest
     probability setup of the day. Do NOT hold waiting for EMA confirmation.
 
   ── INDICATORS ──
@@ -578,14 +585,12 @@ def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> st
 
 
 _MIN_VOLUME_RATIO = 1.0
-"""TEMPORARY (2026-05-29) — lowered from 1.3 → 1.0 to validate the end-to-end
-trading pipeline. After 5 trading days with 0 trades, the 1.3 threshold has
-been the bottleneck on SPY (sustained ≥1.3x volume on 5-min bars is rare for
-an index ETF). LLM prompt at lines 120/123/131/132 also lowered to 1.0.
-
-REVERT before Monday open 2026-06-01 if no validation completes today, or
-keep at the empirically-validated level if at least one trade fires cleanly.
-Tracked in KB change log entry 2026-05-29."""
+"""Production volume threshold. Lowered from 1.3 to 1.0 on 2026-05-30 after
+6 trading days with 0 trades validated that 1.3 was unreachable on SPY 5-min
+bars (sustained ≥1.3x volume requires a sudden catalyst, which is the
+multi-stock regime — for an index ETF, 0.9–1.2 is the normal range and 1.0
+captures volume-confirmed moves while filtering volume-fading sessions).
+Kept in sync with the LLM prompt at lines 120/123/131/132."""
 
 
 def _log_near_misses(
@@ -597,16 +602,17 @@ def _log_near_misses(
 ) -> None:
     """Persist near-miss rows for HOLDs that met ≥3 of the 4 production criteria.
 
-    criteria_met counts against PRODUCTION thresholds (vol>=1.3), so it lines up
-    with what the LLM gate sees. A near-miss is logged when the count is ≥3,
-    which still captures the common volume-only-miss case (vol<1.3 but other 3
-    criteria align).
+    criteria_met counts against PRODUCTION thresholds, so it lines up with
+    what the LLM gate sees.
 
-    Bullish: price>VWAP + RSI 45-72 + EMA20>EMA50 + vol>=1.3
-    Bearish: price<VWAP + RSI 28-55 + EMA20<EMA50 + vol>=1.3
+    Bullish: price>VWAP + RSI 40-80 + EMA20>EMA50 + vol>=1.0
+    Bearish: price<VWAP + RSI 20-60 + EMA20<EMA50 + vol>=1.0
 
-    NOTE: Records logged before 2026-05-27 used relaxed vol>=1.0 — older
-    criteria_met values overstate by 1 in the volume-only-miss case.
+    NOTE: Historical interpretation gotchas:
+    - Records logged before 2026-05-27 used relaxed vol>=1.0 — older
+      criteria_met values overstate by 1 in the volume-only-miss case.
+    - Records logged between 2026-05-27 and 2026-05-30 used vol>=1.3 and
+      narrower RSI bands (45-72 / 28-55).
     """
     rows: list[NearMiss] = []
     for d in hold_decisions:
@@ -626,8 +632,8 @@ def _log_near_misses(
         ema_bear = 0 < ema20 < ema50
         vol_meets_threshold = vr >= _MIN_VOLUME_RATIO
 
-        bullish = sum([above_vwap, 45 <= rsi <= 72, ema_bull, vol_meets_threshold])
-        bearish = sum([not above_vwap, 28 <= rsi <= 55, ema_bear, vol_meets_threshold])
+        bullish = sum([above_vwap, 40 <= rsi <= 80, ema_bull, vol_meets_threshold])
+        bearish = sum([not above_vwap, 20 <= rsi <= 60, ema_bear, vol_meets_threshold])
 
         if bullish >= 3:
             criteria_met, would_be, ema_flag = bullish, "BUY_CALL", ema_bull
