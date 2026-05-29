@@ -840,9 +840,12 @@ async def get_recent_bars(
     With warmup_days>0, the fetch spans warmup_days+2 calendar days back so
     trend indicators that need long lookback (EMA50, volume_ratio_20) have
     valid values at today's market open instead of None for the first 1–4
-    hours of the session. IEX feed returns only RTH bars, so cross-day spans
-    don't mix RTH with extended hours. VWAP must still be session-anchored
-    by the caller (see indicators.snapshot session_start_et parameter).
+    hours of the session. Extended-hours bars (pre-market 4-9:30 and
+    post-market 16-20) ARE returned by IEX on multi-day spans and are
+    filtered out in Python here so vol_ratio (current vs prior 20) compares
+    today's RTH bar against prior RTH bars, not against a low-volume
+    overnight tick. VWAP must still be session-anchored by the caller (see
+    indicators.snapshot session_start_et parameter).
     """
     def _fetch() -> list[Bar]:
         tf = TimeFrame(timeframe_minutes, TimeFrameUnit.Minute)
@@ -850,9 +853,22 @@ async def get_recent_bars(
         rth_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
 
         if warmup_days > 0:
-            # +2 days covers weekends/holidays; tail in Python to `limit`.
-            start = now_et - timedelta(days=warmup_days + 2)
-            req_limit = max(limit, 250)
+            # Alpaca returns OLDEST-first up to req_limit, so a 3-day-back start
+            # with limit=250 can fully exhaust on prior-session bars and never
+            # reach today's. Anchor to the start of the most recent trading day
+            # that's `warmup_days` sessions back, padding for weekends so the
+            # response always reaches NOW.
+            weekday = now_et.weekday()  # 0=Mon ... 4=Fri
+            days_back = warmup_days
+            # Walking back across the weekend costs 2 extra calendar days.
+            for _ in range(warmup_days):
+                if weekday == 0:  # Monday → previous Friday
+                    days_back += 2
+                weekday = (weekday - 1) % 7
+            start = (now_et - timedelta(days=days_back)).replace(
+                hour=9, minute=30, second=0, microsecond=0
+            )
+            req_limit = max(limit + 120, 200)
         else:
             start = rth_open if now_et >= rth_open else now_et.replace(hour=4, minute=0, second=0, microsecond=0)
             req_limit = limit
@@ -873,6 +889,17 @@ async def get_recent_bars(
         else:
             raw_bars = []
         bars = [_to_bar(b) for b in raw_bars]
+        if warmup_days > 0:
+            bars = [b for b in bars if _is_rth_et(b.timestamp)]
         return bars[-limit:]
 
     return await asyncio.to_thread(_fetch)
+
+
+def _is_rth_et(ts: datetime) -> bool:
+    """True if ts (any tz) falls inside US equity RTH: 9:30-16:00 ET, Mon-Fri."""
+    et = to_et(ts)
+    if et.weekday() >= 5:
+        return False
+    minutes = et.hour * 60 + et.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
