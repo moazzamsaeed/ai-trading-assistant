@@ -29,7 +29,7 @@ from integrations.alpaca_client import Bar, NewsArticle
 from trademaster import indicators
 from trademaster.config import get_settings
 from trademaster.db import NearMiss, Signal as SignalRow
-from trademaster.db import make_session_factory
+from trademaster.db import get_directional_trade_context, make_session_factory
 from trademaster.logging import get_logger
 from trademaster.models import SignalAction
 from trademaster.router import TaskType, route_to_model
@@ -112,6 +112,18 @@ STEP 1 — TREND + VOLATILITY FILTER:
   • VOLATILE (ATR too high): whipsaw risk, HIGH conviction only.
   • NORMAL: full-size trades allowed.
 
+  ── KEY LEVELS & TODAY'S PATH ──
+  MARKET CONTEXT includes a KEY LEVELS map (support/resistance) and a
+  "Today's path" line (the day's structure so far). USE BOTH:
+  • Don't buy calls into overhead resistance, or puts into support just below —
+    there's little room before the move stalls. Favour entries with clear room
+    to the next level.
+  • A level tested 2+ times and rejected needs volume to break; a fade off it
+    favours the opposite side.
+  • ANTICIPATE: in your reasoning, name the next level you expect price to reach
+    and why. If a macro headline above is relevant, say which level it likely
+    triggers and in which direction.
+
 STEP 2 — INDICATOR CONFLUENCE:
   RSI uses period 9 — faster signal on 5-min bars.
 
@@ -184,6 +196,10 @@ STEP 4 — FINAL SANITY CHECK:
   • If SPY has been ranging ±0.1% for the last 30 min → HOLD. Options decay on flat days.
   • If volume is fading (volume_ratio < 1.0) → HOLD. No fuel for continuation.
   • If the signal is only marginally bullish/bearish → HOLD. Wait for a cleaner setup.
+  • POSITION CHECK (see "YOUR POSITIONS & TODAY" above, when present): if you
+    already hold a position in this SAME direction, do NOT add — return HOLD.
+    If your earlier same-direction trades today were stopped out, the regime
+    isn't cooperating — require overwhelming evidence or HOLD.
   • {exit_hint}
 
 STEP 5 — CAPITAL EFFICIENCY:
@@ -382,6 +398,175 @@ def format_directional_signal(
     )
 
 
+def _summarize_price_path(today_bars: list[Bar], current: float) -> str:
+    """One-line narrative of today's intraday structure from the 5-min bars.
+
+    The LLM otherwise sees only a frozen snapshot (current price + current
+    indicator values) and is blind to the day's path — whether price has been
+    rejected at a level, holding support, or grinding in one direction. This
+    reconstructs that structure from bars we already fetched.
+    """
+    if len(today_bars) < 3 or current <= 0:
+        return ""
+    highs = [float(b.high) for b in today_bars]
+    lows = [float(b.low) for b in today_bars]
+    session_high = max(highs)
+    session_low = min(lows)
+    rng = session_high - session_low
+
+    if rng <= 0:
+        loc = "flat"
+    else:
+        pos = (current - session_low) / rng
+        if pos >= 0.8:
+            loc = "near session high"
+        elif pos <= 0.2:
+            loc = "near session low"
+        elif pos >= 0.55:
+            loc = "upper half"
+        elif pos <= 0.45:
+            loc = "lower half"
+        else:
+            loc = "mid-range"
+
+    # Structure over the last ~30 min (6 five-min bars).
+    recent = today_bars[-6:]
+    open0 = float(recent[0].open)
+    net_pct = (float(recent[-1].close) - open0) / open0 * 100 if open0 else 0.0
+    rlows = [float(b.low) for b in recent]
+    rhighs = [float(b.high) for b in recent]
+    higher_lows = all(rlows[i] >= rlows[i - 1] * 0.9995 for i in range(1, len(rlows)))
+    lower_highs = all(rhighs[i] <= rhighs[i - 1] * 1.0005 for i in range(1, len(rhighs)))
+    if higher_lows and net_pct > 0.05:
+        struct = "higher-lows, grinding up"
+    elif lower_highs and net_pct < -0.05:
+        struct = "lower-highs, grinding down"
+    elif net_pct > 0.05:
+        struct = "pushing up"
+    elif net_pct < -0.05:
+        struct = "pulling back"
+    else:
+        struct = "choppy/flat"
+
+    # Rejection/support tests: bars whose extreme sits within 0.1% of the day's.
+    tol = max(session_high * 0.001, 0.05)
+    res_touches = sum(1 for h in highs if h >= session_high - tol)
+    sup_touches = sum(1 for low in lows if low <= session_low + tol)
+    notes = []
+    if res_touches >= 2:
+        notes.append(f"tested ${session_high:.2f} {res_touches}× (resistance)")
+    if sup_touches >= 2:
+        notes.append(f"held ${session_low:.2f} {sup_touches}× (support)")
+
+    line = (
+        f"Today's path: ranged ${session_low:.2f}–${session_high:.2f}, now {loc}; "
+        f"last 30m {struct} ({net_pct:+.1f}%)."
+    )
+    if notes:
+        line += " " + "; ".join(notes) + "."
+    return line
+
+
+def _build_key_levels_block(
+    price: float,
+    md: dict,
+    orb_high: float,
+    orb_low: float,
+    session_high: float,
+    session_low: float,
+    vwap: float,
+) -> str:
+    """Consolidated support/resistance map so the LLM can reason about WHERE
+    price is likely to go (anticipation), not just whether boxes tick now."""
+    if price <= 0:
+        return ""
+    raw: list[tuple[float, str]] = []
+
+    def add(name: str, val) -> None:
+        if val and float(val) > 0:
+            raw.append((round(float(val), 2), name))
+
+    add("prev high", md.get("prev_high"))
+    add("prev low", md.get("prev_low"))
+    add("prev close", md.get("prev_close"))
+    add("MA5", md.get("ma5"))
+    add("MA10", md.get("ma10"))
+    add("ORB high", orb_high)
+    add("ORB low", orb_low)
+    add("session high", session_high)
+    add("session low", session_low)
+    add("VWAP", vwap)
+    # Nearest whole-dollar and $5 levels, if within ~0.6% of price.
+    for r in {float(round(price)), float(round(price / 5) * 5)}:
+        if r > 0 and abs(r - price) / price < 0.006:
+            add("round", r)
+
+    if not raw:
+        return ""
+
+    # Merge levels within $0.15 of each other into one labelled node.
+    raw.sort()
+    merged: list[tuple[float, list[str]]] = []
+    for lvl, name in raw:
+        if merged and abs(lvl - merged[-1][0]) <= 0.15:
+            merged[-1][1].append(name)
+        else:
+            merged.append((lvl, [name]))
+
+    def fmt(node: tuple[float, list[str]]) -> str:
+        return f"${node[0]:.2f} {'/'.join(node[1])}"
+
+    resistance = [n for n in merged if n[0] > price][:3]
+    support = list(reversed([n for n in merged if n[0] <= price]))[:3]
+
+    lines = [f"KEY LEVELS (SPY ${price:.2f}):"]
+    if resistance:
+        lines.append("  Resistance: " + " · ".join(fmt(n) for n in resistance))
+    if support:
+        lines.append("  Support:    " + " · ".join(fmt(n) for n in support))
+    return "\n".join(lines)
+
+
+def _format_position_context(pos_ctx: dict, *, now: datetime) -> str:
+    """Plain-language block on open positions + today's outcomes for the prompt.
+
+    Returns "" when there is nothing to report (keeps the prompt tight on
+    quiet days)."""
+    open_pos = pos_ctx.get("open") or []
+    closed = pos_ctx.get("today_closed") or []
+    if not open_pos and not closed:
+        return ""
+
+    lines = ["═══ YOUR POSITIONS & TODAY ═══"]
+    if open_pos:
+        for p in open_pos:
+            action = (p.get("action") or "?").replace("BUY_", "").lower()
+            t = to_et(p["opened_at"]).strftime("%H:%M ET") if p.get("opened_at") else "?"
+            peak = p.get("peak_pnl_pct")
+            peak_s = f", peak {float(peak):+.0f}%" if peak is not None else ""
+            entry = p.get("entry_price")
+            entry_s = f" @ ${entry}" if entry is not None else ""
+            lines.append(
+                f"  OPEN: {p.get('qty')}× {p.get('ticker')} {action}{entry_s} "
+                f"from {t}{peak_s} — you are ALREADY in this direction."
+            )
+    else:
+        lines.append("  OPEN: none.")
+
+    if closed:
+        wins = sum(1 for c in closed if (c.get("realized_pnl") or 0) > 0)
+        losses = sum(1 for c in closed if (c.get("realized_pnl") or 0) < 0)
+        summary = ", ".join(
+            f"{(c.get('action') or '?').replace('BUY_', '')} "
+            f"${(c.get('realized_pnl') or 0):+.0f}"
+            f"{' (' + c['exit_reason'] + ')' if c.get('exit_reason') else ''}"
+            for c in closed[-4:]
+        )
+        lines.append(f"  TODAY closed {len(closed)} ({wins}W/{losses}L): {summary}")
+    lines.append("══════════════════════════════")
+    return "\n".join(lines)
+
+
 async def _build_market_context(
     tickers: list[str],
     bars_fetcher=alpaca_client.get_recent_bars,
@@ -410,6 +595,12 @@ async def _build_market_context(
         orb_high = float(today_spy_bars[0].high) if today_spy_bars else 0.0
         orb_low = float(today_spy_bars[0].low) if today_spy_bars else 0.0
 
+        # Today's realized range + intraday path narrative (reconstructed from
+        # the same bars; the snapshot alone discards this structure).
+        session_high = max((float(b.high) for b in today_spy_bars), default=0.0)
+        session_low = min((float(b.low) for b in today_spy_bars), default=0.0)
+        price_path = _summarize_price_path(today_spy_bars, spy_price)
+
         # Volatility regime from ATR as % of price
         atr_pct = (spy_atr / spy_price * 100) if spy_price else 0.0
         if atr_pct < 0.05:
@@ -425,6 +616,7 @@ async def _build_market_context(
             "spy_pct": 0, "ticker_perf": {}, "tickers_above_vwap": 0,
             "orb_high": 0, "orb_low": 0, "vol_regime": "NORMAL",
             "spy_15min_bias": "NEUTRAL",
+            "session_high": 0, "session_low": 0, "price_path": "", "key_levels": "",
         }
 
     if spy_price > spy_vwap * 1.005:
@@ -525,6 +717,13 @@ async def _build_market_context(
         "spy_15min_bias": spy_15min_bias,
         "vix": round(vix_level, 2) if vix_level else None,
         "multi_day": multi_day,
+        "session_high": round(session_high, 2),
+        "session_low": round(session_low, 2),
+        "price_path": price_path,
+        "key_levels": _build_key_levels_block(
+            spy_price, multi_day, orb_high, orb_low,
+            session_high, session_low, spy_vwap,
+        ),
     }
 
 
@@ -562,6 +761,14 @@ def _format_market_context_block(ctx: dict, truth_social_posts: list[str]) -> st
             f"MA5: ${md.get('ma5',0):.2f} ({ma5_pos}) | "
             f"MA10: ${md.get('ma10',0):.2f} ({ma10_pos})"
         )
+        lines.append("")
+
+    # Intraday path narrative + consolidated S/R map (anticipation context).
+    if ctx.get("price_path"):
+        lines.append(ctx["price_path"])
+    if ctx.get("key_levels"):
+        lines.append(ctx["key_levels"])
+    if ctx.get("price_path") or ctx.get("key_levels"):
         lines.append("")
 
     perf = ctx.get("ticker_perf", {})
@@ -724,6 +931,19 @@ async def run_directional_scan(
     market_context_block = _format_market_context_block(market_ctx, truth_posts)
     if daily_bias_line:
         market_context_block = daily_bias_line + "\n\n" + market_context_block
+
+    # Position + recent-outcome awareness — prepended first so the LLM weighs
+    # "am I already long?" and "did today's same-direction trades work?" before
+    # anything else. Fail-open: a DB hiccup must not block the scan.
+    try:
+        position_block = _format_position_context(
+            get_directional_trade_context(factory), now=now
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("position_context_failed", error=str(e))
+        position_block = ""
+    if position_block:
+        market_context_block = position_block + "\n\n" + market_context_block
 
     # Per-ticker context (bars + news + indicators) — gather in parallel-ish.
     # Also retain snaps for post-LLM near-miss analysis.

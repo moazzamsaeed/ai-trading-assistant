@@ -288,3 +288,63 @@ def get_today_trade_count_by_conviction(session_factory) -> dict[str, int]:
             conviction = (row.extra or {}).get("conviction", "HIGH")
             counts[conviction] = counts.get(conviction, 0) + 1
     return counts
+
+
+_DIRECTIONAL_STRATEGIES = ["directional_call", "directional_put"]
+
+
+def get_directional_trade_context(session_factory) -> dict:
+    """Open directional positions + today's closed directional outcomes.
+
+    Feeds the intraday scan prompt so the LLM reasons WITH its own state
+    (am I already long? did my earlier same-direction trades work?) instead
+    of being stateless and overridden after the fact. Returns plain dicts so
+    the session closes cleanly. ET-day boundary, consistent with the other
+    helpers here. Honors baseline_reset_at for the today-closed slice.
+    """
+    today = today_et()
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    day_end = day_start + timedelta(days=1)
+    reset_at = get_settings().baseline_reset_at
+    effective_start = max(day_start, reset_at) if reset_at is not None else day_start
+
+    open_positions: list[dict] = []
+    today_closed: list[dict] = []
+    with session_factory() as session:
+        open_rows = session.execute(
+            select(Trade)
+            .where(Trade.strategy.in_(_DIRECTIONAL_STRATEGIES))
+            .where(Trade.closed_at.is_(None))
+            .order_by(Trade.opened_at)
+        ).scalars().all()
+        for r in open_rows:
+            e = r.extra or {}
+            open_positions.append({
+                "ticker": e.get("ticker") or r.symbol,
+                "action": e.get("action"),
+                "conviction": e.get("conviction"),
+                "qty": int(r.qty) if r.qty is not None else None,
+                "entry_price": float(r.entry_price) if r.entry_price is not None else None,
+                "peak_pnl_pct": e.get("peak_pnl_pct"),
+                "opened_at": r.opened_at,
+            })
+
+        closed_rows = session.execute(
+            select(Trade)
+            .where(Trade.strategy.in_(_DIRECTIONAL_STRATEGIES))
+            .where(Trade.closed_at >= effective_start)
+            .where(Trade.closed_at < day_end)
+            .order_by(Trade.closed_at)
+        ).scalars().all()
+        for r in closed_rows:
+            e = r.extra or {}
+            today_closed.append({
+                "ticker": e.get("ticker") or r.symbol,
+                "action": e.get("action"),
+                "realized_pnl": (
+                    float(r.realized_pnl_usd) if r.realized_pnl_usd is not None else None
+                ),
+                "exit_reason": e.get("exit_reason"),
+            })
+
+    return {"open": open_positions, "today_closed": today_closed}

@@ -389,3 +389,160 @@ async def test_scan_selective_passes_high_conviction(monkeypatch, session_factor
     )
     assert len(messages) == 1
     assert "+50%" in messages[0]  # selective exit targets
+
+
+# ----------------- intraday price-path summary -----------------
+
+
+def _path_bars(seq: list[tuple[float, float, float, float]]) -> list[Bar]:
+    """Build 5-min bars from (open, high, low, close) tuples."""
+    t = datetime(2026, 5, 11, 14, 0, tzinfo=UTC)
+    out = []
+    for i, (o, h, low, c) in enumerate(seq):
+        out.append(Bar(
+            timestamp=t + timedelta(minutes=5 * i),
+            open=Decimal(str(o)), high=Decimal(str(h)),
+            low=Decimal(str(low)), close=Decimal(str(c)),
+            volume=1000, vwap=None,
+        ))
+    return out
+
+
+def test_price_path_too_few_bars_returns_empty():
+    assert agent._summarize_price_path(_path_bars([(740, 740.5, 739.8, 740.2)]), 740.2) == ""
+
+
+def test_price_path_grinding_up_detects_structure_and_levels():
+    bars = _path_bars([
+        (740.0, 740.5, 739.8, 740.3), (740.3, 741.2, 740.1, 741.0),
+        (741.0, 742.0, 740.8, 741.8), (741.8, 743.8, 741.7, 743.0),
+        (743.0, 743.8, 742.6, 742.9), (742.9, 743.5, 742.7, 743.1),
+    ])
+    out = agent._summarize_price_path(bars, 743.1)
+    assert "ranged $739.80–$743.80" in out
+    assert "near session high" in out
+    assert "grinding up" in out
+    assert "743.80" in out and "resistance" in out  # tested twice
+
+
+def test_price_path_flat_when_no_range():
+    bars = _path_bars([(740.0, 740.0, 740.0, 740.0)] * 6)
+    out = agent._summarize_price_path(bars, 740.0)
+    assert "flat" in out
+    assert "choppy/flat" in out
+
+
+# ----------------- key levels map -----------------
+
+
+def test_key_levels_splits_resistance_and_support():
+    md = {"prev_high": 745.3, "prev_low": 739.8, "prev_close": 741.0,
+          "ma5": 742.2, "ma10": 740.5}
+    out = agent._build_key_levels_block(743.1, md, 740.5, 739.8, 743.8, 739.8, 742.4)
+    assert "KEY LEVELS (SPY $743.10)" in out
+    assert "Resistance:" in out and "Support:" in out
+    # prev high (745.30) is above price → resistance; VWAP (742.40) below → support
+    res = [ln for ln in out.splitlines() if "Resistance" in ln][0]
+    sup = [ln for ln in out.splitlines() if "Support" in ln][0]
+    assert "745.30" in res and "prev high" in res
+    assert "742.40" in sup and "VWAP" in sup
+
+
+def test_key_levels_empty_price_returns_empty():
+    assert agent._build_key_levels_block(0, {}, 0, 0, 0, 0, 0) == ""
+
+
+# ----------------- position context -----------------
+
+
+def test_position_context_empty_returns_empty():
+    empty = {"open": [], "today_closed": []}
+    assert agent._format_position_context(empty, now=datetime.now(UTC)) == ""
+
+
+def test_position_context_renders_open_and_today():
+    pc = {
+        "open": [{"ticker": "SPY", "action": "BUY_CALL", "conviction": "HIGH",
+                  "qty": 2, "entry_price": 1.40, "peak_pnl_pct": 18.0,
+                  "opened_at": datetime(2026, 5, 29, 15, 5, tzinfo=UTC)}],
+        "today_closed": [
+            {"ticker": "SPY", "action": "BUY_CALL", "realized_pnl": -952.0,
+             "exit_reason": "stop_loss"},
+            {"ticker": "SPY", "action": "BUY_CALL", "realized_pnl": 232.0,
+             "exit_reason": "profit_target"},
+        ],
+    }
+    out = agent._format_position_context(pc, now=datetime.now(UTC))
+    assert "YOUR POSITIONS & TODAY" in out
+    assert "ALREADY in this direction" in out
+    assert "peak +18%" in out
+    assert "1W/1L" in out
+    assert "stop_loss" in out
+
+
+# ----------------- get_directional_trade_context (DB) -----------------
+
+
+def test_trade_context_query_open_and_closed(session_factory):
+    from trademaster.db import Trade, get_directional_trade_context
+
+    now = datetime.now(UTC)
+    with session_factory() as s:
+        s.add(Trade(
+            opened_at=now, closed_at=None, symbol="SPY250529C00740000",
+            asset_class="option", side="buy", strategy="directional_call",
+            qty=Decimal("2"), entry_price=Decimal("1.40"),
+            extra={"ticker": "SPY", "action": "BUY_CALL", "conviction": "HIGH",
+                   "peak_pnl_pct": 12.0},
+        ))
+        s.add(Trade(
+            opened_at=now, closed_at=now, symbol="SPY250529P00740000",
+            asset_class="option", side="buy", strategy="directional_put",
+            qty=Decimal("1"), entry_price=Decimal("0.90"),
+            exit_price=Decimal("0.45"), realized_pnl_usd=Decimal("-45"),
+            extra={"ticker": "SPY", "action": "BUY_PUT", "exit_reason": "stop_loss"},
+        ))
+        s.commit()
+
+    ctx = get_directional_trade_context(session_factory)
+    assert len(ctx["open"]) == 1
+    assert ctx["open"][0]["action"] == "BUY_CALL"
+    assert ctx["open"][0]["peak_pnl_pct"] == 12.0
+    assert len(ctx["today_closed"]) == 1
+    assert ctx["today_closed"][0]["realized_pnl"] == -45.0
+
+
+async def test_scan_injects_open_position_into_prompt(monkeypatch, session_factory):
+    """An open directional position must surface in the LLM prompt."""
+    from trademaster.db import Trade
+
+    now = datetime.now(UTC)
+    with session_factory() as s:
+        s.add(Trade(
+            opened_at=now, closed_at=None, symbol="SPY250529C00740000",
+            asset_class="option", side="buy", strategy="directional_call",
+            qty=Decimal("2"), entry_price=Decimal("1.40"),
+            extra={"ticker": "SPY", "action": "BUY_CALL", "conviction": "HIGH"},
+        ))
+        s.commit()
+
+    async def fake_news(*_a, **_k):
+        return []
+
+    captured: dict = {}
+
+    async def fake_route(_task_type, prompt, **_k):
+        captured["text"] = prompt
+        return _llm('[{"ticker":"SPY","action":"HOLD","strike":null,"expiry":null,'
+                    '"conviction":"LOW","reasoning":"already long"}]')
+
+    monkeypatch.setattr(agent, "route_to_model", fake_route)
+
+    await agent.run_directional_scan(
+        watchlist=("SPY",),
+        session_factory=session_factory,
+        bars_fetcher=_fake_bars_with_vix,
+        news_fetcher=fake_news,
+    )
+    assert "YOUR POSITIONS & TODAY" in captured["text"]
+    assert "ALREADY in this direction" in captured["text"]
