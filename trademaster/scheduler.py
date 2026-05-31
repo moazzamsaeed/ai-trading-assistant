@@ -15,8 +15,10 @@ Channel routing (passed as named posters by the orchestrator):
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, time as _time
+from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -70,6 +72,9 @@ _SIGNAL_DEDUP_SECONDS = 1800
 log = get_logger(__name__)
 
 PREMARKET_TZ = "America/New_York"
+
+PROJECT_ROOT = Path(__file__).parent.parent
+_HEALTH_CHECK_SCRIPT = PROJECT_ROOT / "scripts" / "trade_health_check.py"
 
 
 Poster = Callable[[str], Awaitable[None]]
@@ -583,6 +588,58 @@ async def _iron_condor_exit_job(
             await trade_poster(trade_text)
 
 
+# ----------------- end-of-day trade health check -----------------
+
+
+async def _trade_health_check_job(
+    *,
+    log_poster: Poster = _noop_poster,
+) -> None:
+    """Run scripts/trade_health_check.py after close; post any findings to #logs.
+
+    Invoked as a subprocess (the script is built for cron: empty stdout +
+    exit 0 = clean/silent, a markdown report + exit 1 = issues found). The
+    script advances its own watermark, so each run only re-checks trades
+    closed since the previous run. A non-0/1 return code is a script-level
+    crash, surfaced to #logs.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(_HEALTH_CHECK_SCRIPT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(PROJECT_ROOT),
+        )
+        out, err = await proc.communicate()
+    except Exception as e:  # noqa: BLE001
+        log.error(
+            "trade_health_check_job_failed",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        await log_poster(f"⚠️ Trade health check failed to run: `{type(e).__name__}: {e}`")
+        return
+
+    report = out.decode().strip()
+    if proc.returncode not in (0, 1):
+        log.error(
+            "trade_health_check_crashed",
+            rc=proc.returncode,
+            stderr=err.decode()[:1000],
+        )
+        await log_poster(
+            f"⚠️ Trade health check crashed (rc={proc.returncode}): "
+            f"`{err.decode().strip()[:300] or 'no stderr'}`"
+        )
+        return
+
+    if report:
+        await log_poster(report)
+    else:
+        log.info("trade_health_check_clean")
+
+
 def make_scheduler(
     *,
     research_poster: Poster,
@@ -689,6 +746,25 @@ def make_scheduler(
         id="directional_0dte_final_close",
         replace_existing=True,
         misfire_grace_time=120,
+    )
+
+    # End-of-day trade health check — 16:15 ET Mon-Fri, after the 16:00 close
+    # so closed_at and final extra fields are persisted. Scans trades closed
+    # since the last run for silent-failure patterns; posts to #logs only if
+    # something is found. misfire_grace_time is generous — it's a non-urgent
+    # diagnostic that's fine to run late (e.g. after a daemon restart).
+    scheduler.add_job(
+        _trade_health_check_job,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour=16,
+            minute=15,
+            timezone=PREMARKET_TZ,
+        ),
+        kwargs={"log_poster": log_post},
+        id="trade_health_check",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     # Fast trailing stop tick — every 30 sec during RTH for 0DTE responsiveness.

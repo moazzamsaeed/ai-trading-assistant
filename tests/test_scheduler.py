@@ -803,3 +803,94 @@ async def test_event_blackout_blocks_scan(monkeypatch):
         research_poster=_noop_poster, log_poster=_noop_poster,
     )
     assert not scan_called, "scan must be blocked on blackout event days"
+
+
+# ----------------- trade health check -----------------
+
+
+class _FakeProc:
+    """Minimal stand-in for an asyncio subprocess process."""
+
+    def __init__(self, *, stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0):
+        self._stdout = stdout
+        self._stderr = stderr
+        self.returncode = returncode
+
+    async def communicate(self):
+        return self._stdout, self._stderr
+
+
+def _patch_subprocess(monkeypatch, proc):
+    async def fake_exec(*_args, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(sch.asyncio, "create_subprocess_exec", fake_exec)
+
+
+def test_make_scheduler_registers_health_check_job():
+    scheduler = sch.make_scheduler(**_all_posters())
+    job = scheduler.get_job("trade_health_check")
+    assert job is not None
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert fields["day_of_week"] == "mon-fri"
+    assert fields["hour"] == "16"
+    assert fields["minute"] == "15"
+    assert str(job.trigger.timezone) == sch.PREMARKET_TZ
+
+
+async def test_health_check_posts_report_to_logs(monkeypatch):
+    """Issues found (exit 1, report on stdout) → posted to #logs."""
+    _patch_subprocess(
+        monkeypatch,
+        _FakeProc(stdout=b"\xe2\x9a\xa0 2 issue(s) found\n", returncode=1),
+    )
+    posted = []
+
+    async def logs(text): posted.append(text)
+
+    await sch._trade_health_check_job(log_poster=logs)
+    assert len(posted) == 1
+    assert "issue(s) found" in posted[0]
+
+
+async def test_health_check_silent_when_clean(monkeypatch):
+    """Clean run (exit 0, empty stdout) → nothing posted."""
+    _patch_subprocess(monkeypatch, _FakeProc(stdout=b"", returncode=0))
+    posted = []
+
+    async def logs(text): posted.append(text)
+
+    await sch._trade_health_check_job(log_poster=logs)
+    assert posted == []
+
+
+async def test_health_check_crash_routes_to_logs(monkeypatch):
+    """Non-0/1 return code → crash alert posted to #logs."""
+    _patch_subprocess(
+        monkeypatch,
+        _FakeProc(stderr=b"Traceback: boom", returncode=2),
+    )
+    posted = []
+
+    async def logs(text): posted.append(text)
+
+    await sch._trade_health_check_job(log_poster=logs)
+    assert len(posted) == 1
+    assert "crashed" in posted[0].lower()
+    assert "boom" in posted[0]
+
+
+async def test_health_check_launch_failure_routes_to_logs(monkeypatch):
+    """If the subprocess can't even be launched → failure alert to #logs."""
+    async def boom_exec(*_args, **_kwargs):
+        raise OSError("no python")
+
+    monkeypatch.setattr(sch.asyncio, "create_subprocess_exec", boom_exec)
+    posted = []
+
+    async def logs(text): posted.append(text)
+
+    await sch._trade_health_check_job(log_poster=logs)
+    assert len(posted) == 1
+    assert "failed to run" in posted[0].lower()
+    assert "no python" in posted[0]
