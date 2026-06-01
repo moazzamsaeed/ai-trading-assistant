@@ -314,7 +314,10 @@ async def _maybe_scale_out(
         remaining_qty=int(trade.qty),
     )
 
+    _e = trade.extra or {}
     return {
+        "ticker": _e.get("ticker", trade.symbol[:3]),
+        "action": _e.get("action", "BUY_CALL"),
         "tier": trigger_pct,
         "sell_qty": sell_qty,
         "exit_price": str(exit_price),
@@ -465,6 +468,37 @@ async def _llm_exit_confirm(
 # ---------------------------------------------------------------------------
 # Message formatting
 # ---------------------------------------------------------------------------
+
+
+def format_scale_out(r: dict) -> str:
+    """Plain-language #signals message for one scale-out tier firing.
+
+    Part of the trade lifecycle: posted each time a profit tier locks in a
+    chunk, between the entry confirmation and the final close."""
+    action = r.get("action", "BUY_CALL")
+    option_word = "CALL" if action == "BUY_CALL" else "PUT"
+    ticker = r.get("ticker", "SPY")
+    sell_qty = r.get("sell_qty", 0)
+    remaining = r.get("remaining_qty", 0)
+    try:
+        tier = float(r.get("tier", 0))
+    except (TypeError, ValueError):
+        tier = 0.0
+    try:
+        locked = abs(float(r.get("partial_pnl_usd", 0)))
+    except (TypeError, ValueError):
+        locked = 0.0
+
+    tail = (
+        f"holding {remaining}× for higher targets"
+        if remaining and remaining > 0
+        else "position now fully scaled out"
+    )
+    return (
+        f"💰 **{ticker} {option_word} — scaled out {sell_qty}× at +{tier:.0f}% gain** · "
+        f"locked in ${locked:,.0f} · {tail}.\n"
+        f"**Manual: Sell {sell_qty}× {ticker} {option_word} at market** to match."
+    )
 
 
 def _format_exit_combined(

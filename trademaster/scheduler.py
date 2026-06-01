@@ -24,8 +24,17 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from agents.directional.executor import execute_directional_signal
-from agents.directional.exit_monitor import run_directional_exit_monitor, run_trailing_stop_tick
-from agents.directional.intraday import format_directional_signal, format_entry_combined, run_directional_scan
+from agents.directional.exit_monitor import (
+    format_scale_out,
+    run_directional_exit_monitor,
+    run_trailing_stop_tick,
+)
+from agents.directional.intraday import (
+    format_directional_plan,
+    format_directional_signal,
+    format_entry_combined,
+    run_directional_scan,
+)
 from agents.intraday.scan import run_intraday_scan
 from agents.options.exit_monitor import run_exit_monitor
 from agents.options.strategist import run_iron_condor_strategist
@@ -365,6 +374,11 @@ async def _directional_scan_job(
             )
             continue
 
+        # PLAN signal: announce the setup + entry trigger + green-lights just
+        # before entering. The entry-fill confirmation follows as a separate
+        # #signals message once Alpaca fills (see format_entry_combined below).
+        await signal_poster(format_directional_plan(decision, today=today, mode=mode))
+
         try:
             result = await execute_directional_signal(decision, mode=mode, capital_usd=available)
             if result.executed and result.trade_id is not None:
@@ -451,7 +465,9 @@ async def _directional_exit_job(
 
     for r in results:
         combined_text = r.get("combined_text")
-        if combined_text:
+        if r.get("status") == "scaled_out":
+            await signal_poster(format_scale_out(r))
+        elif combined_text:
             await signal_poster(combined_text)  # one message to #signals
         elif r.get("error_text"):
             await log_poster(r["error_text"])
@@ -486,13 +502,7 @@ async def _trailing_stop_tick_job(
 
     for r in results:
         if r.get("status") == "scaled_out":
-            tier = r.get("tier", 0)
-            sell_qty = r.get("sell_qty", 0)
-            pnl = r.get("partial_pnl_usd", "?")
-            await signal_poster(
-                f"💰 **Scaled out {sell_qty} contracts at +{tier:.0f}% tier** · "
-                f"partial P&L: ${pnl} · {r.get('remaining_qty', 0)} contracts remaining"
-            )
+            await signal_poster(format_scale_out(r))
         elif r.get("combined_text"):
             await signal_poster(r["combined_text"])
 

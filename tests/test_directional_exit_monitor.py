@@ -1124,3 +1124,37 @@ async def test_trailing_stop_tick_skips_when_no_positions(session_factory):
     )
     assert results == []
     assert quote_called == []  # didn't even call quote fetcher
+
+
+# ----------------- format_scale_out -----------------
+
+
+def test_format_scale_out_call_with_remaining():
+    from agents.directional.exit_monitor import format_scale_out
+    out = format_scale_out({
+        "ticker": "SPY", "action": "BUY_CALL", "tier": 30.0,
+        "sell_qty": 1, "partial_pnl_usd": "43.0", "remaining_qty": 1,
+    })
+    assert "SPY CALL" in out
+    assert "scaled out 1× at +30% gain" in out
+    assert "locked in $43" in out
+    assert "holding 1× for higher targets" in out
+    assert "Manual: Sell 1× SPY CALL at market" in out
+
+
+def test_format_scale_out_put_fully_scaled():
+    from agents.directional.exit_monitor import format_scale_out
+    out = format_scale_out({
+        "ticker": "SPY", "action": "BUY_PUT", "tier": 50.0,
+        "sell_qty": 2, "partial_pnl_usd": "-10.0", "remaining_qty": 0,
+    })
+    assert "SPY PUT" in out
+    assert "fully scaled out" in out
+    assert "locked in $10" in out  # abs value
+
+
+def test_format_scale_out_tolerates_bad_numbers():
+    from agents.directional.exit_monitor import format_scale_out
+    out = format_scale_out({"ticker": "SPY", "action": "BUY_CALL",
+                            "tier": "x", "partial_pnl_usd": None})
+    assert "SPY CALL" in out  # no crash

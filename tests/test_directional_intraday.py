@@ -546,3 +546,94 @@ async def test_scan_injects_open_position_into_prompt(monkeypatch, session_facto
     )
     assert "YOUR POSITIONS & TODAY" in captured["text"]
     assert "ALREADY in this direction" in captured["text"]
+
+
+# ----------------- green lights + plan/entry signal format -----------------
+
+
+_CALL_ANALYSIS = {
+    "spy_price": 743.10, "vwap": 742.40, "rsi9": 61.0, "ema20": 742.9,
+    "ema50": 742.1, "macd": 0.12, "macd_signal": 0.08, "volume_ratio": 1.6,
+    "next_target": "$745.30 (prev high)",
+}
+
+
+def test_green_lights_all_confirm_for_aligned_call():
+    lines = agent._green_lights("BUY_CALL", _CALL_ANALYSIS)
+    assert len(lines) == 5
+    assert all(line.startswith("✅") for line in lines)
+    assert "above VWAP" in lines[0]
+
+
+def test_green_lights_flags_weak_volume_and_bad_ema():
+    a = dict(_CALL_ANALYSIS, volume_ratio=0.7, ema20=742.0, ema50=742.5)
+    lines = agent._green_lights("BUY_CALL", a)
+    assert any(line.startswith("⚪") and "Volume" in line for line in lines)
+    assert any(line.startswith("⚪") and "EMA" in line for line in lines)
+
+
+def test_next_target_picks_nearest_resistance_for_call():
+    ctx = {"multi_day": {"prev_high": 745.3, "prev_low": 739.8},
+           "session_high": 743.8, "session_low": 740.1, "orb_high": 740.5, "orb_low": 739.8}
+    out = agent._next_target("BUY_CALL", 743.1, ctx)
+    assert out == "$743.80 (session high)"  # nearest level above 743.1
+
+
+def test_next_target_picks_nearest_support_for_put():
+    ctx = {"multi_day": {"prev_high": 745.3, "prev_low": 739.8},
+           "session_high": 743.8, "session_low": 740.1, "orb_high": 740.5, "orb_low": 739.8}
+    out = agent._next_target("BUY_PUT", 741.0, ctx)
+    assert out == "$740.50 (ORB high)"  # nearest level below 741.0
+
+
+def test_format_plan_signal_has_greens_trigger_and_target():
+    d = TickerDecision("SPY", "BUY_CALL", 743.0, "0DTE", "HIGH", "broke ORH",
+                       analysis=_CALL_ANALYSIS)
+    out = agent.format_directional_plan(d, today=date(2026, 5, 29), mode="aggressive")
+    assert "setup forming" in out
+    assert "Green lights (5/5)" in out
+    assert "enter as **SPY trades $743.10**" in out
+    assert "$745.30 (prev high)" in out
+    assert "scale out 25% at +15%, +30%, +50%" in out
+
+
+def test_format_plan_signal_survives_missing_analysis():
+    d = TickerDecision("SPY", "BUY_CALL", 743.0, "0DTE", "HIGH", "x", analysis=None)
+    out = agent.format_directional_plan(d, today=date(2026, 5, 29), mode="aggressive")
+    assert "setup forming" in out
+    assert "the current level" in out  # no price → graceful fallback
+
+
+def test_format_entry_combined_mentions_scale_out_reporting():
+    d = TickerDecision("SPY", "BUY_CALL", 743.0, "0DTE", "HIGH", "x", analysis=_CALL_ANALYSIS)
+    out = agent.format_entry_combined(
+        d, today=date(2026, 5, 29), mode="aggressive", trade_id=1, qty=2,
+        occ="SPY260529C00743000", entry_premium=Decimal("1.42"), total_cost=Decimal("284.00"),
+    )
+    assert "bot entered" in out
+    assert "scale-out" in out and "final close" in out
+
+
+async def test_scan_attaches_analysis_to_actionable(monkeypatch, session_factory):
+    """Actionable decisions must carry the indicator analysis for the signals."""
+    async def fake_news(*_a, **_k):
+        return []
+
+    async def fake_route(_task_type, _prompt, **_k):
+        return _llm('[{"ticker":"SPY","action":"BUY_CALL","strike":743.0,"expiry":"0DTE",'
+                    '"conviction":"HIGH","reasoning":"breakout"}]')
+
+    monkeypatch.setattr(agent, "route_to_model", fake_route)
+
+    decisions, _msgs, _report = await agent.run_directional_scan(
+        watchlist=("SPY",),
+        session_factory=session_factory,
+        bars_fetcher=_fake_bars_with_vix,
+        news_fetcher=fake_news,
+        mode="aggressive",
+    )
+    spy = [d for d in decisions if d.ticker == "SPY"][0]
+    assert spy.action == "BUY_CALL"
+    assert spy.analysis is not None
+    assert spy.analysis["spy_price"] is not None
+    assert "volume_ratio" in spy.analysis

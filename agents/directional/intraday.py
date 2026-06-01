@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 
@@ -54,6 +54,10 @@ class TickerDecision:
     expiry: str | None  # "0DTE" or "WEEKLY"
     conviction: Literal["LOW", "MEDIUM", "HIGH"]
     reasoning: str
+    # Indicator snapshot + level context at decision time, attached to
+    # actionable decisions so the #signals plan/entry messages can show the
+    # concrete green-lights and entry/target prices. None for HOLDs.
+    analysis: dict | None = None
 
 
 _MODE_CONFIG = {
@@ -336,6 +340,158 @@ def format_scan_report(
     return "\n".join(lines)
 
 
+def _next_target(action: str, price: float | None, ctx: dict) -> str | None:
+    """Nearest level price would head toward — resistance for calls, support
+    for puts — drawn from prev/session/ORB highs & lows."""
+    if not price:
+        return None
+    md = ctx.get("multi_day", {})
+    candidates = {
+        "prev high": md.get("prev_high"),
+        "session high": ctx.get("session_high"),
+        "ORB high": ctx.get("orb_high"),
+        "prev low": md.get("prev_low"),
+        "session low": ctx.get("session_low"),
+        "ORB low": ctx.get("orb_low"),
+    }
+    is_call = action == "BUY_CALL"
+    best: tuple[float, str] | None = None
+    for name, val in candidates.items():
+        if not val or float(val) <= 0:
+            continue
+        v = float(val)
+        if (is_call and v > price and (best is None or v < best[0])) or (
+            not is_call and v < price and (best is None or v > best[0])
+        ):
+            best = (v, name)
+    return f"${best[0]:.2f} ({best[1]})" if best else None
+
+
+def _build_analysis(action: str, snap: dict, ctx: dict) -> dict:
+    """Indicator snapshot subset + entry/target prices for the signal messages."""
+    def fnum(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    price = fnum(snap.get("last_close")) or ctx.get("spy_price")
+    return {
+        "spy_price": price,
+        "vwap": fnum(snap.get("vwap")),
+        "rsi9": fnum(snap.get("rsi9")),
+        "ema20": fnum(snap.get("ema20")),
+        "ema50": fnum(snap.get("ema50")),
+        "macd": fnum(snap.get("macd")),
+        "macd_signal": fnum(snap.get("macd_signal")),
+        "volume_ratio": fnum(snap.get("volume_ratio_20")),
+        "next_target": _next_target(action, price, ctx),
+    }
+
+
+def _green_lights(action: str, a: dict) -> list[str]:
+    """Plain-language per-indicator confirmation lines for a BUY signal.
+
+    ✅ = the indicator confirms the trade direction; ⚪ = neutral/lagging.
+    Reads the snapshot values attached to the decision at scan time."""
+    is_call = action == "BUY_CALL"
+    price = a.get("spy_price")
+    vwap = a.get("vwap")
+    rsi = a.get("rsi9")
+    ema20 = a.get("ema20")
+    ema50 = a.get("ema50")
+    vr = a.get("volume_ratio")
+    macd = a.get("macd")
+    macd_sig = a.get("macd_signal")
+    lines: list[str] = []
+
+    def f2(x) -> str:
+        return f"{float(x):.2f}" if x is not None else "?"
+
+    if price is not None and vwap is not None:
+        if is_call and float(price) > float(vwap):
+            lines.append(f"✅ Price ${f2(price)} above VWAP ${f2(vwap)} — buyers in control")
+        elif not is_call and float(price) < float(vwap):
+            lines.append(f"✅ Price ${f2(price)} below VWAP ${f2(vwap)} — sellers in control")
+        else:
+            lines.append(f"⚪ Price ${f2(price)} vs VWAP ${f2(vwap)} — not yet confirming")
+    if rsi is not None:
+        r = float(rsi)
+        if is_call:
+            ok = 40 <= r <= 80
+            note = "momentum up, room to run" if ok else ("overbought" if r > 80 else "too weak")
+        else:
+            ok = 20 <= r <= 60
+            note = "momentum down, room to fall" if ok else ("oversold" if r < 20 else "too strong")
+        lines.append(f"{'✅' if ok else '⚪'} RSI(9) {r:.0f} — {note}")
+    if ema20 is not None and ema50 is not None and float(ema20) > 0 and float(ema50) > 0:
+        if is_call and float(ema20) > float(ema50):
+            lines.append("✅ EMA20 above EMA50 — short-term trend up")
+        elif not is_call and float(ema20) < float(ema50):
+            lines.append("✅ EMA20 below EMA50 — short-term trend down")
+        else:
+            lines.append("⚪ EMA20/50 not yet crossed your way (lagging confirmation)")
+    if vr is not None:
+        v = float(vr)
+        lines.append(
+            f"{'✅' if v >= 1.0 else '⚪'} Volume {v:.1f}× normal — "
+            f"{'real participation' if v >= 1.0 else 'fading, weak fuel'}"
+        )
+    if macd is not None and macd_sig is not None:
+        if is_call and float(macd) > float(macd_sig):
+            lines.append("✅ MACD above signal — upward acceleration")
+        elif not is_call and float(macd) < float(macd_sig):
+            lines.append("✅ MACD below signal — downward acceleration")
+        else:
+            lines.append("⚪ MACD not confirming acceleration")
+    return lines
+
+
+def format_directional_plan(
+    d: TickerDecision, *, today: date, mode: str = "selective"
+) -> str:
+    """Forward-looking PLAN signal posted to #signals just before entry.
+
+    States the entry trigger ("enter as SPY trades $X"), the concrete
+    green-light checklist, and the managed-exit plan. Paired with the entry
+    confirmation (format_entry_combined) as a separate follow-up message."""
+    a = d.analysis or {}
+    is_call = d.action == "BUY_CALL"
+    icon = "📈" if is_call else "📉"
+    option_word = "CALL" if is_call else "PUT"
+    exp = (
+        today.strftime("%b %-d") if d.expiry == "0DTE"
+        else _next_friday(today).strftime("%b %-d")
+    )
+
+    greens = _green_lights(d.action, a)
+    n_ok = sum(1 for g in greens if g.startswith("✅"))
+    trigger = a.get("spy_price")
+    trigger_s = f"${float(trigger):.2f}" if trigger is not None else "the current level"
+    target = a.get("next_target")
+    target_line = (
+        f"\n🔮 Next level I'm watching: {target}." if target else ""
+    )
+
+    lines = [
+        f"{icon} **{d.ticker} {option_word} setup forming** [{mode.upper()} · {d.conviction}]",
+        "",
+    ]
+    if greens:
+        lines.append(f"✅ Green lights ({n_ok}/{len(greens)}):")
+        lines += [f"  {g}" for g in greens]
+        lines.append("")
+    lines += [
+        f"🎯 Plan: enter as **{d.ticker} trades {trigger_s}** — buy the "
+        f"**{exp} ${d.strike} {option_word}**.",
+        "Manage: scale out 25% at +15%, +30%, +50% gain · auto-stop if the option "
+        "loses 30% · close by 15:50 ET if same-day." + target_line,
+        "",
+        f"_Why: {d.reasoning}_",
+    ]
+    return "\n".join(lines)
+
+
 def format_entry_combined(
     decision: TickerDecision,
     *,
@@ -347,7 +503,7 @@ def format_entry_combined(
     entry_premium: Decimal,
     total_cost: Decimal,
 ) -> str:
-    """Single #signals message combining entry signal + execution confirmation."""
+    """Entry-fill confirmation for #signals (the follow-up to the plan signal)."""
     action_word = "BUY CALL" if decision.action == "BUY_CALL" else "BUY PUT"
     icon = "📈" if decision.action == "BUY_CALL" else "📉"
     option_word = "Call" if decision.action == "BUY_CALL" else "Put"
@@ -366,7 +522,8 @@ def format_entry_combined(
         f"${decision.strike} {option_word}**\n"
         f"\n"
         f"Why: {decision.reasoning}\n"
-        f"Conviction: {decision.conviction} · Smart exit active (hard floor: −30%)"
+        f"Conviction: {decision.conviction} · Now managing — I'll post a signal at "
+        f"each scale-out and the final close (auto-stop if it loses 30%)."
     )
 
 
@@ -1045,6 +1202,15 @@ async def run_directional_scan(
             else:
                 overridden.append(d)
         decisions = overridden
+
+    # Attach indicator + level context to non-HOLD decisions so the #signals
+    # plan/entry messages can show concrete green-lights and entry/target
+    # prices. HOLDs carry no analysis (nothing to act on).
+    decisions = [
+        replace(d, analysis=_build_analysis(d.action, ticker_snaps.get(d.ticker, {}), market_ctx))
+        if d.action != "HOLD" else d
+        for d in decisions
+    ]
 
     if mode == "selective":
         actionable = [d for d in decisions if d.action != "HOLD" and d.conviction == "HIGH"]
