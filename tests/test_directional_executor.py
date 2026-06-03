@@ -471,12 +471,79 @@ async def test_bid_ask_spread_filter_rejects_wide_spread(monkeypatch):
     async def chain_tight(_ticker, **_k):
         return [tight]
 
-    # Wide spread: select_best_strike should return None
+    # Wide spread: select_best_strike should return None (retry_delay_s=0 to
+    # avoid the real retry sleeps in the no-candidate path).
     monkeypatch.setattr(_ac, "get_options_chain", chain_wide)
-    result_wide = await select_best_strike("SPY", date(2026, 1, 1), "call", 500.0, 500.0)
+    result_wide = await select_best_strike(
+        "SPY", date(2026, 1, 1), "call", 500.0, 500.0, retry_delay_s=0.0
+    )
     assert result_wide is None, "wide spread must be rejected"
 
     # Tight spread: should be accepted
     monkeypatch.setattr(_ac, "get_options_chain", chain_tight)
     result_tight = await select_best_strike("SPY", date(2026, 1, 1), "call", 500.0, 500.0)
     assert result_tight is not None, "tight spread must be accepted"
+
+
+async def test_select_best_strike_retries_until_ask_populates(monkeypatch):
+    """No-ask first attempt, then a live ask appears → retry succeeds (the
+    2026-06-03 BUY_PUT miss: indicative feed had no ask early-session)."""
+    from agents.directional.executor import select_best_strike
+    from integrations.alpaca_client import OptionQuote
+    from decimal import Decimal as D
+    from datetime import date
+    import integrations.alpaca_client as _ac
+
+    no_ask = OptionQuote(
+        occ_symbol="SPY260101P00500000", underlying="SPY",
+        strike=D("500"), expiry=date(2026, 1, 1), option_type="put",
+        bid=D("1.50"), ask=D("0"), mid=D("0.75"),  # ask=0 → un-buyable
+        delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
+    )
+    good = OptionQuote(
+        occ_symbol="SPY260101P00500000", underlying="SPY",
+        strike=D("500"), expiry=date(2026, 1, 1), option_type="put",
+        bid=D("1.80"), ask=D("2.10"), mid=D("1.95"),
+        delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
+    )
+
+    calls = {"n": 0}
+
+    async def flaky_chain(_ticker, **_k):
+        calls["n"] += 1
+        return [no_ask] if calls["n"] == 1 else [good]
+
+    monkeypatch.setattr(_ac, "get_options_chain", flaky_chain)
+    result = await select_best_strike(
+        "SPY", date(2026, 1, 1), "put", 500.0, 500.0, retry_delay_s=0.0
+    )
+    assert result is not None, "should succeed once the ask populates on retry"
+    assert calls["n"] == 2, "should have retried exactly once"
+
+
+async def test_select_best_strike_gives_up_after_retries_when_no_ask(monkeypatch):
+    """Ask never populates → None after exhausting retries (the real miss case)."""
+    from agents.directional.executor import select_best_strike
+    from integrations.alpaca_client import OptionQuote
+    from decimal import Decimal as D
+    from datetime import date
+    import integrations.alpaca_client as _ac
+
+    no_ask = OptionQuote(
+        occ_symbol="SPY260101P00500000", underlying="SPY",
+        strike=D("500"), expiry=date(2026, 1, 1), option_type="put",
+        bid=D("1.50"), ask=D("0"), mid=D("0.75"),
+        delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
+    )
+    calls = {"n": 0}
+
+    async def dead_chain(_ticker, **_k):
+        calls["n"] += 1
+        return [no_ask]
+
+    monkeypatch.setattr(_ac, "get_options_chain", dead_chain)
+    result = await select_best_strike(
+        "SPY", date(2026, 1, 1), "put", 500.0, 500.0, retries=2, retry_delay_s=0.0
+    )
+    assert result is None
+    assert calls["n"] == 3, "1 initial + 2 retries"

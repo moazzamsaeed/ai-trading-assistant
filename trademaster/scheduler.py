@@ -31,7 +31,6 @@ from agents.directional.exit_monitor import (
 )
 from agents.directional.intraday import (
     format_directional_plan,
-    format_directional_signal,
     format_entry_combined,
     run_directional_scan,
 )
@@ -375,9 +374,21 @@ async def _directional_scan_job(
             continue
 
         # PLAN signal: announce the setup + entry trigger + green-lights just
-        # before entering. The entry-fill confirmation follows as a separate
-        # #signals message once Alpaca fills (see format_entry_combined below).
-        await signal_poster(format_directional_plan(decision, today=today, mode=mode))
+        # before entering. Deduplicated per (ticker, action) at 30 min so a
+        # setup that keeps re-qualifying every scan doesn't spam #signals.
+        # Whenever a plan IS posted, its outcome (entry fill OR a skip notice)
+        # always follows so the plan never dangles unexplained.
+        sig_key = (decision.ticker, decision.action)
+        last_sig = _last_signal_posted.get(sig_key)
+        plan_posted = (
+            not last_sig
+            or (datetime.now(UTC) - last_sig).total_seconds() >= _SIGNAL_DEDUP_SECONDS
+        )
+        if plan_posted:
+            await signal_poster(format_directional_plan(decision, today=today, mode=mode))
+            _last_signal_posted[sig_key] = datetime.now(UTC)
+        else:
+            log.info("signal_dedup_suppressed", ticker=decision.ticker, action=decision.action)
 
         try:
             result = await execute_directional_signal(decision, mode=mode, capital_usd=available)
@@ -403,16 +414,16 @@ async def _directional_scan_job(
                     ticker=decision.ticker,
                     reason=result.reason,
                 )
-                # Post to #signals for manual entry — deduplicated at 30 min per (ticker, action)
-                sig_key = (decision.ticker, decision.action)
-                last_sig = _last_signal_posted.get(sig_key)
-                if not last_sig or (datetime.now(UTC) - last_sig).total_seconds() >= _SIGNAL_DEDUP_SECONDS:
-                    manual = format_directional_signal(decision, today=today, mode=mode)
-                    manual += f"\n⚠️ _Auto-execute skipped: {result.reason}_"
-                    await signal_poster(manual)
-                    _last_signal_posted[sig_key] = datetime.now(UTC)
-                else:
-                    log.info("signal_dedup_suppressed", ticker=decision.ticker, action=decision.action)
+                # Close the loop on a posted plan so it never dangles: tell
+                # #signals the bot didn't enter and why. The plan above already
+                # carries the manual buy instruction if you still want it.
+                if plan_posted:
+                    opt = "CALL" if decision.action == "BUY_CALL" else "PUT"
+                    await signal_poster(
+                        f"⚠️ **{decision.ticker} {opt} — bot did NOT enter.**\n"
+                        f"Reason: {result.reason}.\n"
+                        f"_The setup was valid; enter manually from the plan above if you still want it._"
+                    )
         except Exception as e:  # noqa: BLE001
             log.error(
                 "directional_execute_error",

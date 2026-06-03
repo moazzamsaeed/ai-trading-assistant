@@ -14,6 +14,7 @@ Both paper and live modes execute immediately.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -194,6 +195,9 @@ async def select_best_strike(
     option_type: str,
     target_strike: float,
     budget: float,
+    *,
+    retries: int = 2,
+    retry_delay_s: float = 2.0,
 ) -> _SelectedStrike | None:
     """Fetch the real option chain and return the best available quoted strike.
 
@@ -205,19 +209,18 @@ async def select_best_strike(
     - Fetch strikes from $10 ITM to $30 OTM relative to target
     - Filter to those with a live ask quote within budget
     - Pick the one closest to target (ATM preference over deep OTM)
+
+    Retries the chain fetch up to `retries` times (with `retry_delay_s` between
+    attempts) when no strike qualifies. The indicative options feed routinely
+    returns strikes with no live `ask` early in the session — those come back
+    as ask=0 and get filtered out, killing otherwise-valid signals. A short
+    retry gives quotes a chance to populate before we give up. (See the
+    2026-06-03 BUY_PUT misses: every put near the money had no ask quote.)
     """
     otm_dir = 1 if option_type == "call" else -1
     lo = Decimal(str(target_strike - 10))
     hi = Decimal(str(target_strike + otm_dir * 30))
     strike_lo, strike_hi = min(lo, hi), max(lo, hi)
-
-    try:
-        quotes = await alpaca_client.get_options_chain(
-            ticker, expiry=expiry_date, strike_lo=strike_lo, strike_hi=strike_hi,
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("directional_chain_fetch_failed", ticker=ticker, error=str(e))
-        return None
 
     # Minimum $0.30/share ask ($30/contract). Lowered from $0.50 on 2026-05-30
     # because $0.50 blocked every BUY_PUT execute attempt on a falling SPY
@@ -231,35 +234,56 @@ async def select_best_strike(
     MIN_ASK = Decimal("0.30")
     max_spread_pct = get_settings().max_bid_ask_spread_pct
 
-    candidates = [
-        q for q in quotes
-        if q.option_type == option_type
-        and q.ask is not None
-        and q.ask >= MIN_ASK
-        and float(q.ask) * 100 <= budget
-        and q.mid > 0
-        and float(q.spread / q.mid) <= max_spread_pct
-    ]
-    if not candidates:
-        # Log whether the spread filter was the cause (vs. budget/min_ask)
-        pre_spread = [
+    last_pre_spread = 0
+    for attempt in range(retries + 1):
+        try:
+            quotes = await alpaca_client.get_options_chain(
+                ticker, expiry=expiry_date, strike_lo=strike_lo, strike_hi=strike_hi,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "directional_chain_fetch_failed", ticker=ticker, error=str(e), attempt=attempt
+            )
+            quotes = []
+
+        candidates = [
+            q for q in quotes
+            if q.option_type == option_type
+            and q.ask is not None
+            and q.ask >= MIN_ASK
+            and float(q.ask) * 100 <= budget
+            and q.mid > 0
+            and float(q.spread / q.mid) <= max_spread_pct
+        ]
+        if candidates:
+            if attempt > 0:
+                log.info(
+                    "directional_strike_found_on_retry", ticker=ticker, attempt=attempt
+                )
+            best = min(candidates, key=lambda q: abs(float(q.strike) - target_strike))
+            return _SelectedStrike(strike=best.strike, occ=best.occ_symbol, quote=best)
+
+        # No candidate this attempt. Track whether budget/min_ask (vs. spread)
+        # was the cause, for the final diagnostic log.
+        last_pre_spread = len([
             q for q in quotes
             if q.option_type == option_type and q.ask is not None and q.ask >= MIN_ASK
             and float(q.ask) * 100 <= budget
-        ]
-        log.info(
-            "directional_no_qualifying_strike",
-            ticker=ticker,
-            target_strike=target_strike,
-            budget=budget,
-            min_ask=float(MIN_ASK),
-            max_spread_pct=max_spread_pct,
-            spread_filtered_count=len(pre_spread),
-        )
-        return None
+        ])
+        if attempt < retries:
+            await asyncio.sleep(retry_delay_s)
 
-    best = min(candidates, key=lambda q: abs(float(q.strike) - target_strike))
-    return _SelectedStrike(strike=best.strike, occ=best.occ_symbol, quote=best)
+    log.info(
+        "directional_no_qualifying_strike",
+        ticker=ticker,
+        target_strike=target_strike,
+        budget=budget,
+        min_ask=float(MIN_ASK),
+        max_spread_pct=max_spread_pct,
+        spread_filtered_count=last_pre_spread,
+        attempts=retries + 1,
+    )
+    return None
 
 
 # ---------------------------------------------------------------------------
