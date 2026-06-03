@@ -31,6 +31,7 @@ On a close fill:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime, time
@@ -233,6 +234,23 @@ def _maybe_ratchet_trailing_stop(
     return new_trail if stop_ratcheted else None
 
 
+# Per-trade locks serialize scale-out (and any other) management of a single
+# trade across the concurrent 30-sec trailing tick and 5-min exit monitor.
+# Both fire on :00-second 5-min boundaries (e.g. 14:45:00) and, without this,
+# both passed the "tier already fired?" check before either persisted —
+# double-firing the same tier and over-selling (trade #43, 2026-06-02).
+# Keyed by trade id; a handful of stale entries over the daemon's life is fine.
+_scale_out_locks: dict[int, asyncio.Lock] = {}
+
+
+def _scale_out_lock(trade_id: int) -> asyncio.Lock:
+    lock = _scale_out_locks.get(trade_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _scale_out_locks[trade_id] = lock
+    return lock
+
+
 async def _maybe_scale_out(
     session_factory,
     trade: Trade,
@@ -246,63 +264,81 @@ async def _maybe_scale_out(
     non-zero sell_fraction not yet fired: sells sell_fraction × original_qty,
     updates trade.qty and extra. Returns dict on successful partial close, else None.
 
-    Only fires once per tier per trade (tracked in extra.scale_out_tiers_fired).
+    Only fires once per tier per trade. The whole check→submit→persist runs
+    under a per-trade lock so the 30-sec tick and 5-min monitor can't both fire
+    the same tier; state (fired tiers, qty) is read fresh from the DB inside the
+    lock rather than trusting the possibly-stale passed-in trade object.
     """
-    extra = trade.extra or {}
-    peak = float(extra.get("peak_pnl_pct", 0.0))
-    fired = set(extra.get("scale_out_tiers_fired", []))
-    original_qty = int(extra.get("original_qty", int(trade.qty)))
+    async with _scale_out_lock(trade.id):
+        # Read fresh state inside the lock — the passed-in `trade` may be stale
+        # if a concurrent call just scaled out.
+        with session_factory() as session:
+            row = session.get(Trade, trade.id)
+            if row is None:
+                return None
+            extra = dict(row.extra or {})
+            entry_p = Decimal(str(row.entry_price))
+            current_qty = int(row.qty)
+            occ = extra.get("occ_symbol", row.symbol)
+        peak = float(extra.get("peak_pnl_pct", 0.0))
+        fired = set(extra.get("scale_out_tiers_fired", []))
+        original_qty = int(extra.get("original_qty", current_qty))
 
-    # Find the lowest unfired tier the peak has crossed (process lowest first)
-    new_tier = None
-    for trigger, _lock, sell_frac in sorted(TRAILING_STOP_LEVELS, key=lambda t: t[0]):
-        if peak >= trigger and trigger not in fired and sell_frac > 0:
-            new_tier = (trigger, sell_frac)
-            break
+        # Find the lowest unfired tier the peak has crossed (process lowest first)
+        new_tier = None
+        for trigger, _lock, sell_frac in sorted(TRAILING_STOP_LEVELS, key=lambda t: t[0]):
+            if peak >= trigger and trigger not in fired and sell_frac > 0:
+                new_tier = (trigger, sell_frac)
+                break
 
-    if new_tier is None:
-        return None
-
-    trigger_pct, sell_frac = new_tier
-    sell_qty = max(1, int(original_qty * sell_frac))
-    remaining_qty = int(trade.qty)
-    sell_qty = min(sell_qty, remaining_qty)
-    if sell_qty <= 0:
-        return None
-
-    occ = extra.get("occ_symbol", trade.symbol)
-    try:
-        order = await submitter(qty=sell_qty, occ_symbol=occ, limit_price=current_bid)
-        final = await waiter(order.order_id, timeout_s=30.0)
-    except Exception as e:  # noqa: BLE001
-        log.warning("scale_out_failed", trade_id=trade.id, tier=trigger_pct, error=str(e))
-        return None
-
-    if final.status != "filled":
-        log.warning("scale_out_not_filled", trade_id=trade.id, tier=trigger_pct, status=final.status)
-        return None
-
-    exit_price = final.filled_avg_price if final.filled_avg_price is not None else current_bid
-    entry_p = Decimal(str(trade.entry_price))
-    partial_pnl = (exit_price - entry_p) * Decimal("100") * Decimal(sell_qty)
-
-    with session_factory() as session:
-        row = session.get(Trade, trade.id)
-        if row is None:
+        if new_tier is None:
             return None
-        new_extra = dict(row.extra or {})
-        new_extra.setdefault("original_qty", original_qty)
-        fired_list = list(new_extra.get("scale_out_tiers_fired", []))
-        fired_list.append(trigger_pct)
-        new_extra["scale_out_tiers_fired"] = fired_list
-        prior = Decimal(str(new_extra.get("partial_realized_pnl_usd", "0")))
-        new_extra["partial_realized_pnl_usd"] = str(prior + partial_pnl)
-        new_extra["last_partial_close_order_id"] = final.order_id
-        row.extra = new_extra
-        row.qty = Decimal(remaining_qty - sell_qty)
-        session.commit()
-        trade.qty = row.qty
-        trade.extra = new_extra
+
+        trigger_pct, sell_frac = new_tier
+        sell_qty = min(max(1, int(original_qty * sell_frac)), current_qty)
+        if sell_qty <= 0:
+            return None
+
+        try:
+            order = await submitter(qty=sell_qty, occ_symbol=occ, limit_price=current_bid)
+            final = await waiter(order.order_id, timeout_s=30.0)
+        except Exception as e:  # noqa: BLE001
+            log.warning("scale_out_failed", trade_id=trade.id, tier=trigger_pct, error=str(e))
+            return None
+
+        if final.status != "filled":
+            log.warning("scale_out_not_filled", trade_id=trade.id, tier=trigger_pct, status=final.status)
+            return None
+
+        exit_price = final.filled_avg_price if final.filled_avg_price is not None else current_bid
+        partial_pnl = (exit_price - entry_p) * Decimal("100") * Decimal(sell_qty)
+
+        with session_factory() as session:
+            row = session.get(Trade, trade.id)
+            if row is None:
+                return None
+            new_extra = dict(row.extra or {})
+            new_extra.setdefault("original_qty", original_qty)
+            fired_list = list(new_extra.get("scale_out_tiers_fired", []))
+            # Idempotent guard: under the lock this can't be a duplicate, but if
+            # it ever is, still record the sell — we already executed it.
+            if trigger_pct in fired_list:
+                log.warning("scale_out_tier_already_recorded", trade_id=trade.id, tier=trigger_pct)
+            fired_list.append(trigger_pct)
+            new_extra["scale_out_tiers_fired"] = fired_list
+            prior = Decimal(str(new_extra.get("partial_realized_pnl_usd", "0")))
+            new_extra["partial_realized_pnl_usd"] = str(prior + partial_pnl)
+            new_extra["last_partial_close_order_id"] = final.order_id
+            row.extra = new_extra
+            # Decrement from the FRESH row.qty, never a stale captured value, so
+            # concurrent sells can't clobber each other's decrement.
+            row.qty = Decimal(max(0, int(row.qty) - sell_qty))
+            session.commit()
+            trade.qty = row.qty
+            trade.extra = new_extra
+            remaining = int(row.qty)
+            ticker = new_extra.get("ticker", row.symbol[:3])
+            action = new_extra.get("action", "BUY_CALL")
 
     log.info(
         "scale_out_executed",
@@ -311,18 +347,17 @@ async def _maybe_scale_out(
         sell_qty=sell_qty,
         exit_price=str(exit_price),
         partial_pnl_usd=str(partial_pnl),
-        remaining_qty=int(trade.qty),
+        remaining_qty=remaining,
     )
 
-    _e = trade.extra or {}
     return {
-        "ticker": _e.get("ticker", trade.symbol[:3]),
-        "action": _e.get("action", "BUY_CALL"),
+        "ticker": ticker,
+        "action": action,
         "tier": trigger_pct,
         "sell_qty": sell_qty,
         "exit_price": str(exit_price),
         "partial_pnl_usd": str(partial_pnl),
-        "remaining_qty": int(trade.qty),
+        "remaining_qty": remaining,
     }
 
 

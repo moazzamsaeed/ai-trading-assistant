@@ -1158,3 +1158,101 @@ def test_format_scale_out_tolerates_bad_numbers():
     out = format_scale_out({"ticker": "SPY", "action": "BUY_CALL",
                             "tier": "x", "partial_pnl_usd": None})
     assert "SPY CALL" in out  # no crash
+
+
+# ----------------- scale-out duplicate-tier race -----------------
+
+
+async def test_scale_out_lock_prevents_duplicate_tier_fire(session_factory):
+    """Two concurrent _maybe_scale_out calls (30s tick + 5min monitor colliding
+    on a :00 boundary, as in trade #43) must fire a tier ONCE and decrement qty
+    once. Without the per-trade lock both fire the same tier and over-sell."""
+    import asyncio
+    from agents.directional.exit_monitor import _maybe_scale_out, _scale_out_locks
+    _scale_out_locks.clear()
+
+    # qty=4, peak +20% → only the +15% tier is crossable (not +30%).
+    with session_factory() as s:
+        t = Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call", qty=Decimal("4"), entry_price=Decimal("1.00"),
+            opened_at=datetime.now(UTC),
+            extra={"ticker": "SPY", "action": "BUY_CALL", "occ_symbol": "SPY260101C00500000",
+                   "mode": "aggressive", "peak_pnl_pct": 20.0, "original_qty": 4},
+        )
+        s.add(t); s.commit(); tid = t.id
+
+    submits = {"n": 0}
+
+    async def submitter(*, qty, occ_symbol, limit_price):
+        submits["n"] += 1
+        await asyncio.sleep(0)  # yield so the other coroutine attempts the lock
+        return OrderResult(
+            order_id=f"o{submits['n']}", status="filled",
+            filled_avg_price=Decimal("1.20"), filled_qty=Decimal(str(qty)),
+            submitted_at=datetime.now(UTC), raw_status="filled",
+        )
+
+    async def waiter(order_id, timeout_s=30.0):
+        return OrderResult(
+            order_id=order_id, status="filled", filled_avg_price=Decimal("1.20"),
+            filled_qty=Decimal("1"), submitted_at=datetime.now(UTC), raw_status="filled",
+        )
+
+    # Two separate Trade objects with the same id — mimics the two monitor runs.
+    with session_factory() as s:
+        t1 = s.get(Trade, tid); s.expunge(t1)
+    with session_factory() as s:
+        t2 = s.get(Trade, tid); s.expunge(t2)
+
+    r1, r2 = await asyncio.gather(
+        _maybe_scale_out(session_factory, t1, Decimal("1.20"), submitter, waiter),
+        _maybe_scale_out(session_factory, t2, Decimal("1.20"), submitter, waiter),
+    )
+
+    fired = [r for r in (r1, r2) if r is not None]
+    assert len(fired) == 1, "exactly one call should fire the tier"
+    assert submits["n"] == 1, "only one sell order should be submitted (no double-sell)"
+    with session_factory() as s:
+        row = s.get(Trade, tid)
+        assert row.extra["scale_out_tiers_fired"] == [15.0], "tier recorded exactly once"
+        assert int(row.qty) == 3, "qty decremented once (4 → 3), no stale clobber"
+
+
+async def test_scale_out_decrements_from_fresh_qty(session_factory):
+    """Sequential scale-outs across tiers decrement from the live row.qty, not a
+    stale captured value — 4 → 3 (15%) → 2 (30%)."""
+    import asyncio
+    from agents.directional.exit_monitor import _maybe_scale_out, _scale_out_locks
+    _scale_out_locks.clear()
+
+    with session_factory() as s:
+        t = Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call", qty=Decimal("4"), entry_price=Decimal("1.00"),
+            opened_at=datetime.now(UTC),
+            extra={"ticker": "SPY", "action": "BUY_CALL", "occ_symbol": "SPY260101C00500000",
+                   "mode": "aggressive", "peak_pnl_pct": 35.0, "original_qty": 4},
+        )
+        s.add(t); s.commit(); tid = t.id
+
+    async def submitter(*, qty, occ_symbol, limit_price):
+        return OrderResult(order_id="o", status="filled", filled_avg_price=Decimal("1.30"),
+                           filled_qty=Decimal(str(qty)), submitted_at=datetime.now(UTC),
+                           raw_status="filled")
+
+    async def waiter(order_id, timeout_s=30.0):
+        return OrderResult(order_id=order_id, status="filled", filled_avg_price=Decimal("1.30"),
+                           filled_qty=Decimal("1"), submitted_at=datetime.now(UTC),
+                           raw_status="filled")
+
+    with session_factory() as s:
+        trade = s.get(Trade, tid); s.expunge(trade)
+    # First call fires +15% (lowest unfired), second fires +30%.
+    r1 = await _maybe_scale_out(session_factory, trade, Decimal("1.30"), submitter, waiter)
+    r2 = await _maybe_scale_out(session_factory, trade, Decimal("1.30"), submitter, waiter)
+    assert r1["tier"] == 15.0 and r2["tier"] == 30.0
+    with session_factory() as s:
+        row = s.get(Trade, tid)
+        assert row.extra["scale_out_tiers_fired"] == [15.0, 30.0]
+        assert int(row.qty) == 2, "4 → 3 → 2"
