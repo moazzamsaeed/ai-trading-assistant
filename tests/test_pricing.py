@@ -45,3 +45,28 @@ def test_deepseek_flash_cost_math():
 
 def test_zero_tokens_zero_cost():
     assert calculate_cost("claude-opus-4-7", 0, 0) == Decimal("0")
+
+
+def test_haiku_45_cost_math_uses_corrected_rate():
+    # Haiku 4.5 = $1/M input, $5/M output (was wrongly $0.80/$4.00). 1M+1M = $6.
+    cost = calculate_cost("claude-haiku-4-5-20251001", 1_000_000, 1_000_000)
+    assert cost == Decimal("6.00")
+
+
+def test_dated_and_undated_model_names_resolve_same():
+    # API may return the id without the -YYYYMMDD snapshot suffix; must not $0.
+    dated = calculate_cost("claude-haiku-4-5-20251001", 100_000, 50_000)
+    undated = calculate_cost("claude-haiku-4-5", 100_000, 50_000)
+    assert dated == undated
+    assert undated > Decimal("0"), "undated alias must not silently price $0"
+
+
+def test_unknown_model_warns(monkeypatch):
+    """Unknown model returns $0 but must WARN (not silently vanish)."""
+    from trademaster.llm import pricing as _pricing
+
+    warnings: list = []
+    monkeypatch.setattr(_pricing.log, "warning", lambda *a, **k: warnings.append((a, k)))
+    cost = _pricing.calculate_cost("totally-made-up-model", 1000, 2000)
+    assert cost == Decimal("0")
+    assert warnings and warnings[0][0][0] == "pricing_model_unknown"
