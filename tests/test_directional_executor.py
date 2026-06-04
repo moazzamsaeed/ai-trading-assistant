@@ -547,3 +547,75 @@ async def test_select_best_strike_gives_up_after_retries_when_no_ask(monkeypatch
     )
     assert result is None
     assert calls["n"] == 3, "1 initial + 2 retries"
+
+
+# ----------------- strike-range direction (2026-06-03 BUY_PUT regression) -----------------
+
+
+async def test_put_strike_range_includes_atm(monkeypatch):
+    """Put search range must span $30 OTM to $10 ITM (i.e. include ATM), not
+    skew $10-30 OTM. Regression for the 2026-06-03 BUY_PUT misses where deep-OTM
+    puts priced under the $0.30 floor were the only strikes searched."""
+    from agents.directional.executor import select_best_strike
+    from integrations.alpaca_client import OptionQuote
+    from decimal import Decimal as D
+    from datetime import date
+    import integrations.alpaca_client as _ac
+
+    atm = OptionQuote(  # tradeable ATM put
+        occ_symbol="SPY260101P00750000", underlying="SPY", strike=D("750"),
+        expiry=date(2026, 1, 1), option_type="put",
+        bid=D("0.40"), ask=D("0.45"), mid=D("0.425"),
+        delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
+    )
+    deep = OptionQuote(  # deep-OTM put under the $0.30 floor
+        occ_symbol="SPY260101P00725000", underlying="SPY", strike=D("725"),
+        expiry=date(2026, 1, 1), option_type="put",
+        bid=D("0.02"), ask=D("0.04"), mid=D("0.03"),
+        delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
+    )
+    captured = {}
+
+    async def chain(_ticker, *, expiry, strike_lo, strike_hi):
+        captured["lo"] = float(strike_lo)
+        captured["hi"] = float(strike_hi)
+        return [q for q in (atm, deep) if strike_lo <= q.strike <= strike_hi]
+
+    monkeypatch.setattr(_ac, "get_options_chain", chain)
+    res = await select_best_strike(
+        "SPY", date(2026, 1, 1), "put", 750.0, 3000.0, retry_delay_s=0.0
+    )
+
+    # put range = target-30 .. target+10 (includes ATM)
+    assert captured["lo"] == 720.0 and captured["hi"] == 760.0
+    assert res is not None and float(res.strike) == 750.0, "must pick the tradeable ATM put"
+
+
+async def test_call_strike_range_unchanged(monkeypatch):
+    """Call search range stays $10 ITM to $30 OTM (target-10 .. target+30)."""
+    from agents.directional.executor import select_best_strike
+    from integrations.alpaca_client import OptionQuote
+    from decimal import Decimal as D
+    from datetime import date
+    import integrations.alpaca_client as _ac
+
+    atm = OptionQuote(
+        occ_symbol="SPY260101C00750000", underlying="SPY", strike=D("750"),
+        expiry=date(2026, 1, 1), option_type="call",
+        bid=D("1.40"), ask=D("1.45"), mid=D("1.425"),
+        delta=None, gamma=None, theta=None, vega=None, implied_volatility=None,
+    )
+    captured = {}
+
+    async def chain(_ticker, *, expiry, strike_lo, strike_hi):
+        captured["lo"] = float(strike_lo)
+        captured["hi"] = float(strike_hi)
+        return [atm] if strike_lo <= atm.strike <= strike_hi else []
+
+    monkeypatch.setattr(_ac, "get_options_chain", chain)
+    res = await select_best_strike(
+        "SPY", date(2026, 1, 1), "call", 750.0, 3000.0, retry_delay_s=0.0
+    )
+    # call range = target-10 .. target+30
+    assert captured["lo"] == 740.0 and captured["hi"] == 780.0
+    assert res is not None and float(res.strike) == 750.0

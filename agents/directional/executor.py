@@ -211,15 +211,23 @@ async def select_best_strike(
     - Pick the one closest to target (ATM preference over deep OTM)
 
     Retries the chain fetch up to `retries` times (with `retry_delay_s` between
-    attempts) when no strike qualifies. The indicative options feed routinely
-    returns strikes with no live `ask` early in the session — those come back
-    as ask=0 and get filtered out, killing otherwise-valid signals. A short
-    retry gives quotes a chance to populate before we give up. (See the
-    2026-06-03 BUY_PUT misses: every put near the money had no ask quote.)
+    attempts) when no strike qualifies, to ride out transient quote gaps on the
+    indicative feed.
     """
-    otm_dir = 1 if option_type == "call" else -1
-    lo = Decimal(str(target_strike - 10))
-    hi = Decimal(str(target_strike + otm_dir * 30))
+    # Search $10 ITM to $30 OTM relative to target. ITM/OTM are direction-aware:
+    # for a CALL, ITM = below spot, OTM = above; for a PUT it's the reverse.
+    # The range MUST include the ATM/near strikes (where the real liquidity and
+    # >$0.30 premiums are). The old formula hardcoded lo=target-10 for both, so
+    # puts searched only target-30..target-10 — all $10-30 OTM, deep-OTM 0DTE
+    # strikes priced under the $0.30 floor — and never found a tradeable put.
+    # (Root cause of the 2026-06-03 BUY_PUT misses; calls were unaffected.)
+    itm_offset, otm_offset = 10, 30
+    if option_type == "call":
+        lo = Decimal(str(target_strike - itm_offset))
+        hi = Decimal(str(target_strike + otm_offset))
+    else:  # put: ITM is above spot, OTM is below
+        lo = Decimal(str(target_strike - otm_offset))
+        hi = Decimal(str(target_strike + itm_offset))
     strike_lo, strike_hi = min(lo, hi), max(lo, hi)
 
     # Minimum $0.30/share ask ($30/contract). Lowered from $0.50 on 2026-05-30
