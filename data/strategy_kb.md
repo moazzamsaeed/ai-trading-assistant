@@ -133,6 +133,16 @@
   - Third investigation (`UNKNOWN` conviction on trades #1–#35) turned out to be a historical artifact, not a current bug — trades predated commit `3821a76` which added the field. No fix needed.
 - **Pattern: the weekly review loop is paying for itself.** $0.07 LLM cost surfaced two bugs that had been silently degrading risk management and observability. Trust the n-cited findings; investigate them.
 
+**I8. BUY_PUT signals never executed since the rebuild — strike-range skew (2026-06-04)**
+- Symptom: every directional trade since the rebuild was a CALL; every BUY_PUT signal died at execution with `no_affordable_strike` / `directional_no_qualifying_strike` (`spread_filtered_count=0`). 2026-06-03 alone: 7 valid put signals fired, 0 executed.
+- **First (wrong) diagnosis: data feed.** The `spread_filtered_count=0` was read as "the indicative feed returned no asks." A retry-the-chain mitigation (commit `7ebc1b4`) was shipped on that theory. It did not help — the afternoon puts still failed after retries.
+- **Actual root cause: `select_best_strike` searched the wrong strikes for puts.** `lo` was hardcoded `target-10` for both option types; only the OTM (+30) term flipped sign. For a put that gave the range `[target-30, target-10]` — entirely $10–30 OTM. On 0DTE those strikes are priced **under the $0.30 `MIN_ASK` floor**, so all candidates were filtered → `None`. It never looked at the ATM/near strikes the LLM wanted (~$0.40+). Calls were unaffected: their range `[target-10, target+30]` already includes ATM.
+- **Confirmed empirically, live mid-session (2026-06-04):** `select_best_strike(put, target≈ATM)` returned `None` (matching the prod signature) while the ATM put was quoted ask $1.14 and the indicative chain showed asks on 20/20 near-the-money strikes. After the fix it resolved the ATM strike. **The feed was fine all along.**
+- **OPRA dead-end:** checked whether the account could switch to the OPRA feed — `APIError: "OPRA agreement is not signed"`. No access (paid subscription). Not needed: indicative has asks; we were searching the wrong strikes.
+- **Fix shipped 2026-06-04** (commit `f2d2170`): direction-aware offsets — call `[target-10, target+30]`, put `[target-30, target+10]` (both include ATM). Regression tests lock the range for each type.
+- **Lesson: `no_affordable_strike` / `spread_filtered_count=0` means "the strikes we *searched* were untradeable," NOT "the feed has no quotes."** Check the requested strike range before blaming market data. (This is the inverse of the I4/I7 silent-failure reflex — here the data was fine and the bug was ours.)
+- **Watch:** if BUY_PUT execution rate stays at zero now that puts can fill, re-investigate — but the structural blocker is gone.
+
 ---
 
 ## Operational lessons (non-strategy, but affect outcomes)
@@ -167,7 +177,9 @@
 - **Error `42210000` is overloaded** — Same code for "position not in book" AND "IOC not supported". Whitelist must check message text, not code alone.
 - **Verify position exists before DB auto-close** (2026-05-14, 4e20803) — Sell rejection used to auto-close the DB row, leaving position live in Alpaca.
 - **Snap LLM strikes to chain** (2026-05-13, b6f092e) — LLM occasionally picks non-existent strike; snap to nearest valid contract.
-- **$0.50/share premium floor** (2026-05-13, 0a8500a) — Strike selection rejected cheaper-than-$0.50 contracts after early losses on cheap deep-OTM.
+- **Strike-search range must include ATM for BOTH types** (2026-06-04, f2d2170, I8) — `select_best_strike` skewed the put range $10-30 OTM and never found a tradeable put. Range is now direction-aware: call `[target-10, target+30]`, put `[target-30, target+10]`. `no_affordable_strike` / `spread_filtered_count=0` ⇒ wrong strikes searched, not missing quotes.
+- **Account has NO OPRA options-data access** (2026-06-04) — `OptionChainRequest(feed=OPRA)` → `APIError: "OPRA agreement is not signed"`. Default indicative feed is sufficient (it returns bid+ask on near-the-money strikes); don't propose OPRA without first checking the subscription.
+- **$0.30/share premium floor** (2026-05-30, MIN_ASK; was $0.50 on 2026-05-13, 0a8500a) — Strike selection rejects contracts under $0.30 ask. Interacts with strike range: searching deep-OTM strikes lands under this floor (see I8).
 - **In-process Black-Scholes greeks** (2026-05-11, 4b83935, D-017) — Alpaca indicative feed returns `greeks=None`. We bisect IV from mid price → derive delta.
 - **`abs(filled_avg_price * 100)` on credit fills** — Credit spreads return negative price. Naive multiplication records negative entry.
 - **`_enum_str(v)` helper for alpaca-py enums** — `str(AccountStatus.ACTIVE)` returns `"AccountStatus.ACTIVE"`, not `"ACTIVE"`.
@@ -249,3 +261,9 @@
   - Strike floor $0.50 → $0.30, paired with new $500 per-trade max-loss cap (D14)
   - All test cases updated; 450 tests pass.
   - Expected effect: 2-4 trades/day under normal SPY conditions, bounded $500 max single-trade loss, daily 15% governor still catches catastrophic days. **First real-data validation of the rebuilt architecture starts Monday 2026-06-01.**
+- **2026-06-01 → 06-04** — First real-data validation week. Results + fixes shipped (all live):
+  - **Mon 06-01:** 3 trades (all SPY CALL), net −$235, all stops/scale-outs/persistence worked — controlled losing day. First trades since the rebuild.
+  - **Tue 06-02:** 1 trade (#43, +$98, first winner). Health check caught a **duplicate +30% scale-out tier** — race between the 30s tick and 5min monitor colliding at the 14:45:00 boundary, both passing the tier check before either persisted → double-sell + qty/broker desync (`position_not_in_broker`). Fixed (commit `1ab457e`) with a per-trade `asyncio.Lock` + fresh-qty decrement + idempotent tier guard.
+  - **Wed 06-03:** 0 trades. 7 BUY_PUT signals all blocked by the strike-range bug (see I8); 52 near-misses, all correctly-held puts in a choppy NEUTRAL range (no follow-through). The daily-trade count cap (6) was never hit — budget was never the constraint.
+  - **Signal/observability upgrades shipped this week:** trade health-check daily cron (`77d4dc2`); LLM context enrichment — intraday price-path, open-position/today-outcome awareness, consolidated key-levels map (`e792807`); full trade-lifecycle #signals messaging — plan → entry → per-tier scale-out → close, with a green-light checklist (`fcd4898`); chain-fetch retry + no-dangling-plan skip notice (`7ebc1b4`).
+  - **Put execution fix (`f2d2170`, I8):** the binding constraint on the bearish side. Puts can finally fill as of 2026-06-04.
