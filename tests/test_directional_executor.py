@@ -324,13 +324,14 @@ async def test_execute_put_persists_correct_strategy(session_factory):
 
 
 async def test_execute_aggressive_sizing(session_factory):
-    """Position sizing uses available budget but is capped by MAX_LOSS_PER_TRADE_USD.
+    """Position sizing is capped at max_loss_per_trade_pct of effective capital.
 
-    The cap was introduced 2026-05-30 as the direct defense against the trade
-    #37 pattern (large contract count × cheap premium = big absolute loss when
-    the option goes to zero). At $5000 budget and $2.00/share ask:
-      - Without cap: floor($5000 / $200) = 25 contracts → up to $5000 loss
-      - With cap:    floor($500 / $200)  = 2 contracts  → bounded $500 loss
+    Defense against the trade #37 pattern (large contract count × cheap premium
+    = big absolute loss when the option zeroes). With the $5000 test-default
+    capital and the 10% default cap = $500, at $2.00/share ask:
+      - Uncapped: floor($5000 / $200) = 25 contracts → up to $5000 loss
+      - Capped:   floor($500 / $200)  = 2 contracts  → bounded $500 loss
+    (The cap auto-scales: at the live $25k capital it's $2,500.)
     """
     submitted_kwargs = {}
 

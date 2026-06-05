@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # the blackout earns its keep. Flip to True to restore the skip.
     enable_event_blackout: bool = False
 
+    # Per-trade catastrophic-loss cap, as a fraction of EFFECTIVE capital
+    # (auto-scales with the account). Caps deployed premium so qty × premium ×
+    # 100 ≤ pct × capital. Was a fixed $500; converted to 10% on 2026-06-05 when
+    # capital moved to $25k so position size scales with the budget.
+    max_loss_per_trade_pct: float = Field(default=0.10, gt=0, le=1.0)
+
     # Scale-out / trailing-stop ladder override. Empty = use the code default
     # (DEFAULT_TRAILING_STOP_LEVELS in exit_monitor). Set a JSON array of
     # [trigger_pct, lock_pct, sell_frac] to A/B a different ladder without a

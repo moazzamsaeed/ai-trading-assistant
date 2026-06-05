@@ -48,13 +48,10 @@ _EXIT_PCT = {
 
 # Per-trade catastrophic-loss cap. When an option expires worthless the loss
 # equals (qty × premium × 100), so capping the deployed amount = capping the
-# realised loss. Introduced 2026-05-30 as the direct defense against the
-# trade #37 pattern (56 contracts × $0.53 = $952 single-trade loss); the old
-# defense was the $0.50 MIN_ASK floor, which bounded loss by proxy through
-# premium and blocked too many valid setups. $500 chosen because 3 losing
-# trades at full cap = $1500 = daily loss limit (15% of $10k), so the daily
-# governor still catches catastrophic days even with looser entry filters.
-MAX_LOSS_PER_TRADE_USD = Decimal("500")
+# realised loss. Introduced 2026-05-30 against the trade #37 pattern (56
+# contracts × $0.53 = $952 single-trade loss). Originally a fixed $500;
+# converted 2026-06-05 to settings.max_loss_per_trade_pct of EFFECTIVE capital
+# so it scales with the account (10% of $25k = $2,500). See execute_directional_signal.
 
 
 class DirectionalExecutionResult:
@@ -238,7 +235,7 @@ async def select_best_strike(
     # tested as low enough to capture valid 0DTE OTM premiums while staying
     # above the suspected paper-tracking floor. Re-evaluate if ghost positions
     # reappear after this change. The catastrophic-loss defense from trade #37
-    # moved to MAX_LOSS_PER_TRADE_USD in execute_directional_signal.
+    # is the per-trade cap (max_loss_per_trade_pct) in execute_directional_signal.
     MIN_ASK = Decimal("0.30")
     max_spread_pct = get_settings().max_bid_ask_spread_pct
 
@@ -341,15 +338,19 @@ async def execute_directional_signal(
     # capital_usd is the available exposure budget passed by the scheduler
     # (max_total_exposure - already_deployed). The full amount is deployed —
     # no per-trade fraction. The scheduler's exposure cap is the only limit.
+    # Effective capital drives both the budget fallback and the per-trade cap.
+    from trademaster.capital import get_effective_capital
+    effective_capital = await get_effective_capital(factory)
     if capital_usd is None:
-        from trademaster.capital import get_effective_capital
-        capital_usd = await get_effective_capital(factory)
+        capital_usd = effective_capital
     if capital_usd <= Decimal("0"):
         return DirectionalExecutionResult(
             executed=False, order=None, trade_id=None,
             reason="effective capital is $0 — no new positions",
         )
     position_usd = float(capital_usd)
+    # Per-trade cap = pct of effective capital (auto-scales with the account).
+    max_loss_usd = float(effective_capital) * float(settings.max_loss_per_trade_pct)
 
     # Always select from the real chain — handles strike increments, missing
     # strikes, and budget constraints in one pass for every ticker.
@@ -382,16 +383,16 @@ async def execute_directional_signal(
     occ = selected.occ
     quote = selected.quote
     one_contract_cost = float(quote.ask) * 100
-    # Cap deployed amount at MAX_LOSS_PER_TRADE_USD so total qty × premium × 100
-    # ≤ $500 — bounds the worst case if the option goes to zero.
-    capped_position_usd = min(position_usd, float(MAX_LOSS_PER_TRADE_USD))
+    # Cap deployed amount at max_loss_usd (pct of effective capital) so total
+    # qty × premium × 100 ≤ that — bounds the worst case if the option zeroes.
+    capped_position_usd = min(position_usd, max_loss_usd)
     qty = max(1, math.floor(capped_position_usd / one_contract_cost))
     if capped_position_usd < position_usd:
         log.info(
             "directional_execute_qty_capped_by_loss_cap",
             ticker=decision.ticker,
             budget=position_usd,
-            cap=float(MAX_LOSS_PER_TRADE_USD),
+            cap=round(max_loss_usd, 2),
             one_contract_cost=one_contract_cost,
             qty=qty,
         )
