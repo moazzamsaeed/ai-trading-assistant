@@ -733,13 +733,18 @@ def make_scheduler(
         misfire_grace_time=300,
     )
 
-    # Directional exit monitor — every 5 min during RTH (10:00–15:25 ET).
+    # Directional exit monitor — every MINUTE during RTH (9:00–15:59 ET).
+    # Tightened from every-5-min on 2026-06-05: the LLM hold/sell decision is
+    # time-sensitive on 0DTE, so it shouldn't wait up to 5 min between checks.
+    # The 30-sec trailing_stop_tick still handles mechanical stops/scale-outs
+    # between these LLM passes. coalesce + max_instances guard against a slow
+    # LLM run overlapping the next minute.
     scheduler.add_job(
         _directional_exit_job,
         CronTrigger(
             day_of_week="mon-fri",
-            hour="10-15",
-            minute="0,5,10,15,20,25,30,35,40,45",
+            hour="9-15",
+            minute="*",
             timezone=PREMARKET_TZ,
         ),
         kwargs={
@@ -748,7 +753,9 @@ def make_scheduler(
         },
         id="directional_exit",
         replace_existing=True,
-        misfire_grace_time=120,
+        misfire_grace_time=60,
+        max_instances=2,
+        coalesce=True,
     )
 
     # Safety net: re-run at 15:50 ET so any 0DTE position that failed to close
