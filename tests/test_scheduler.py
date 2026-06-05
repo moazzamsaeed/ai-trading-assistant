@@ -784,16 +784,22 @@ async def test_max_trades_per_day_blocks_scan(monkeypatch):
     assert not scan_called, "scan must be blocked after max_trades_per_day"
 
 
-async def test_event_blackout_blocks_scan(monkeypatch):
-    """On a CPI/FOMC/NFP day the scan is skipped entirely."""
+async def test_event_blackout_not_consulted_when_disabled(monkeypatch):
+    """Default (enable_event_blackout=False): the blackout calendar is not even
+    checked — the LLM trades event days (NFP/CPI/FOMC) during paper validation."""
     sf = _fresh_db()
     monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
 
     async def fake_unrealized(): return _D("0")
     monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
-    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: "FOMC Decision")
 
-    scan_called = []
+    consulted = []
+
+    def _record_blackout(*_):
+        consulted.append(1)
+        return "FOMC Decision"
+    monkeypatch.setattr(sch, "is_blackout_day", _record_blackout)
+    monkeypatch.setattr(sch.get_settings(), "enable_event_blackout", False)
 
     async def fake_scan(**_): return ([], [], "")
     monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
@@ -802,7 +808,38 @@ async def test_event_blackout_blocks_scan(monkeypatch):
         signal_poster=_noop_poster, trade_poster=_noop_poster,
         research_poster=_noop_poster, log_poster=_noop_poster,
     )
-    assert not scan_called, "scan must be blocked on blackout event days"
+    assert not consulted, "blackout calendar must NOT be consulted when disabled"
+
+
+async def test_event_blackout_blocks_when_enabled(monkeypatch):
+    """When explicitly re-enabled, a CPI/FOMC/NFP day still skips the scan."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+
+    async def fake_unrealized(): return _D("0")
+    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch.get_settings(), "enable_event_blackout", True)
+
+    consulted = []
+
+    def _record_blackout(*_):
+        consulted.append(1)
+        return "FOMC Decision"
+    monkeypatch.setattr(sch, "is_blackout_day", _record_blackout)
+
+    scan_called = []
+
+    async def fake_scan(**_):
+        scan_called.append(1)
+        return ([], [], "")
+    monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
+
+    await sch._directional_scan_job(
+        signal_poster=_noop_poster, trade_poster=_noop_poster,
+        research_poster=_noop_poster, log_poster=_noop_poster,
+    )
+    assert consulted, "blackout calendar must be consulted when enabled"
+    assert not scan_called, "scan must be blocked on a blackout day when enabled"
 
 
 # ----------------- trade health check -----------------

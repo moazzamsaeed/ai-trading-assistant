@@ -241,11 +241,14 @@ async def _directional_scan_job(
         log.info("scan_skipped_max_trades_per_day", total=total_today, limit=settings.max_trades_per_day)
         return
 
-    # ---- Event blackout calendar ----
-    blackout_event = is_blackout_day(today_et())
-    if blackout_event:
-        log.info("scan_skipped_event_blackout", blackout=blackout_event)
-        return
+    # ---- Event blackout calendar (opt-in; disabled by default 2026-06-05) ----
+    # We deliberately trade event days (NFP/CPI/FOMC) during paper validation to
+    # test the LLM across every regime. Re-enable via settings.enable_event_blackout.
+    if settings.enable_event_blackout:
+        blackout_event = is_blackout_day(today_et())
+        if blackout_event:
+            log.info("scan_skipped_event_blackout", blackout=blackout_event)
+            return
 
     # ---- Time of day filter ----
     et_now = to_et(datetime.now(UTC))

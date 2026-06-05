@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     enable_iron_condor: bool = False
     directional_mode: Literal["aggressive", "selective"] = "selective"
 
+    # Event-day blackout (NFP/CPI/FOMC). Disabled 2026-06-05 to let the LLM
+    # trade event days during the paper-validation phase — we want data on every
+    # regime, including high-volatility catalyst days, before deciding whether
+    # the blackout earns its keep. Flip to True to restore the skip.
+    enable_event_blackout: bool = False
+
     # Starting capital baseline for the directional flow. The actual
     # effective capital is computed dynamically — see trademaster/capital.py.
     # In paper mode, effective = this base + cumulative realized P&L (since
