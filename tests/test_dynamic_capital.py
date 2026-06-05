@@ -419,3 +419,40 @@ async def test_position_sizing_scales_with_capital(session_factory, monkeypatch)
 
     # Full capital as budget — $5k - $1k loss = $4k (no per-trade fraction)
     assert captured["budget"] == 4000.00, f"Expected $4000 budget, got ${captured['budget']}"
+
+
+# ---------------------------------------------------------------------------
+# scale-out partials counted in realized P&L (governor fix, 2026-06-05)
+# ---------------------------------------------------------------------------
+
+
+def _trade_with_partial(session_factory, *, final_pnl, partial, closed=True):
+    with session_factory() as s:
+        s.add(Trade(
+            symbol="SPY", asset_class="option", side="buy", strategy="directional_call",
+            qty=Decimal("1"), entry_price=Decimal("1"),
+            exit_price=Decimal("2") if closed else None,
+            realized_pnl_usd=Decimal(str(final_pnl)) if closed else None,
+            opened_at=datetime.now(UTC),
+            closed_at=datetime.now(UTC) if closed else None,
+            extra={"partial_realized_pnl_usd": str(partial)},
+        ))
+        s.commit()
+
+
+def test_cumulative_includes_scale_out_partials(session_factory):
+    # 100 final leg + 585 scale-out partial
+    _trade_with_partial(session_factory, final_pnl=100.0, partial=585.0)
+    assert get_cumulative_realized_pnl(session_factory) == Decimal("685.00")
+
+
+def test_partials_counted_even_for_open_trade(session_factory):
+    # An open trade that scaled out has realized partials the governor must see.
+    _trade_with_partial(session_factory, final_pnl=0, partial=200.0, closed=False)
+    assert get_cumulative_realized_pnl(session_factory) == Decimal("200.00")
+
+
+def test_today_realized_includes_partials(session_factory):
+    from trademaster.db import get_today_realized_pnl
+    _trade_with_partial(session_factory, final_pnl=-50.0, partial=300.0)
+    assert get_today_realized_pnl(session_factory) == Decimal("250.00")  # -50 + 300

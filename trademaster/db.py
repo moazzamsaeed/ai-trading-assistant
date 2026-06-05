@@ -12,6 +12,7 @@ Single-writer SQLite — one TradeMaster process. No pooling concerns.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -173,8 +174,36 @@ def init_db(engine=None) -> None:
     Base.metadata.create_all(engine)
 
 
+def _sum_scale_out_partials(session, *, start=None, end=None) -> Decimal:
+    """Sum extra.partial_realized_pnl_usd (scale-out gains) over trades whose
+    opened_at falls in [start, end).
+
+    Scale-out partials are realized intraday when a tier fires, but they are
+    NOT in realized_pnl_usd (which `_close_trade_row` sets to the FINAL leg
+    only). So the governors + capital calc would otherwise ignore every locked
+    scale-out gain — understating winners and tripping the loss limit early.
+    Attributed by opened_at: exact for 0DTE (open/scale/close same day), and a
+    fine approximation for the rare multi-day weekly. Disjoint from
+    realized_pnl_usd (scaled qty vs. final qty), so no double-count.
+    """
+    stmt = select(Trade.extra)
+    if start is not None:
+        stmt = stmt.where(Trade.opened_at >= start)
+    if end is not None:
+        stmt = stmt.where(Trade.opened_at < end)
+    total = Decimal("0")
+    for extra in session.execute(stmt).scalars():
+        if not extra:
+            continue
+        p = extra.get("partial_realized_pnl_usd")
+        if p:
+            with contextlib.suppress(ArithmeticError, ValueError, TypeError):
+                total += Decimal(str(p))
+    return total
+
+
 def get_cumulative_realized_pnl(session_factory) -> Decimal:
-    """Sum of realized_pnl_usd across closed trades.
+    """Sum of realized_pnl_usd (final legs) + scale-out partials across trades.
 
     Used by the paper-mode capital model: effective capital tracks the
     starting base plus all realized gains/losses since the (optional)
@@ -195,11 +224,12 @@ def get_cumulative_realized_pnl(session_factory) -> Decimal:
         if reset_at is not None:
             stmt = stmt.where(Trade.closed_at >= reset_at)
         result = session.execute(stmt).scalar()
-    return Decimal(str(result or 0))
+        partials = _sum_scale_out_partials(session, start=reset_at)
+    return Decimal(str(result or 0)) + partials
 
 
 def get_today_realized_pnl(session_factory) -> Decimal:
-    """Sum of realized_pnl_usd for trades closed today (ET calendar day).
+    """Realized P&L today (ET day): final-leg closes + scale-out partials.
 
     Uses ET-aware day boundaries so trades near midnight ET are counted
     correctly — SQLite's DATE('now') is UTC and would miss them after ~8pm ET.
@@ -222,11 +252,12 @@ def get_today_realized_pnl(session_factory) -> Decimal:
             .where(Trade.closed_at >= effective_start)
             .where(Trade.closed_at < day_end)
         ).scalar()
-    return Decimal(str(result or 0))
+        partials = _sum_scale_out_partials(session, start=effective_start, end=day_end)
+    return Decimal(str(result or 0)) + partials
 
 
 def get_this_week_realized_pnl(session_factory) -> Decimal:
-    """Sum of realized_pnl_usd for trades closed this week (Mon–Sun, ET).
+    """Realized P&L this week (Mon–Sun ET): final-leg closes + scale-out partials.
 
     Resets Monday 00:00 ET. Used for the weekly loss limit gate.
     """
@@ -243,7 +274,8 @@ def get_this_week_realized_pnl(session_factory) -> Decimal:
             .where(Trade.closed_at >= effective_start)
             .where(Trade.closed_at < week_end)
         ).scalar()
-    return Decimal(str(result or 0))
+        partials = _sum_scale_out_partials(session, start=effective_start, end=week_end)
+    return Decimal(str(result or 0)) + partials
 
 
 def get_today_trade_count(session_factory) -> int:
