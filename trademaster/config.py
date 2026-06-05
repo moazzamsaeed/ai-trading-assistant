@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # capital moved to $25k so position size scales with the budget.
     max_loss_per_trade_pct: float = Field(default=0.10, gt=0, le=1.0)
 
+    # Above the top ladder tier, the trailing stop trails continuously instead
+    # of capping: it locks (peak − this gap). 0.20 → at +200% peak it locks
+    # +180%, at +300% locks +280%, etc. (set 2026-06-05 to stop give-back on
+    # big runners like #50, which peaked +242% but the stop capped at +75%).
+    trailing_stop_trail_gap_pct: float = Field(default=0.20, gt=0, le=1.0)
+
     # Scale-out / trailing-stop ladder override. Empty = use the code default
     # (DEFAULT_TRAILING_STOP_LEVELS in exit_monitor). Set a JSON array of
     # [trigger_pct, lock_pct, sell_frac] to A/B a different ladder without a

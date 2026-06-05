@@ -156,18 +156,18 @@ def test_today_et_correct_under_est(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_directional_force_close_clock_15_29_et_not_triggered():
-    """15:29 ET (1 min before threshold) → past_force_close_time = False."""
+def test_directional_force_close_clock_15_44_et_not_triggered():
+    """15:44 ET (1 min before threshold) → past_force_close_time = False."""
     from agents.directional.exit_monitor import FORCE_CLOSE_AFTER
 
-    et_now = to_et(datetime(2026, 5, 13, 19, 29, tzinfo=UTC))  # 15:29 EDT
+    et_now = to_et(datetime(2026, 5, 13, 19, 44, tzinfo=UTC))  # 15:44 EDT
     assert et_now.time() < FORCE_CLOSE_AFTER
 
 
-def test_directional_force_close_clock_15_30_et_triggered():
+def test_directional_force_close_clock_15_45_et_triggered():
     from agents.directional.exit_monitor import FORCE_CLOSE_AFTER
 
-    et_now = to_et(datetime(2026, 5, 13, 19, 30, tzinfo=UTC))  # 15:30 EDT
+    et_now = to_et(datetime(2026, 5, 13, 19, 45, tzinfo=UTC))  # 15:45 EDT
     assert et_now.time() >= FORCE_CLOSE_AFTER
 
 

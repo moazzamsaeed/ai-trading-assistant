@@ -549,7 +549,7 @@ async def test_0dte_force_closed_on_expiry_day(session_factory):
         return _filled(price=2.50)
 
     results = await run_directional_exit_monitor(
-        now=datetime(2026, 5, 12, 19, 31, tzinfo=UTC),  # 15:31 ET on May 12 = expiry
+        now=datetime(2026, 5, 12, 19, 46, tzinfo=UTC),  # 15:46 ET = past 15:45 force-close
         session_factory=session_factory,
         quote_fetcher=mid_quote,
         bars_fetcher=no_bars,
@@ -577,7 +577,7 @@ async def test_weekly_force_closed_on_expiry_day(session_factory):
         return _filled(price=2.50)
 
     results = await run_directional_exit_monitor(
-        now=datetime(2026, 5, 15, 19, 31, tzinfo=UTC),  # Fri 15:31 ET
+        now=datetime(2026, 5, 15, 19, 46, tzinfo=UTC),  # Fri 15:46 ET (past 15:45)
         session_factory=session_factory,
         quote_fetcher=mid_quote,
         bars_fetcher=no_bars,
@@ -872,11 +872,17 @@ def test_trailing_stop_premium_at_80pct():
     assert result == (Decimal("2.00") * Decimal("1.45")).quantize(Decimal("0.0001"))
 
 
-def test_trailing_stop_uses_highest_tier():
-    """At +150% should use the +120% tier (locks in +75%), not the +80% tier."""
+def test_trailing_stop_continuous_above_top_tier():
+    """Above the +120% top tier the stop trails continuously at peak − 20% gap,
+    instead of capping at +75% (retuned 2026-06-05)."""
     entry = Decimal("2.00")
-    result = _trailing_stop_premium(entry, 150.0)
-    assert result == (Decimal("2.00") * Decimal("1.75")).quantize(Decimal("0.0001"))
+
+    def lock(mult):
+        return (Decimal("2.00") * Decimal(mult)).quantize(Decimal("0.0001"))
+
+    assert _trailing_stop_premium(entry, 120.0) == lock("2.00")  # +120% → lock +100%
+    assert _trailing_stop_premium(entry, 200.0) == lock("2.80")  # +200% → lock +180%
+    assert _trailing_stop_premium(entry, 300.0) == lock("3.80")  # +300% → lock +280%
 
 
 def test_maybe_ratchet_updates_db_when_new_peak(session_factory):

@@ -4,7 +4,7 @@ Runs every 5 min during RTH. For each open directional Trade row:
 
   1. Hard floor (mode-aware): exit immediately, no LLM.
        aggressive: −50% | selective: −30%
-  2. Force close on expiry day at 15:30 ET (0DTE every day, weekly on Friday).
+  2. Force close on expiry day at 15:45 ET (0DTE every day, weekly on Friday).
   3. Trailing stop + scale-out: at each tier, ratchet stop AND sell a portion.
        +15%→sell 25%, lock +3%   |  +30%→sell 25%, lock +10%
        +50%→sell 25%, lock +25%  |  +75%→hold, lock +40%   |  +100%→lock +60%
@@ -56,7 +56,7 @@ from trademaster.timeutils import to_et
 
 log = get_logger(__name__)
 
-FORCE_CLOSE_AFTER = time(15, 30)
+FORCE_CLOSE_AFTER = time(15, 45)   # 15 min before the 16:00 ET close (was 15:30)
 DIRECTIONAL_STRATEGIES = {"directional_call", "directional_put"}
 HARD_FLOOR_PCT = Decimal("0.30")   # −30%: exit unconditionally, no LLM
 VOLUME_FADE_THRESHOLD = 0.7        # volume_ratio below this = momentum fading
@@ -208,11 +208,26 @@ def _trailing_stop_premium(
 ) -> Decimal | None:
     """Return the stop price that locks in gains at the current peak level.
 
-    Walks the active ladder from highest to lowest and returns the first
-    tier whose trigger has been reached. Returns None if peak is below the
-    lowest trigger.
+    Uses the discrete ladder up to its top tier; ABOVE the top tier the stop
+    trails CONTINUOUSLY — locking (peak − trailing_stop_trail_gap_pct) — so a
+    big runner keeps ratcheting instead of capping at the top tier's lock
+    (e.g. at +200% peak it locks +180%, at +300% +280%). Returns None if peak
+    is below the lowest trigger.
     """
-    for trigger_pct, lock_pct, _sell_frac in _trailing_stop_levels():
+    levels = _trailing_stop_levels()  # high → low
+    if not levels:
+        return None
+
+    top_trigger, top_lock, _ = levels[0]
+    if peak_pnl_pct >= top_trigger:
+        gap = float(get_settings().trailing_stop_trail_gap_pct)
+        # max() guards the (impossible-for-peak≥top) case and keeps it monotonic.
+        lock_pct = max(top_lock, peak_pnl_pct / 100.0 - gap)
+        return (entry_premium * (Decimal("1") + Decimal(str(lock_pct)))).quantize(
+            Decimal("0.0001")
+        )
+
+    for trigger_pct, lock_pct, _sell_frac in levels:
         if peak_pnl_pct >= trigger_pct:
             return (entry_premium * (Decimal("1") + Decimal(str(lock_pct)))).quantize(
                 Decimal("0.0001")
