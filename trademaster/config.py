@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # the blackout earns its keep. Flip to True to restore the skip.
     enable_event_blackout: bool = False
 
+    # Scale-out / trailing-stop ladder override. Empty = use the code default
+    # (DEFAULT_TRAILING_STOP_LEVELS in exit_monitor). Set a JSON array of
+    # [trigger_pct, lock_pct, sell_frac] to A/B a different ladder without a
+    # code change, e.g. '[[120,0.75,0],[80,0.45,0],[50,0.20,0.25],[25,0.08,0.25]]'.
+    trailing_stop_levels: str = ""
+
     # Starting capital baseline for the directional flow. The actual
     # effective capital is computed dynamically — see trademaster/capital.py.
     # In paper mode, effective = this base + cumulative realized P&L (since

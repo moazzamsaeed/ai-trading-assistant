@@ -481,11 +481,15 @@ def format_directional_plan(
         lines.append(f"✅ Green lights ({n_ok}/{len(greens)}):")
         lines += [f"  {g}" for g in greens]
         lines.append("")
+    # Derive the scale-out wording from the live ladder so it can't drift from
+    # the actual exit config; hard floor is mode-aware (−50% aggressive / −30%).
+    from agents.directional.exit_monitor import scale_out_plan_summary
+    hard_stop_pct = 50 if mode == "aggressive" else 30
     lines += [
         f"🎯 Plan: enter as **{d.ticker} trades {trigger_s}** — buy the "
         f"**{exp} ${d.strike} {option_word}**.",
-        "Manage: scale out 25% at +15%, +30%, +50% gain · auto-stop if the option "
-        "loses 30% · close by 15:50 ET if same-day." + target_line,
+        f"Manage: {scale_out_plan_summary()} · auto-stop if the option loses "
+        f"{hard_stop_pct}% · close by 15:50 ET if same-day." + target_line,
         "",
         f"_Why: {d.reasoning}_",
     ]

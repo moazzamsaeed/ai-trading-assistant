@@ -839,51 +839,44 @@ from agents.directional.exit_monitor import (
 
 
 def test_trailing_stop_premium_below_first_tier():
-    """Below +15% no trailing stop applies."""
+    """Below +25% no trailing stop applies (ladder retuned 2026-06-05)."""
     entry = Decimal("2.00")
-    assert _trailing_stop_premium(entry, 14.9) is None
+    assert _trailing_stop_premium(entry, 24.9) is None
 
 
-def test_trailing_stop_premium_at_15pct():
-    """At +15% locks in +3% → stop at entry × 1.03."""
+def test_trailing_stop_premium_at_25pct():
+    """At +25% locks in +8% → stop at entry × 1.08."""
     entry = Decimal("2.00")
-    result = _trailing_stop_premium(entry, 15.0)
-    assert result == (Decimal("2.00") * Decimal("1.03")).quantize(Decimal("0.0001"))
-
-
-def test_trailing_stop_premium_at_30pct():
-    """At +30% locks in +10% → stop at entry × 1.10."""
-    entry = Decimal("2.00")
-    result = _trailing_stop_premium(entry, 30.0)
-    assert result == Decimal("2.00") * Decimal("1.10")
+    result = _trailing_stop_premium(entry, 25.0)
+    assert result == (Decimal("2.00") * Decimal("1.08")).quantize(Decimal("0.0001"))
 
 
 def test_trailing_stop_premium_at_50pct():
-    """At +50% locks in +25% → stop at entry × 1.25."""
+    """At +50% locks in +20% → stop at entry × 1.20."""
     entry = Decimal("2.00")
     result = _trailing_stop_premium(entry, 50.0)
-    assert result == (Decimal("2.00") * Decimal("1.25")).quantize(Decimal("0.0001"))
+    assert result == (Decimal("2.00") * Decimal("1.20")).quantize(Decimal("0.0001"))
 
 
-def test_trailing_stop_premium_at_75pct():
-    """At +75% locks in +40% → stop at entry × 1.40."""
+def test_trailing_stop_premium_between_tiers_uses_lower():
+    """At +75% (below the +80% tier) still uses the +50% tier → +20%."""
     entry = Decimal("2.00")
     result = _trailing_stop_premium(entry, 75.0)
-    assert result == (Decimal("2.00") * Decimal("1.40")).quantize(Decimal("0.0001"))
+    assert result == (Decimal("2.00") * Decimal("1.20")).quantize(Decimal("0.0001"))
 
 
-def test_trailing_stop_premium_at_100pct():
-    """At +100% locks in +60% → stop at entry × 1.60."""
+def test_trailing_stop_premium_at_80pct():
+    """At +80% locks in +45% → stop at entry × 1.45."""
     entry = Decimal("2.00")
-    result = _trailing_stop_premium(entry, 100.0)
-    assert result == (Decimal("2.00") * Decimal("1.60")).quantize(Decimal("0.0001"))
+    result = _trailing_stop_premium(entry, 80.0)
+    assert result == (Decimal("2.00") * Decimal("1.45")).quantize(Decimal("0.0001"))
 
 
 def test_trailing_stop_uses_highest_tier():
-    """At +120% should use the +100% tier (locks in +60%), not +75% tier."""
+    """At +150% should use the +120% tier (locks in +75%), not the +80% tier."""
     entry = Decimal("2.00")
-    result = _trailing_stop_premium(entry, 120.0)
-    assert result == (Decimal("2.00") * Decimal("1.60")).quantize(Decimal("0.0001"))
+    result = _trailing_stop_premium(entry, 150.0)
+    assert result == (Decimal("2.00") * Decimal("1.75")).quantize(Decimal("0.0001"))
 
 
 def test_maybe_ratchet_updates_db_when_new_peak(session_factory):
@@ -900,9 +893,9 @@ def test_maybe_ratchet_updates_db_when_new_peak(session_factory):
         session.commit()
         trade_id = trade.id
 
-    # Position hits +35% → should lock in +10%
+    # Position hits +35% → crosses the +25% tier → locks in +8%
     result = _maybe_ratchet_trailing_stop(session_factory, trade, 35.0, Decimal("2.00"))
-    expected_stop = (Decimal("2.00") * Decimal("1.10")).quantize(Decimal("0.0001"))
+    expected_stop = (Decimal("2.00") * Decimal("1.08")).quantize(Decimal("0.0001"))
     assert result == expected_stop
 
     with session_factory() as session:
@@ -959,7 +952,7 @@ async def test_trailing_stop_triggers_exit_in_monitor(session_factory):
                 "peak_pnl_pct": 55.0,
                 "trailing_stop_active": True,
                 # All scale-out tiers already fired so this test isolates the full-exit path
-                "scale_out_tiers_fired": [15.0, 30.0, 50.0],
+                "scale_out_tiers_fired": [25.0, 50.0],
                 "original_qty": 4,
             },
         )
@@ -1000,8 +993,8 @@ from agents.directional.exit_monitor import (
 )
 
 
-async def test_scale_out_fires_at_15pct_tier(session_factory):
-    """When peak crosses +15%, 25% of original qty is partial-closed."""
+async def test_scale_out_fires_at_25pct_tier(session_factory):
+    """When peak crosses +25% (new first tier), 25% of original qty is closed."""
     with session_factory() as session:
         trade = Trade(
             symbol="SPY260101C00500000", asset_class="option", side="buy",
@@ -1011,7 +1004,7 @@ async def test_scale_out_fires_at_15pct_tier(session_factory):
                 "ticker": "SPY", "action": "BUY_CALL",
                 "occ_symbol": "SPY260101C00500000", "mode": "aggressive",
                 "stop_premium": "1.00",
-                "peak_pnl_pct": 18.0,  # crossed +15% tier
+                "peak_pnl_pct": 28.0,  # crossed +25% tier
                 "original_qty": 4,
             },
         )
@@ -1020,24 +1013,24 @@ async def test_scale_out_fires_at_15pct_tier(session_factory):
         trade_id = trade.id
 
     async def fake_sell(**_kw):
-        return _filled(price=2.30)
+        return _filled(price=2.56)
 
     async def fake_wait(order_id, **_kw):
-        return _filled(price=2.30)
+        return _filled(price=2.56)
 
     result = await _maybe_scale_out(
         session_factory, trade,
-        current_bid=Decimal("2.30"),
+        current_bid=Decimal("2.56"),
         submitter=fake_sell, waiter=fake_wait,
     )
     assert result is not None
-    assert result["tier"] == 15.0
+    assert result["tier"] == 25.0
     assert result["sell_qty"] == 1  # 25% of 4 = 1
 
     with session_factory() as session:
         row = session.get(Trade, trade_id)
         assert int(row.qty) == 3  # 4 - 1
-        assert 15.0 in row.extra["scale_out_tiers_fired"]
+        assert 25.0 in row.extra["scale_out_tiers_fired"]
 
 
 async def test_scale_out_fires_once_per_tier(session_factory):
@@ -1051,9 +1044,9 @@ async def test_scale_out_fires_once_per_tier(session_factory):
                 "ticker": "SPY", "action": "BUY_CALL",
                 "occ_symbol": "SPY260101C00500000", "mode": "aggressive",
                 "stop_premium": "2.06",
-                "peak_pnl_pct": 18.0,
+                "peak_pnl_pct": 28.0,
                 "original_qty": 4,
-                "scale_out_tiers_fired": [15.0],  # +15% already done
+                "scale_out_tiers_fired": [25.0],  # +25% already done
             },
         )
         session.add(trade)
@@ -1091,13 +1084,13 @@ async def test_trailing_stop_tick_partial_closes_at_tier(session_factory):
         session.commit()
 
     async def good_quote(_occ):
-        return _quote(bid=2.34)  # +17%
+        return _quote(bid=2.56)  # +28% → crosses the +25% tier
 
     async def fake_sell(**_kw):
-        return _filled(price=2.34)
+        return _filled(price=2.56)
 
     async def fake_wait(order_id, **_kw):
-        return _filled(price=2.34)
+        return _filled(price=2.56)
 
     results = await run_trailing_stop_tick(
         session_factory=session_factory,
@@ -1107,7 +1100,7 @@ async def test_trailing_stop_tick_partial_closes_at_tier(session_factory):
     )
     assert len(results) == 1
     assert results[0]["status"] == "scaled_out"
-    assert results[0]["tier"] == 15.0
+    assert results[0]["tier"] == 25.0
 
 
 async def test_trailing_stop_tick_skips_when_no_positions(session_factory):
@@ -1178,7 +1171,7 @@ async def test_scale_out_lock_prevents_duplicate_tier_fire(session_factory):
             strategy="directional_call", qty=Decimal("4"), entry_price=Decimal("1.00"),
             opened_at=datetime.now(UTC),
             extra={"ticker": "SPY", "action": "BUY_CALL", "occ_symbol": "SPY260101C00500000",
-                   "mode": "aggressive", "peak_pnl_pct": 20.0, "original_qty": 4},
+                   "mode": "aggressive", "peak_pnl_pct": 28.0, "original_qty": 4},
         )
         s.add(t); s.commit(); tid = t.id
 
@@ -1215,13 +1208,13 @@ async def test_scale_out_lock_prevents_duplicate_tier_fire(session_factory):
     assert submits["n"] == 1, "only one sell order should be submitted (no double-sell)"
     with session_factory() as s:
         row = s.get(Trade, tid)
-        assert row.extra["scale_out_tiers_fired"] == [15.0], "tier recorded exactly once"
+        assert row.extra["scale_out_tiers_fired"] == [25.0], "tier recorded exactly once"
         assert int(row.qty) == 3, "qty decremented once (4 → 3), no stale clobber"
 
 
 async def test_scale_out_decrements_from_fresh_qty(session_factory):
     """Sequential scale-outs across tiers decrement from the live row.qty, not a
-    stale captured value — 4 → 3 (15%) → 2 (30%)."""
+    stale captured value — 4 → 3 (+25%) → 2 (+50%)."""
     import asyncio
     from agents.directional.exit_monitor import _maybe_scale_out, _scale_out_locks
     _scale_out_locks.clear()
@@ -1232,7 +1225,7 @@ async def test_scale_out_decrements_from_fresh_qty(session_factory):
             strategy="directional_call", qty=Decimal("4"), entry_price=Decimal("1.00"),
             opened_at=datetime.now(UTC),
             extra={"ticker": "SPY", "action": "BUY_CALL", "occ_symbol": "SPY260101C00500000",
-                   "mode": "aggressive", "peak_pnl_pct": 35.0, "original_qty": 4},
+                   "mode": "aggressive", "peak_pnl_pct": 55.0, "original_qty": 4},
         )
         s.add(t); s.commit(); tid = t.id
 
@@ -1248,11 +1241,57 @@ async def test_scale_out_decrements_from_fresh_qty(session_factory):
 
     with session_factory() as s:
         trade = s.get(Trade, tid); s.expunge(trade)
-    # First call fires +15% (lowest unfired), second fires +30%.
+    # First call fires +25% (lowest unfired), second fires +50%.
     r1 = await _maybe_scale_out(session_factory, trade, Decimal("1.30"), submitter, waiter)
     r2 = await _maybe_scale_out(session_factory, trade, Decimal("1.30"), submitter, waiter)
-    assert r1["tier"] == 15.0 and r2["tier"] == 30.0
+    assert r1["tier"] == 25.0 and r2["tier"] == 50.0
     with session_factory() as s:
         row = s.get(Trade, tid)
-        assert row.extra["scale_out_tiers_fired"] == [15.0, 30.0]
+        assert row.extra["scale_out_tiers_fired"] == [25.0, 50.0]
         assert int(row.qty) == 2, "4 → 3 → 2"
+
+
+# ----------------- configurable ladder -----------------
+
+
+def test_trailing_stop_levels_default():
+    from agents.directional.exit_monitor import (
+        DEFAULT_TRAILING_STOP_LEVELS, _trailing_stop_levels,
+    )
+    assert _trailing_stop_levels() == DEFAULT_TRAILING_STOP_LEVELS
+    # New default ladder: sell tiers at +25% and +50%, last 50% rides.
+    sell_tiers = sorted(t[0] for t in DEFAULT_TRAILING_STOP_LEVELS if t[2] > 0)
+    assert sell_tiers == [25.0, 50.0]
+
+
+def test_trailing_stop_levels_config_override(monkeypatch):
+    from agents.directional import exit_monitor as em
+    monkeypatch.setattr(
+        em.get_settings(), "trailing_stop_levels",
+        "[[60,0.30,0.5],[20,0.05,0.5]]",
+    )
+    levels = em._trailing_stop_levels()
+    assert levels == [(60.0, 0.30, 0.5), (20.0, 0.05, 0.5)]  # sorted high→low
+
+
+def test_trailing_stop_levels_invalid_falls_back(monkeypatch):
+    from agents.directional import exit_monitor as em
+    warned = []
+    monkeypatch.setattr(em.log, "warning", lambda *a, **k: warned.append(a))
+    monkeypatch.setattr(em.get_settings(), "trailing_stop_levels", "not json")
+    assert em._trailing_stop_levels() == em.DEFAULT_TRAILING_STOP_LEVELS
+    assert warned and warned[0][0] == "trailing_stop_levels_invalid"
+
+
+def test_scale_out_plan_summary_default():
+    from agents.directional.exit_monitor import scale_out_plan_summary
+    assert scale_out_plan_summary() == "scale out 25% at +25%, +50% gain"
+
+
+def test_scale_out_plan_summary_tracks_config(monkeypatch):
+    from agents.directional import exit_monitor as em
+    monkeypatch.setattr(
+        em.get_settings(), "trailing_stop_levels",
+        "[[60,0.30,0.5],[20,0.05,0.5]]",
+    )
+    assert em.scale_out_plan_summary() == "scale out 50% at +20%, +60% gain"

@@ -41,12 +41,12 @@ DEFAULT_CUTOFF_DATE = date(2026, 5, 26)
 
 ET = ZoneInfo("America/New_York")
 
-# Tiers we expect to fire if peak crosses them. Mirrors TRAILING_STOP_LEVELS
-# in agents/directional/exit_monitor.py — kept in sync manually for now.
-# Values are in PERCENT (15.0 = +15%), matching how peak_pnl_pct and the
-# entries of scale_out_tiers_fired are persisted (exit_monitor appends the
-# raw trigger_pct, e.g. 15.0).
-TIER_THRESHOLDS = [15.0, 30.0, 50.0]  # tiers that have sell_frac > 0
+# Tiers we expect to fire if peak crosses them. Mirrors the sell tiers in
+# DEFAULT_TRAILING_STOP_LEVELS (agents/directional/exit_monitor.py) — kept in
+# sync manually. Values are in PERCENT (25.0 = +25%), matching how peak_pnl_pct
+# and scale_out_tiers_fired are persisted (exit_monitor appends raw trigger_pct).
+# Retuned 2026-06-05: ladder moved 15/30/50 → 25/50 (sell tiers only).
+TIER_THRESHOLDS = [25.0, 50.0]  # tiers that have sell_frac > 0
 
 
 # ---------------------------------------------------------------------------

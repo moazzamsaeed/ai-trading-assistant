@@ -48,6 +48,7 @@ from integrations.alpaca_client import (
     parse_occ_symbol,
 )
 from trademaster import indicators
+from trademaster.config import get_settings
 from trademaster.db import Trade, make_session_factory
 from trademaster.logging import get_logger
 from trademaster.router import TaskType, route_to_model
@@ -65,15 +66,54 @@ PROFIT_LOCK_PCT = 75.0             # always consult LLM above this P&L even with
 # Walked from highest to lowest. At each crossed tier:
 #   - Ratchet stop on REMAINING position to lock_in_pct
 #   - Sell sell_fraction of ORIGINAL qty to lock that portion in
-# Sell fractions add up to 75%; the final 25% is held with the highest ratcheted
-# stop so big winners still get to run.
-TRAILING_STOP_LEVELS: list[tuple[float, float, float]] = [
-    (100.0, 0.60, 0.00),  # +100% → lock +60%, no further sell (last 25% runs)
-    (75.0,  0.40, 0.00),  # +75%  → lock +40%, no further sell
-    (50.0,  0.25, 0.25),  # +50%  → lock +25% AND sell 25% of original
-    (30.0,  0.10, 0.25),  # +30%  → lock +10% AND sell 25% of original
-    (15.0,  0.03, 0.25),  # +15%  → lock +3%  AND sell 25% of original
+#
+# Retuned 2026-06-05 to let winners run further (was 15/30/50 selling 75% by
+# +50%). Now scaling starts at +25% and only 50% is sold by +50% — the last 50%
+# rides to +80/+120% with an ever-rising ratchet. More trend capture, at the
+# cost of more give-back on reversals; tracked via the health-check peak-vs-
+# realized metric. Override per-deployment via settings.trailing_stop_levels
+# (JSON array of [trigger, lock, sell]); see _trailing_stop_levels().
+DEFAULT_TRAILING_STOP_LEVELS: list[tuple[float, float, float]] = [
+    (120.0, 0.75, 0.00),  # +120% → lock +75%, no further sell
+    (80.0,  0.45, 0.00),  # +80%  → lock +45%, no further sell
+    (50.0,  0.20, 0.25),  # +50%  → lock +20% AND sell 25% of original
+    (25.0,  0.08, 0.25),  # +25%  → lock +8%  AND sell 25% of original
 ]
+# Backward-compat alias — tests and the trade_health_check mirror reference this.
+TRAILING_STOP_LEVELS = DEFAULT_TRAILING_STOP_LEVELS
+
+
+def _trailing_stop_levels() -> list[tuple[float, float, float]]:
+    """The active scale-out / trailing-stop ladder, sorted high→low.
+
+    Reads settings.trailing_stop_levels (a JSON array of
+    [trigger_pct, lock_pct, sell_frac]) when set, so the ladder can be A/B'd
+    without a code change; falls back to DEFAULT_TRAILING_STOP_LEVELS on empty
+    or invalid config (logged)."""
+    raw = (get_settings().trailing_stop_levels or "").strip()
+    if not raw:
+        return DEFAULT_TRAILING_STOP_LEVELS
+    try:
+        parsed = json.loads(raw)
+        levels = [(float(t), float(lk), float(s)) for t, lk, s in parsed]
+        if not levels:
+            raise ValueError("empty levels")
+        return sorted(levels, key=lambda x: x[0], reverse=True)
+    except (ValueError, TypeError, json.JSONDecodeError) as e:
+        log.warning("trailing_stop_levels_invalid", error=str(e), raw=raw[:120])
+        return DEFAULT_TRAILING_STOP_LEVELS
+
+
+def scale_out_plan_summary() -> str:
+    """Plain-language scale-out description for #signals, derived from the active
+    ladder so the signal text never drifts from the real config."""
+    sell_tiers = sorted((t for t in _trailing_stop_levels() if t[2] > 0), key=lambda x: x[0])
+    if not sell_tiers:
+        return "ride the full position with a trailing stop"
+    fracs = {int(round(s * 100)) for _, _, s in sell_tiers}
+    frac_txt = f"{next(iter(fracs))}%" if len(fracs) == 1 else "a portion"
+    tiers_txt = ", ".join(f"+{int(t)}%" for t, _, _ in sell_tiers)
+    return f"scale out {frac_txt} at {tiers_txt} gain"
 
 _EXIT_CONFIRM_PROMPT = """You manage an open options position. Decide EXIT or HOLD.
 
@@ -168,11 +208,11 @@ def _trailing_stop_premium(
 ) -> Decimal | None:
     """Return the stop price that locks in gains at the current peak level.
 
-    Walks TRAILING_STOP_LEVELS from highest to lowest and returns the first
+    Walks the active ladder from highest to lowest and returns the first
     tier whose trigger has been reached. Returns None if peak is below the
-    lowest trigger (+15%).
+    lowest trigger.
     """
-    for trigger_pct, lock_pct, _sell_frac in TRAILING_STOP_LEVELS:
+    for trigger_pct, lock_pct, _sell_frac in _trailing_stop_levels():
         if peak_pnl_pct >= trigger_pct:
             return (entry_premium * (Decimal("1") + Decimal(str(lock_pct)))).quantize(
                 Decimal("0.0001")
@@ -286,7 +326,7 @@ async def _maybe_scale_out(
 
         # Find the lowest unfired tier the peak has crossed (process lowest first)
         new_tier = None
-        for trigger, _lock, sell_frac in sorted(TRAILING_STOP_LEVELS, key=lambda t: t[0]):
+        for trigger, _lock, sell_frac in sorted(_trailing_stop_levels(), key=lambda t: t[0]):
             if peak >= trigger and trigger not in fired and sell_frac > 0:
                 new_tier = (trigger, sell_frac)
                 break
