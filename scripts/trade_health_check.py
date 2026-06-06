@@ -45,8 +45,8 @@ ET = ZoneInfo("America/New_York")
 # DEFAULT_TRAILING_STOP_LEVELS (agents/directional/exit_monitor.py) — kept in
 # sync manually. Values are in PERCENT (25.0 = +25%), matching how peak_pnl_pct
 # and scale_out_tiers_fired are persisted (exit_monitor appends raw trigger_pct).
-# Retuned 2026-06-05: ladder moved 15/30/50 → 25/50 (sell tiers only).
-TIER_THRESHOLDS = [25.0, 50.0]  # tiers that have sell_frac > 0
+# Retuned 2026-06-05 (v2): single scale-out tier at +100% (ride-then-scale-once).
+TIER_THRESHOLDS = [100.0]  # tiers that have sell_frac > 0
 
 
 # ---------------------------------------------------------------------------

@@ -67,17 +67,21 @@ PROFIT_LOCK_PCT = 75.0             # always consult LLM above this P&L even with
 #   - Ratchet stop on REMAINING position to lock_in_pct
 #   - Sell sell_fraction of ORIGINAL qty to lock that portion in
 #
-# Retuned 2026-06-05 to let winners run further (was 15/30/50 selling 75% by
-# +50%). Now scaling starts at +25% and only 50% is sold by +50% — the last 50%
-# rides to +80/+120% with an ever-rising ratchet. More trend capture, at the
-# cost of more give-back on reversals; tracked via the health-check peak-vs-
-# realized metric. Override per-deployment via settings.trailing_stop_levels
-# (JSON array of [trigger, lock, sell]); see _trailing_stop_levels().
+# Retuned 2026-06-05 (v2): "ride, then scale once." The position is PROTECTED
+# the whole way up by the trailing-stop ratchet (lock at +25/+50/+80%), but
+# does NOT sell until +100% — then it banks 25% (cheap insurance: 0DTE gamma
+# makes +100%+ positions reversal-prone) and the remaining 75% rides. ABOVE
+# +100% the stop trails continuously (peak − trailing_stop_trail_gap_pct, see
+# _trailing_stop_premium), so big runners keep ratcheting (+200% → lock +180%)
+# instead of getting scaled off early. Earlier v1 sold 25% at both +25% and
+# +50%, which gave winners away before they trended. Tracked via the
+# health-check peak-vs-realized metric. Override via settings.trailing_stop_levels.
 DEFAULT_TRAILING_STOP_LEVELS: list[tuple[float, float, float]] = [
-    (120.0, 0.75, 0.00),  # +120% → lock +75%, no further sell
-    (80.0,  0.45, 0.00),  # +80%  → lock +45%, no further sell
-    (50.0,  0.20, 0.25),  # +50%  → lock +20% AND sell 25% of original
-    (25.0,  0.08, 0.25),  # +25%  → lock +8%  AND sell 25% of original
+    (100.0, 0.60, 0.25),  # +100% → SELL 25% (the one scale-out); above here the
+                          #          stop trails continuously (peak − gap)
+    (80.0,  0.45, 0.00),  # +80%  → lock +45%, ride (no sell)
+    (50.0,  0.20, 0.00),  # +50%  → lock +20%, ride (no sell)
+    (25.0,  0.08, 0.00),  # +25%  → lock +8%,  ride (no sell)
 ]
 # Backward-compat alias — tests and the trade_health_check mirror reference this.
 TRAILING_STOP_LEVELS = DEFAULT_TRAILING_STOP_LEVELS

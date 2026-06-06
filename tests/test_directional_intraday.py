@@ -594,7 +594,7 @@ def test_format_plan_signal_has_greens_trigger_and_target():
     assert "Green lights (5/5)" in out
     assert "enter as **SPY trades $743.10**" in out
     assert "$745.30 (prev high)" in out
-    assert "scale out 25% at +25%, +50%" in out  # derived from the live ladder
+    assert "scale out 25% at +100% gain" in out  # derived from the live ladder
 
 
 def test_format_plan_signal_survives_missing_analysis():

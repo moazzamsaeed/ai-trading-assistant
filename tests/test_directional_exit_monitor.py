@@ -999,8 +999,8 @@ from agents.directional.exit_monitor import (
 )
 
 
-async def test_scale_out_fires_at_25pct_tier(session_factory):
-    """When peak crosses +25% (new first tier), 25% of original qty is closed."""
+async def test_scale_out_fires_at_100pct_tier(session_factory):
+    """v2 ladder: the single scale-out fires at +100%, selling 25% of original."""
     with session_factory() as session:
         trade = Trade(
             symbol="SPY260101C00500000", asset_class="option", side="buy",
@@ -1010,7 +1010,7 @@ async def test_scale_out_fires_at_25pct_tier(session_factory):
                 "ticker": "SPY", "action": "BUY_CALL",
                 "occ_symbol": "SPY260101C00500000", "mode": "aggressive",
                 "stop_premium": "1.00",
-                "peak_pnl_pct": 28.0,  # crossed +25% tier
+                "peak_pnl_pct": 110.0,  # crossed +100% tier
                 "original_qty": 4,
             },
         )
@@ -1019,24 +1019,24 @@ async def test_scale_out_fires_at_25pct_tier(session_factory):
         trade_id = trade.id
 
     async def fake_sell(**_kw):
-        return _filled(price=2.56)
+        return _filled(price=4.20)
 
     async def fake_wait(order_id, **_kw):
-        return _filled(price=2.56)
+        return _filled(price=4.20)
 
     result = await _maybe_scale_out(
         session_factory, trade,
-        current_bid=Decimal("2.56"),
+        current_bid=Decimal("4.20"),
         submitter=fake_sell, waiter=fake_wait,
     )
     assert result is not None
-    assert result["tier"] == 25.0
+    assert result["tier"] == 100.0
     assert result["sell_qty"] == 1  # 25% of 4 = 1
 
     with session_factory() as session:
         row = session.get(Trade, trade_id)
         assert int(row.qty) == 3  # 4 - 1
-        assert 25.0 in row.extra["scale_out_tiers_fired"]
+        assert 100.0 in row.extra["scale_out_tiers_fired"]
 
 
 async def test_scale_out_fires_once_per_tier(session_factory):
@@ -1050,9 +1050,9 @@ async def test_scale_out_fires_once_per_tier(session_factory):
                 "ticker": "SPY", "action": "BUY_CALL",
                 "occ_symbol": "SPY260101C00500000", "mode": "aggressive",
                 "stop_premium": "2.06",
-                "peak_pnl_pct": 28.0,
+                "peak_pnl_pct": 110.0,
                 "original_qty": 4,
-                "scale_out_tiers_fired": [25.0],  # +25% already done
+                "scale_out_tiers_fired": [100.0],  # +100% already done
             },
         )
         session.add(trade)
@@ -1090,13 +1090,13 @@ async def test_trailing_stop_tick_partial_closes_at_tier(session_factory):
         session.commit()
 
     async def good_quote(_occ):
-        return _quote(bid=2.56)  # +28% → crosses the +25% tier
+        return _quote(bid=4.20)  # +110% → crosses the +100% scale-out tier
 
     async def fake_sell(**_kw):
-        return _filled(price=2.56)
+        return _filled(price=4.20)
 
     async def fake_wait(order_id, **_kw):
-        return _filled(price=2.56)
+        return _filled(price=4.20)
 
     results = await run_trailing_stop_tick(
         session_factory=session_factory,
@@ -1106,7 +1106,7 @@ async def test_trailing_stop_tick_partial_closes_at_tier(session_factory):
     )
     assert len(results) == 1
     assert results[0]["status"] == "scaled_out"
-    assert results[0]["tier"] == 25.0
+    assert results[0]["tier"] == 100.0
 
 
 async def test_trailing_stop_tick_skips_when_no_positions(session_factory):
@@ -1177,7 +1177,7 @@ async def test_scale_out_lock_prevents_duplicate_tier_fire(session_factory):
             strategy="directional_call", qty=Decimal("4"), entry_price=Decimal("1.00"),
             opened_at=datetime.now(UTC),
             extra={"ticker": "SPY", "action": "BUY_CALL", "occ_symbol": "SPY260101C00500000",
-                   "mode": "aggressive", "peak_pnl_pct": 28.0, "original_qty": 4},
+                   "mode": "aggressive", "peak_pnl_pct": 110.0, "original_qty": 4},
         )
         s.add(t); s.commit(); tid = t.id
 
@@ -1214,16 +1214,22 @@ async def test_scale_out_lock_prevents_duplicate_tier_fire(session_factory):
     assert submits["n"] == 1, "only one sell order should be submitted (no double-sell)"
     with session_factory() as s:
         row = s.get(Trade, tid)
-        assert row.extra["scale_out_tiers_fired"] == [25.0], "tier recorded exactly once"
+        assert row.extra["scale_out_tiers_fired"] == [100.0], "tier recorded exactly once"
         assert int(row.qty) == 3, "qty decremented once (4 → 3), no stale clobber"
 
 
-async def test_scale_out_decrements_from_fresh_qty(session_factory):
+async def test_scale_out_decrements_from_fresh_qty(session_factory, monkeypatch):
     """Sequential scale-outs across tiers decrement from the live row.qty, not a
-    stale captured value — 4 → 3 (+25%) → 2 (+50%)."""
+    stale captured value — 4 → 3 (+25%) → 2 (+50%). Uses a 2-sell config-override
+    ladder (the default v2 ladder sells only once, at +100%)."""
     import asyncio
+    from agents.directional import exit_monitor as em
     from agents.directional.exit_monitor import _maybe_scale_out, _scale_out_locks
     _scale_out_locks.clear()
+    monkeypatch.setattr(
+        em.get_settings(), "trailing_stop_levels",
+        "[[50,0.20,0.25],[25,0.08,0.25]]",
+    )
 
     with session_factory() as s:
         t = Trade(
@@ -1265,9 +1271,9 @@ def test_trailing_stop_levels_default():
         DEFAULT_TRAILING_STOP_LEVELS, _trailing_stop_levels,
     )
     assert _trailing_stop_levels() == DEFAULT_TRAILING_STOP_LEVELS
-    # New default ladder: sell tiers at +25% and +50%, last 50% rides.
+    # v2 ladder: single scale-out tier at +100% (ride-then-scale-once).
     sell_tiers = sorted(t[0] for t in DEFAULT_TRAILING_STOP_LEVELS if t[2] > 0)
-    assert sell_tiers == [25.0, 50.0]
+    assert sell_tiers == [100.0]
 
 
 def test_trailing_stop_levels_config_override(monkeypatch):
@@ -1291,7 +1297,7 @@ def test_trailing_stop_levels_invalid_falls_back(monkeypatch):
 
 def test_scale_out_plan_summary_default():
     from agents.directional.exit_monitor import scale_out_plan_summary
-    assert scale_out_plan_summary() == "scale out 25% at +25%, +50% gain"
+    assert scale_out_plan_summary() == "scale out 25% at +100% gain"
 
 
 def test_scale_out_plan_summary_tracks_config(monkeypatch):
