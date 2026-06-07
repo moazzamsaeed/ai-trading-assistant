@@ -145,7 +145,7 @@ LOSS SIDE — exit if thesis is broken:
 
 PROFIT SIDE — no hard target, use indicator confluence:
   • P&L 30–74%: exit if ≥2 indicators show fading momentum
-  • P&L ≥75%: exit if ANY single indicator shows fading momentum
+  • P&L ≥75%: {profit_lock_rule}
   • P&L ≥150%: EXIT unless ALL indicators unanimously confirm continuation (rare — capture the gain)
   • Volume fade alone while in profit = smart money distributing into your position → EXIT
   • RSI exhaustion + volume fade = momentum spent → EXIT
@@ -509,6 +509,13 @@ async def _llm_exit_confirm(
         "SELECTIVE — protect gains. A single strong reversal signal while in profit "
         "is sufficient to EXIT. Don't give back gains chasing more."
     )
+    # +75% rule, mode-aware so the framework agrees with MODE CONTEXT (was a
+    # contradiction: framework said "any single", aggressive guidance said "≥2").
+    profit_lock_rule = (
+        "still require ≥2 fading indicators to exit (let winners run — one is noise)"
+        if mode == "aggressive" else
+        "exit if ANY single indicator shows fading momentum (protect gains)"
+    )
 
     pnl_sign = "+" if pnl_pct >= 0 else "-"
     prompt = _EXIT_CONFIRM_PROMPT.format(
@@ -523,6 +530,7 @@ async def _llm_exit_confirm(
         expiry=expiry,
         profit_target=profit_target,
         stop_ref=stop_ref,
+        profit_lock_rule=profit_lock_rule,
         price=snap.get("last_close", "?"),
         vwap=snap.get("vwap", "N/A"),
         rsi=snap.get("rsi9", "N/A"),

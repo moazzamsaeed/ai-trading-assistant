@@ -1307,3 +1307,32 @@ def test_scale_out_plan_summary_tracks_config(monkeypatch):
         "[[60,0.30,0.5],[20,0.05,0.5]]",
     )
     assert em.scale_out_plan_summary() == "scale out 50% at +20%, +60% gain"
+
+
+# ----------------- exit-prompt profit rule is mode-aware (#3) -----------------
+
+
+async def test_exit_prompt_profit_rule_is_mode_aware(session_factory):
+    """The +75% profit-take rule must match the mode (no framework/mode-context
+    contradiction): aggressive → ≥2 fading; selective → any single fading."""
+    captured = {}
+
+    async def capture_llm(_task_type, prompt, **_k):
+        captured["prompt"] = prompt
+        return _fake_llm("HOLD", "x")
+
+    t_agg = _fake_trade_obj()
+    t_agg.extra = {**t_agg.extra, "mode": "aggressive"}
+    await _llm_exit_confirm(
+        trade=t_agg, snap=_snap(), triggered_rules=[], current_bid=Decimal("3.0"),
+        pnl_pct=90.0, session_factory=session_factory, llm_caller=capture_llm,
+    )
+    assert "require ≥2 fading indicators to exit" in captured["prompt"]
+    assert "ANY single indicator shows fading momentum (protect" not in captured["prompt"]
+
+    t_sel = _fake_trade_obj()  # default mode = selective
+    await _llm_exit_confirm(
+        trade=t_sel, snap=_snap(), triggered_rules=[], current_bid=Decimal("3.0"),
+        pnl_pct=90.0, session_factory=session_factory, llm_caller=capture_llm,
+    )
+    assert "ANY single indicator shows fading momentum (protect gains)" in captured["prompt"]
