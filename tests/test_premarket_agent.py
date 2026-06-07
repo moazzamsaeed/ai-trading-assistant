@@ -114,10 +114,12 @@ async def test_briefing_includes_week_window_and_upcoming_events(monkeypatch, se
         captured["hours_back"] = hours_back
         return _fake_articles()
 
+    bias_json = '{"bias":"BULLISH","summary":"trend up","catalysts":["CPI"],"risks":["FOMC"]}'
+
     async def fake_route(_task_type, prompt, **_kwargs):
         captured["prompt"] = prompt
         return LLMResponse(
-            text='## Synthesis\nUp.\n{"bias":"BULLISH","summary":"trend up","catalysts":["CPI"],"risks":["FOMC"]}',
+            text=f"## Synthesis\nUp.\n{bias_json}",
             provider="google", model="gemini-2.5-pro",
             input_tokens=400, output_tokens=120,
             cost_usd=Decimal("0.002"), duration_ms=1500,
