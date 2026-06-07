@@ -519,9 +519,9 @@ def format_entry_combined(
         manual_expiry = wk.strftime("%b %-d")
 
     return (
-        f"{icon} **{decision.ticker} {action_word} — bot entered** [{mode.upper()}]\n"
+        f"{icon} **{decision.ticker} {action_word} — model entered** [{mode.upper()}]\n"
         f"\n"
-        f"Bot: **{qty}×** `{occ}` @ **${entry_premium}**/share (${total_cost} total)\n"
+        f"Model: **{qty}×** `{occ}` @ **${entry_premium}**/share (${total_cost} total)\n"
         f"**Manual entry: Buy {decision.ticker} {manual_expiry} "
         f"${decision.strike} {option_word}**\n"
         f"\n"

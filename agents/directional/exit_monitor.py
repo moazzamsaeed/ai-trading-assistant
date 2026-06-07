@@ -629,7 +629,7 @@ def _format_exit_combined(
     icon = "📈" if action == "BUY_CALL" else "📉"
 
     lines = [
-        f"{icon} **{ticker} {option_word} — bot closed** [{mode.upper()}]",
+        f"{icon} **{ticker} {option_word} — model closed** [{mode.upper()}]",
         "",
         f"Reason: {reason_text}",
     ]
@@ -637,7 +637,7 @@ def _format_exit_combined(
         lines.append(f"_{llm_reasoning}_")
     lines += [
         "",
-        f"Bot sold: {qty}× `{occ}` @ **${exit_premium}**/share",
+        f"Model sold: {qty}× `{occ}` @ **${exit_premium}**/share",
         f"**Manual close: Sell {qty}× {ticker} {option_word} at market**",
         "",
         f"P&L: **{pnl_icon} ${abs(pnl_total)}** "

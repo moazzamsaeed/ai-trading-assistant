@@ -274,11 +274,11 @@ async def test_directional_exit_job_posts_combined_to_signals(monkeypatch):
         )
 
     async def fake_monitor(**_kwargs):
-        return [{"combined_text": "📈 SPY CALL — bot closed"}]
+        return [{"combined_text": "📈 SPY CALL — model closed"}]
 
     monkeypatch.setattr(sch, "run_directional_exit_monitor", fake_monitor)
     await sch._directional_exit_job(signal_poster=signals, clock_fetcher=clock_open)
-    assert sig == ["📈 SPY CALL — bot closed"]
+    assert sig == ["📈 SPY CALL — model closed"]
 
 
 async def test_directional_exit_job_force_skips_clock(monkeypatch):

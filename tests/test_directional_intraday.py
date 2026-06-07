@@ -610,7 +610,7 @@ def test_format_entry_combined_mentions_scale_out_reporting():
         d, today=date(2026, 5, 29), mode="aggressive", trade_id=1, qty=2,
         occ="SPY260529C00743000", entry_premium=Decimal("1.42"), total_cost=Decimal("284.00"),
     )
-    assert "bot entered" in out
+    assert "model entered" in out
     assert "scale-out" in out and "final close" in out
 
 

@@ -261,7 +261,7 @@ def test_format_exit_combined_profit():
     t = _fake_trade_for_format()
     msg = _format_exit_combined(t, Decimal("3.00"), "smart_exit", "RSI reversed at 74")
     assert "📈" in msg
-    assert "bot closed" in msg
+    assert "model closed" in msg
     assert "🧠 smart exit" in msg
     assert "RSI reversed" in msg
     assert "Sell" in msg
