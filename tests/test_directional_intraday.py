@@ -637,3 +637,49 @@ async def test_scan_attaches_analysis_to_actionable(monkeypatch, session_factory
     assert spy.analysis is not None
     assert spy.analysis["spy_price"] is not None
     assert "volume_ratio" in spy.analysis
+
+
+# ----------------- pre-emptive "setup forming" alert (Option A) -----------------
+
+
+def test_log_near_misses_returns_forming(session_factory):
+    """A 3/4 bullish near-miss (missing volume) is returned for a forming alert."""
+    snaps = {"SPY": {"last_close": "743.1", "vwap": "742.4", "rsi9": "58",
+                     "ema20": "742.9", "ema50": "742.1", "volume_ratio_20": "0.8",
+                     "macd": "0.1", "macd_signal": "0.05"}}
+    holds = [TickerDecision("SPY", "HOLD", None, None, "LOW", "held — low volume")]
+    forming = agent._log_near_misses(
+        holds, ticker_snaps=snaps, spy_regime="BULL", session_factory=session_factory,
+    )
+    assert "SPY" in forming
+    assert forming["SPY"]["would_be_action"] == "BUY_CALL"
+    assert forming["SPY"]["criteria_met"] == 3
+    assert "volume ≥ 1.0×" in forming["SPY"]["missing"]
+
+
+def test_log_near_misses_empty_when_genuine_hold(session_factory):
+    """A weak setup (≤2 criteria) returns no forming entry."""
+    # price>VWAP + ema_bull = 2 bull, but RSI 30 out-of-band and vol low → max 2.
+    snaps = {"SPY": {"last_close": "742.5", "vwap": "742.4", "rsi9": "30",
+                     "ema20": "742.9", "ema50": "742.1", "volume_ratio_20": "0.5"}}
+    holds = [TickerDecision("SPY", "HOLD", None, None, "LOW", "no edge")]
+    forming = agent._log_near_misses(
+        holds, ticker_snaps=snaps, spy_regime="NEUTRAL", session_factory=session_factory,
+    )
+    assert forming == {}
+
+
+def test_format_setup_forming_renders_watch_alert():
+    d = TickerDecision(
+        "SPY", "HOLD", None, None, "LOW", "forming",
+        analysis={"spy_price": 743.1, "vwap": 742.4, "rsi9": 58.0, "ema20": 742.9,
+                  "ema50": 742.1, "macd": "0.10", "macd_signal": "0.06", "volume_ratio": 0.8,
+                  "forming": {"would_be_action": "BUY_CALL", "criteria_met": 3,
+                              "missing": ["volume ≥ 1.0×"]}},
+    )
+    out = agent.format_setup_forming(d, mode="aggressive")
+    assert "setup forming" in out and "watching" in out
+    assert "Building (3/4 criteria)" in out
+    assert "Still needs: volume" in out
+    assert "model will enter a CALL" in out
+    assert "not an entry yet" in out.lower()

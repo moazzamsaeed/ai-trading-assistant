@@ -496,6 +496,42 @@ def format_directional_plan(
     return "\n".join(lines)
 
 
+def format_setup_forming(
+    d: TickerDecision, *, mode: str = "selective"
+) -> str:
+    """Pre-emptive 'setup forming' WATCH alert for #signals.
+
+    Fired on a strong near-miss — BEFORE the model would enter — to prep manual
+    traders for a forming move. This is the anticipatory first signal; the
+    'model entered' confirmation comes later, only if/when it actually triggers.
+    """
+    a = d.analysis or {}
+    f = a.get("forming", {})
+    would_be = f.get("would_be_action", "BUY_CALL")
+    is_call = would_be == "BUY_CALL"
+    opt = "CALL" if is_call else "PUT"
+    criteria_met = f.get("criteria_met", 0)
+    missing = f.get("missing", [])
+    spy_price = a.get("spy_price")
+    px = f"${float(spy_price):.2f}" if spy_price else "current levels"
+
+    lines = [
+        f"👀 **{d.ticker} {opt} setup forming** [{mode.upper()} · watching]",
+        "",
+        f"Building ({criteria_met}/4 criteria):",
+    ]
+    lines += [f"  {g}" for g in _green_lights(would_be, a)]
+    lines.append("")
+    if missing:
+        lines.append(f"⏳ Still needs: {', '.join(missing)}.")
+    lines += [
+        f"If it confirms near {px}, the model will enter a {opt} — manual "
+        f"traders, get ready.",
+        "_Heads-up only — not an entry yet._",
+    ]
+    return "\n".join(lines)
+
+
 def format_entry_combined(
     decision: TickerDecision,
     *,
@@ -967,8 +1003,11 @@ def _log_near_misses(
     ticker_snaps: dict[str, dict],
     spy_regime: str,
     session_factory,
-) -> None:
+) -> dict[str, dict]:
     """Persist near-miss rows for HOLDs that met ≥3 of the 4 production criteria.
+
+    Returns a {ticker: forming-setup info} dict for those near-misses so the
+    scheduler can post pre-emptive "setup forming" alerts to #signals.
 
     criteria_met counts against PRODUCTION thresholds, so it lines up with
     what the LLM gate sees.
@@ -983,6 +1022,7 @@ def _log_near_misses(
       narrower RSI bands (45-72 / 28-55).
     """
     rows: list[NearMiss] = []
+    forming: dict[str, dict] = {}
     for d in hold_decisions:
         snap = ticker_snaps.get(d.ticker, {})
         price = float(snap.get("last_close") or 0)
@@ -1005,11 +1045,33 @@ def _log_near_misses(
 
         if bullish >= 3:
             criteria_met, would_be, ema_flag = bullish, "BUY_CALL", ema_bull
+            checks = {
+                "price > VWAP": above_vwap,
+                "RSI 40–80": 40 <= rsi <= 80,
+                "EMA20 > EMA50": ema_bull,
+                "volume ≥ 1.0×": vol_meets_threshold,
+            }
         elif bearish >= 3:
             criteria_met, would_be, ema_flag = bearish, "BUY_PUT", ema_bear
+            checks = {
+                "price < VWAP": not above_vwap,
+                "RSI 20–60": 20 <= rsi <= 60,
+                "EMA20 < EMA50": ema_bear,
+                "volume ≥ 1.0×": vol_meets_threshold,
+            }
         else:
             continue  # genuine HOLD, not a near-miss
 
+        forming[d.ticker] = {
+            "would_be_action": would_be,
+            "criteria_met": criteria_met,
+            "missing": [k for k, ok in checks.items() if not ok],
+            "snap": {
+                "spy_price": price, "vwap": vwap, "rsi9": rsi,
+                "ema20": ema20, "ema50": ema50, "volume_ratio": vr,
+                "macd": snap.get("macd"), "macd_signal": snap.get("macd_signal"),
+            },
+        }
         rows.append(NearMiss(
             ticker=d.ticker,
             would_be_action=would_be,
@@ -1032,6 +1094,8 @@ def _log_near_misses(
                      tickers=[r.ticker for r in rows])
         except Exception as e:  # noqa: BLE001
             log.debug("near_miss_log_failed", error=str(e))
+
+    return forming
 
 
 async def run_directional_scan(
@@ -1225,12 +1289,20 @@ async def run_directional_scan(
     # indicators, check criteria against PRODUCTION thresholds (vol≥1.3).
     # Skips tickers with missing bars or null indicators — those can't
     # meaningfully be near-misses, and including them would produce noise.
-    _log_near_misses(
+    forming = _log_near_misses(
         [d for d in decisions if d.action == "HOLD" and d.ticker not in blocked],
         ticker_snaps=ticker_snaps,
         spy_regime=market_ctx.get("spy_regime", "NEUTRAL"),
         session_factory=factory,
     )
+    # Attach forming-setup context to the matching HOLD decisions so the
+    # scheduler can post pre-emptive "setup forming" alerts (Option A).
+    if forming:
+        decisions = [
+            replace(d, analysis={**forming[d.ticker]["snap"], "forming": forming[d.ticker]})
+            if d.action == "HOLD" and d.ticker in forming else d
+            for d in decisions
+        ]
 
     # Persist one Signal row per actionable decision.
     today = now.date()

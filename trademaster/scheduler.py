@@ -30,8 +30,8 @@ from agents.directional.exit_monitor import (
     run_trailing_stop_tick,
 )
 from agents.directional.intraday import (
-    format_directional_plan,
     format_entry_combined,
+    format_setup_forming,
     run_directional_scan,
 )
 from agents.intraday.scan import run_intraday_scan
@@ -299,6 +299,22 @@ async def _directional_scan_job(
         await research_poster(scan_report)
         _last_research_post = now
 
+    # Pre-emptive "setup forming" alerts (Option A): for HOLD decisions that are
+    # strong near-misses, post an anticipatory watch alert to #signals BEFORE any
+    # entry. Deduped per (ticker, would-be direction) at 30 min so a setup that
+    # keeps forming across scans doesn't spam the channel.
+    forming_mode = get_settings().directional_mode
+    for d in decisions:
+        forming = (d.analysis or {}).get("forming") if d.analysis else None
+        if not forming:
+            continue
+        fkey = ("forming", d.ticker, forming.get("would_be_action"))
+        last = _last_signal_posted.get(fkey)
+        if last and (datetime.now(UTC) - last).total_seconds() < _SIGNAL_DEDUP_SECONDS:
+            continue
+        await signal_poster(format_setup_forming(d, mode=forming_mode))
+        _last_signal_posted[fkey] = datetime.now(UTC)
+
     # Auto-execute top 3 decisions by conviction. Built-in guards:
     # - 20% max total exposure cap (no new trades if too much deployed)
     # - 60-min per-ticker cooldown (no re-entry after a stop-loss)
@@ -318,7 +334,6 @@ async def _directional_scan_job(
         key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
     )[:3]
 
-    global _last_trade_open, _last_trade_open_by_action, _last_signal_posted
 
     for decision in to_execute:
         # Tiered conviction cap: MEDIUM signals are limited to max_medium_trades_per_day.
@@ -376,23 +391,10 @@ async def _directional_scan_job(
             )
             continue
 
-        # PLAN signal: announce the setup + entry trigger + green-lights just
-        # before entering. Deduplicated per (ticker, action) at 30 min so a
-        # setup that keeps re-qualifying every scan doesn't spam #signals.
-        # Whenever a plan IS posted, its outcome (entry fill OR a skip notice)
-        # always follows so the plan never dangles unexplained.
-        sig_key = (decision.ticker, decision.action)
-        last_sig = _last_signal_posted.get(sig_key)
-        plan_posted = (
-            not last_sig
-            or (datetime.now(UTC) - last_sig).total_seconds() >= _SIGNAL_DEDUP_SECONDS
-        )
-        if plan_posted:
-            await signal_poster(format_directional_plan(decision, today=today, mode=mode))
-            _last_signal_posted[sig_key] = datetime.now(UTC)
-        else:
-            log.info("signal_dedup_suppressed", ticker=decision.ticker, action=decision.action)
-
+        # The pre-emptive "setup forming" alert was already posted earlier (when
+        # this was a near-miss); here we just execute and confirm. On a fill →
+        # "model entered"; on a skip → a brief deduped notice (per ticker+action
+        # at 30 min) so #signals isn't spammed.
         try:
             result = await execute_directional_signal(decision, mode=mode, capital_usd=available)
             if result.executed and result.trade_id is not None:
@@ -417,16 +419,16 @@ async def _directional_scan_job(
                     ticker=decision.ticker,
                     reason=result.reason,
                 )
-                # Close the loop on a posted plan so it never dangles: tell
-                # #signals the bot didn't enter and why. The plan above already
-                # carries the manual buy instruction if you still want it.
-                if plan_posted:
+                sig_key = (decision.ticker, decision.action)
+                last_sig = _last_signal_posted.get(sig_key)
+                if not last_sig or (datetime.now(UTC) - last_sig).total_seconds() >= _SIGNAL_DEDUP_SECONDS:
                     opt = "CALL" if decision.action == "BUY_CALL" else "PUT"
                     await signal_poster(
-                        f"⚠️ **{decision.ticker} {opt} — bot did NOT enter.**\n"
+                        f"⚠️ **{decision.ticker} {opt} — model did NOT enter.**\n"
                         f"Reason: {result.reason}.\n"
-                        f"_The setup was valid; enter manually from the plan above if you still want it._"
+                        f"_Setup was valid; enter manually if you still want it._"
                     )
+                    _last_signal_posted[sig_key] = datetime.now(UTC)
         except Exception as e:  # noqa: BLE001
             log.error(
                 "directional_execute_error",
