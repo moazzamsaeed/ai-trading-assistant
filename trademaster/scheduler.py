@@ -57,6 +57,10 @@ _scan_in_progress: bool = False
 # Trade execution is unaffected — signals are still acted on immediately.
 _last_research_post: datetime | None = None
 _RESEARCH_POST_INTERVAL_SECONDS = 3600
+# Event-driven research posts (significant news) bypass the hourly cadence but
+# are deduped at 15 min so a news cluster doesn't spam #research.
+_last_event_research_post: datetime | None = None
+_EVENT_RESEARCH_DEDUP_SECONDS = 900
 
 # Per-ticker 15-min cooldown: short re-entry gap for SPY 0DTE where
 # missing a 60-min window means missing the entire move.
@@ -158,6 +162,7 @@ async def _directional_scan_job(
     log_poster: Poster = _noop_poster,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
     post_report_on_hold: bool = True,
+    event_reason: str | None = None,
 ) -> None:
     """Sweep watchlist for directional signals.
 
@@ -290,14 +295,33 @@ async def _directional_scan_job(
     finally:
         _scan_in_progress = False
 
-    # Post scan report to #research at most once per hour.
-    # Scans and trade execution run on every trigger; only the Discord post is throttled.
-    global _last_research_post
+    # #research: a rich LLM market-analysis update, hourly — OR sooner if fired
+    # by a significant news event (deduped at 15 min). Replaces the terse
+    # per-ticker scan dump. Falls back to scan_report if the synthesis fails.
+    global _last_research_post, _last_event_research_post
     now = datetime.now(UTC)
-    elapsed = (now - _last_research_post).total_seconds() if _last_research_post else float("inf")
-    if elapsed >= _RESEARCH_POST_INTERVAL_SECONDS and (post_report_on_hold or messages):
-        await research_poster(scan_report)
+    hourly_due = (
+        (now - _last_research_post).total_seconds() >= _RESEARCH_POST_INTERVAL_SECONDS
+        if _last_research_post else True
+    ) and post_report_on_hold
+    is_news_event = bool(event_reason) and "news" in event_reason.lower()
+    event_due = is_news_event and (
+        not _last_event_research_post
+        or (now - _last_event_research_post).total_seconds() >= _EVENT_RESEARCH_DEDUP_SECONDS
+    )
+    if hourly_due or event_due:
+        try:
+            from agents.research.market_analysis import run_market_analysis
+            report = await run_market_analysis(
+                now=now, trigger=event_reason if event_due else None
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("market_analysis_failed", error=str(e))
+            report = scan_report
+        await research_poster(report)
         _last_research_post = now
+        if event_due:
+            _last_event_research_post = now
 
     # Pre-emptive "setup forming" alerts (Option A): for HOLD decisions that are
     # strong near-misses, post an anticipatory watch alert to #signals BEFORE any
@@ -915,6 +939,7 @@ def make_directional_trigger(
             research_poster=research_poster,
             log_poster=log_post,
             post_report_on_hold=False,  # silent if all HOLD — only post on BUY signals
+            event_reason=reason,  # significant news → fire a #research update
         )
 
     return DirectionalStreamTrigger(
