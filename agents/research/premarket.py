@@ -1,59 +1,93 @@
 """Pre-market research agent.
 
 Runs once per trading day at 8am ET (scheduled by `trademaster.scheduler`).
-Pulls overnight news from Alpaca, asks Gemini 3.1 Pro for a structured
-briefing, persists the result as an `ALERT_ONLY` Signal, and returns the
-text so the Discord bot can post it.
+Pulls a WEEK of market + mega-cap-tech news from Alpaca plus the upcoming
+macro-event calendar, asks the LLM for a PREDICTIVE briefing (week-in-review →
+upcoming catalysts → tech-earnings watch → today's setup & prediction), then
+persists an `ALERT_ONLY` Signal, writes the daily bias for intraday scans, and
+returns the text for Discord.
 """
 
 from __future__ import annotations
 
+import json as _json
 from collections.abc import Callable
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
-import json as _json
-
 from integrations.alpaca_client import NewsArticle, get_recent_news
 from integrations.daily_bias import write_daily_bias
 from trademaster.db import Signal as SignalRow
 from trademaster.db import make_session_factory
+from trademaster.event_calendar import upcoming_events
 from trademaster.logging import get_logger
 from trademaster.models import Signal, SignalAction
 from trademaster.router import TaskType, route_to_model
 from trademaster.timeutils import fmt_et
-from trademaster.watchlist import load_tickers
 
 log = get_logger(__name__)
 
 AGENT_NAME = "research"
 
-PROMPT_TEMPLATE = """You are a pre-market trading analyst. Today is {date_iso} (US Eastern Time).
+# News universe for the briefing: SPY/QQQ + the mega-caps that actually drive
+# the index. Broader than the trading watchlist (SPY only) so the briefing has
+# real market/tech context to predict from.
+NEWS_TICKERS: tuple[str, ...] = (
+    "SPY", "QQQ", "NVDA", "AAPL", "MSFT", "AMZN", "GOOG", "META", "TSLA", "AMD",
+)
 
-Watchlist: {watchlist}
+PROMPT_TEMPLATE = """You are a pre-market strategist for SPY 0DTE/weekly options. \
+Today is {date_iso} (US Eastern).
+Your job is to PREDICT the day, not just summarize — synthesize the past week
+and what's ahead into an actionable bias.
 
-Overnight news (last {hours} hours, {count} articles):
+Coverage tickers (market + mega-cap tech that drive SPY): {tickers}
+
+News from the last {days} days ({count} articles):
 {news_block}
 
-Produce a concise pre-market briefing in six short sections, in this exact order:
+Scheduled macro events ahead (authoritative calendar):
+{events_block}
 
-1. **Overnight Summary** — what moved, what to watch.
-2. **Earnings Today** — companies reporting and consensus, only if mentioned in the news.
-3. **Macro Events** — FOMC, CPI, NFP, jobless claims, etc. that are mentioned or implied.
-4. **Sector Signals** — sector ETF moves and rotation cues if discernible.
-5. **Synthesis** — one paragraph: what today looks like and what to pay attention to.
-6. **BIAS_JSON** — output a single JSON object (no markdown, no code fence) on its own line:
+Produce a pre-market briefing in these sections, in order:
+
+1. **Last Week in Review** — what actually drove SPY and big tech over the past
+   week (themes, not a headline dump). What's the prevailing trend/regime going in?
+2. **Upcoming Catalysts** — combine the macro calendar above with the news. Call
+   out the NEXT high-impact event and when. Flag if today/this week is an event
+   day (expect volatility).
+3. **Tech Earnings Watch** — from the news, which mega-caps report in the next
+   few days and the likely SPY impact. (No earnings-calendar feed — infer from
+   the news; say "none flagged in news" if so.)
+4. **Today's Setup & Prediction** — GIVEN the week's trend + what's ahead,
+   predict the likely path for SPY today: direction lean, key levels to watch,
+   and the scenario that would confirm or invalidate it. Be specific.
+5. **Synthesis** — one paragraph: the day's thesis and what to watch.
+6. **BIAS_JSON** — a single JSON object (no markdown/code fence) on its own line:
    {{"bias":"BULLISH"|"BEARISH"|"NEUTRAL","summary":"one sentence thesis","catalysts":["...","..."],"risks":["...","..."]}}
-   bias must be exactly one of: BULLISH, BEARISH, NEUTRAL.
-   catalysts and risks are each a list of up to 3 short strings.
+   bias is exactly one of BULLISH, BEARISH, NEUTRAL. catalysts/risks: ≤3 each.
 
 Rules:
-- Stay grounded in the news provided. Do not fabricate tickers, prices, or events.
-- If a section has no relevant content, write "No notable items." for that section.
-- Keep the whole briefing (excluding BIAS_JSON) under 1200 words.
-- Use markdown. Bold section headers. Bullet points within sections.
+- Ground claims in the news + calendar provided; do not fabricate tickers,
+  prices, or earnings dates.
+- The prediction (section 4) is the point — commit to a lean and the
+  levels/scenario behind it, even if NEUTRAL (then say why it's range-bound).
+- If a section has no content, write "No notable items."
+- Markdown, bold headers, bullets. Keep under 1300 words (excluding BIAS_JSON).
 """
+
+
+def _format_events_block(events: list[tuple], today) -> str:
+    """Render upcoming macro events with how-many-days-out, for the prompt."""
+    if not events:
+        return "(no scheduled high-impact macro events in the next 10 days)"
+    lines = []
+    for d, name in events:
+        delta = (d - today).days
+        when = "TODAY" if delta == 0 else ("tomorrow" if delta == 1 else f"in {delta} days")
+        lines.append(f"- {d.isoformat()} ({when}): {name}")
+    return "\n".join(lines)
 
 
 def _format_news_block(articles: list[NewsArticle]) -> str:
@@ -74,35 +108,39 @@ def _format_news_block(articles: list[NewsArticle]) -> str:
 async def run_premarket_briefing(
     *,
     watchlist: tuple[str, ...] | None = None,
-    hours_back: int = 18,
-    news_limit: int = 50,
+    hours_back: int = 168,  # 7 days — enough to read the week's trend, not just overnight
+    news_limit: int = 90,
     now: datetime | None = None,
     session_factory: Callable[[], Session] | None = None,
     news_fetcher=get_recent_news,
 ) -> tuple[str, Signal]:
-    """Fetch news → ask Gemini → persist Signal → return (text, Signal).
+    """Fetch a week of market/tech news + upcoming macro events → ask the LLM for
+    a predictive briefing → persist Signal + daily bias → return (text, Signal).
 
-    `news_fetcher` and `session_factory` are injectable for tests.
+    `watchlist` overrides the news universe (defaults to NEWS_TICKERS, the broad
+    market+tech set — NOT the SPY-only trading watchlist). Injectable for tests.
     """
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
-    if watchlist is None:
-        watchlist = load_tickers()
+    news_universe = watchlist or NEWS_TICKERS
 
-    articles = await news_fetcher(watchlist, hours_back=hours_back, limit=news_limit)
+    articles = await news_fetcher(news_universe, hours_back=hours_back, limit=news_limit)
+    events = upcoming_events(now.date(), days=10)
     log.info(
         "premarket_news_fetched",
-        watchlist=list(watchlist),
+        tickers=list(news_universe),
         count=len(articles),
         hours_back=hours_back,
+        upcoming_events=len(events),
     )
 
     prompt = PROMPT_TEMPLATE.format(
         date_iso=now.strftime("%Y-%m-%d"),
-        watchlist=", ".join(watchlist),
-        hours=hours_back,
+        tickers=", ".join(news_universe),
+        days=round(hours_back / 24),
         count=len(articles),
         news_block=_format_news_block(articles),
+        events_block=_format_events_block(events, now.date()),
     )
 
     response = await route_to_model(
@@ -117,9 +155,10 @@ async def run_premarket_briefing(
         action=SignalAction.ALERT_ONLY,
         reasoning=response.text,
         extra={
-            "watchlist": list(watchlist),
+            "news_tickers": list(news_universe),
             "news_count": len(articles),
             "hours_back": hours_back,
+            "upcoming_events": [f"{d.isoformat()}:{n}" for d, n in events],
             "model": response.model,
             "cost_usd": str(response.cost_usd),
         },

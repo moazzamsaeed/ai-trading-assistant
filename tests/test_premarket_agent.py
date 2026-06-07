@@ -102,3 +102,38 @@ async def test_briefing_with_no_news(monkeypatch, session_factory):
     assert "No notable items" in text
     assert signal.extra["news_count"] == 0
     assert "(no articles in window)" in captured_prompt["text"]
+
+
+async def test_briefing_includes_week_window_and_upcoming_events(monkeypatch, session_factory):
+    """Redesign: 7-day news window, broad tech tickers, upcoming macro events,
+    and a prediction-focused prompt."""
+    captured = {}
+
+    async def fake_fetcher(symbols, *, hours_back=18, limit=50):
+        captured["symbols"] = tuple(symbols)
+        captured["hours_back"] = hours_back
+        return _fake_articles()
+
+    async def fake_route(_task_type, prompt, **_kwargs):
+        captured["prompt"] = prompt
+        return LLMResponse(
+            text='## Synthesis\nUp.\n{"bias":"BULLISH","summary":"trend up","catalysts":["CPI"],"risks":["FOMC"]}',
+            provider="google", model="gemini-2.5-pro",
+            input_tokens=400, output_tokens=120,
+            cost_usd=Decimal("0.002"), duration_ms=1500,
+        )
+
+    monkeypatch.setattr(premarket, "route_to_model", fake_route)
+
+    await premarket.run_premarket_briefing(
+        now=datetime(2026, 6, 7, 12, 0, tzinfo=UTC),  # CPI 6/11 + FOMC 6/17 ahead
+        session_factory=session_factory,
+        news_fetcher=fake_fetcher,
+    )
+    # 7-day window, broad tech universe
+    assert captured["hours_back"] == 168
+    assert "NVDA" in captured["symbols"] and "SPY" in captured["symbols"]
+    # prompt carries upcoming macro events + prediction framing
+    assert "CPI Release" in captured["prompt"]
+    assert "FOMC Decision" in captured["prompt"]
+    assert "Prediction" in captured["prompt"]

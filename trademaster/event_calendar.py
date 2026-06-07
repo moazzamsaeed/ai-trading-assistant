@@ -15,7 +15,7 @@ Dates are hardcoded for 2026 and updated annually. Times are ET.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 # 2026 economic event blackout dates (ET calendar day).
 # Sources: Fed calendar, BLS release schedule, CME FedWatch.
@@ -71,3 +71,16 @@ def is_blackout_day(today: date | None = None) -> str | None:
 def all_blackout_dates() -> dict[date, str]:
     """Return a copy of the full blackout calendar."""
     return dict(_BLACKOUT_DATES)
+
+
+def upcoming_events(today: date | None = None, days: int = 10) -> list[tuple[date, str]]:
+    """Macro events in the next `days` calendar days (inclusive of today),
+    sorted by date. Feeds the premarket briefing so it can flag catalysts ahead
+    (e.g. "CPI Wednesday, FOMC next week")."""
+    if today is None:
+        from trademaster.timeutils import today_et
+        today = today_et()
+    horizon = today + timedelta(days=days)
+    return sorted(
+        (d, name) for d, name in _BLACKOUT_DATES.items() if today <= d <= horizon
+    )
