@@ -77,12 +77,13 @@ class Settings(BaseSettings):
     # for the remainder of the week when hit.
     weekly_loss_limit_pct: float = Field(default=0.25, gt=0, le=1.0)
 
-    # Tiered daily trade caps. MEDIUM conviction trades are capped lower to
-    # throttle noise signals. HIGH conviction always gets more room.
-    # Total cap (any conviction): max_trades_per_day.
-    # MEDIUM-only cap: max_medium_trades_per_day.
-    max_trades_per_day: int = Field(default=4, gt=0)
-    max_medium_trades_per_day: int = Field(default=2, gt=0)
+    # Tiered daily trade caps. **0 = UNLIMITED** (no per-day count cap) — set as
+    # the default 2026-06-07: with capital at $25k and risk bounded by the daily
+    # loss limit (15%), per-trade cap (10%), 30% exposure cap, and the per-ticker
+    # / per-action cooldowns, the trade-count cap was the binding throttle and is
+    # no longer wanted. Set a positive number to re-impose a cap.
+    max_trades_per_day: int = Field(default=0, ge=0)        # 0 = unlimited
+    max_medium_trades_per_day: int = Field(default=0, ge=0)  # 0 = unlimited
 
     # No entries before this ET time (opening volatility) or after no_entry_after_et.
     # Format: "HH:MM" 24-hour ET.

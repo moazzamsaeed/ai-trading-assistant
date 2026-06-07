@@ -45,7 +45,7 @@ def test_defaults_load_without_env(monkeypatch, tmp_path):
     assert s.account_type == "cash"
     assert s.daily_loss_limit_pct > 0
     assert s.weekly_loss_limit_pct > 0
-    assert s.max_trades_per_day > 0
+    assert s.max_trades_per_day >= 0  # 0 = unlimited (default since 2026-06-07)
     assert s.max_bid_ask_spread_pct > 0
     assert s.max_concurrent_positions > 0
 

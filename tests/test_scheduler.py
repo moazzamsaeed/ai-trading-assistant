@@ -747,24 +747,23 @@ async def test_weekly_loss_limit_halts_scan(monkeypatch):
     assert any("weekly" in m.lower() for m in logs)
 
 
-async def test_max_trades_per_day_blocks_scan(monkeypatch):
-    """After max_trades_per_day trades, scan is skipped for the rest of the day."""
+async def test_max_trades_cap_blocks_when_set(monkeypatch):
+    """When max_trades_per_day is a positive number, the scan is skipped once
+    that many trades have opened today."""
     from trademaster.timeutils import today_et
     import datetime as _datetime_mod
 
     sf = _fresh_db()
     monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(sch.get_settings(), "max_trades_per_day", 3)
 
-    today = today_et()
-    opened = _dt.combine(today, _datetime_mod.time(14, 0), tzinfo=_UTC)
-
+    opened = _dt.combine(today_et(), _datetime_mod.time(14, 0), tzinfo=_UTC)
     with sf() as session:
-        for i in range(6):  # default max = 6
+        for i in range(3):
             session.add(_Trade(
                 symbol=f"SPY260101C0050000{i}",
                 asset_class="option", side="buy", strategy="directional_call",
-                qty=_D("1"), entry_price=_D("2.00"),
-                opened_at=opened,
+                qty=_D("1"), entry_price=_D("2.00"), opened_at=opened,
             ))
         session.commit()
 
@@ -774,6 +773,33 @@ async def test_max_trades_per_day_blocks_scan(monkeypatch):
 
     scan_called = []
 
+    async def fake_scan(**_):
+        scan_called.append(1)
+        return ([], [], "")
+    monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
+
+    await sch._directional_scan_job(
+        signal_poster=_noop_poster, trade_poster=_noop_poster,
+        research_poster=_noop_poster, log_poster=_noop_poster,
+    )
+    assert not scan_called, "scan must be blocked once the count cap is reached"
+
+
+async def test_max_trades_unlimited_skips_count_check(monkeypatch):
+    """Default (0 = unlimited): the per-day count cap is not even consulted."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(sch.get_settings(), "max_trades_per_day", 0)
+
+    async def fake_unrealized(): return _D("0")
+    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+
+    consulted = []
+    monkeypatch.setattr(
+        sch, "get_today_trade_count_by_conviction",
+        lambda *_a, **_k: consulted.append(1) or {"HIGH": 99},
+    )
+
     async def fake_scan(**_): return ([], [], "")
     monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
 
@@ -781,7 +807,7 @@ async def test_max_trades_per_day_blocks_scan(monkeypatch):
         signal_poster=_noop_poster, trade_poster=_noop_poster,
         research_poster=_noop_poster, log_poster=_noop_poster,
     )
-    assert not scan_called, "scan must be blocked after max_trades_per_day"
+    assert not consulted, "count cap must NOT be consulted when unlimited (0)"
 
 
 async def test_event_blackout_not_consulted_when_disabled(monkeypatch):

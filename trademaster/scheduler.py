@@ -239,12 +239,14 @@ async def _directional_scan_job(
         )
         return
 
-    # ---- Tiered max trades per day ----
-    conviction_counts = get_today_trade_count_by_conviction(make_session_factory())
-    total_today = sum(conviction_counts.values())
-    if total_today >= settings.max_trades_per_day:
-        log.info("scan_skipped_max_trades_per_day", total=total_today, limit=settings.max_trades_per_day)
-        return
+    # ---- Tiered max trades per day (0 = unlimited) ----
+    if settings.max_trades_per_day > 0:
+        conviction_counts = get_today_trade_count_by_conviction(make_session_factory())
+        total_today = sum(conviction_counts.values())
+        if total_today >= settings.max_trades_per_day:
+            log.info("scan_skipped_max_trades_per_day", total=total_today,
+                     limit=settings.max_trades_per_day)
+            return
 
     # ---- Event blackout calendar (opt-in; disabled by default 2026-06-05) ----
     # We deliberately trade event days (NFP/CPI/FOMC) during paper validation to
@@ -360,9 +362,9 @@ async def _directional_scan_job(
 
 
     for decision in to_execute:
-        # Tiered conviction cap: MEDIUM signals are limited to max_medium_trades_per_day.
-        # Re-query each iteration since a previous trade in this loop may have incremented it.
-        if decision.conviction == "MEDIUM":
+        # Tiered MEDIUM-conviction cap (0 = unlimited). Re-query each iteration
+        # since a previous trade in this loop may have incremented it.
+        if decision.conviction == "MEDIUM" and settings.max_medium_trades_per_day > 0:
             current_counts = get_today_trade_count_by_conviction(make_session_factory())
             if current_counts.get("MEDIUM", 0) >= settings.max_medium_trades_per_day:
                 log.info(
