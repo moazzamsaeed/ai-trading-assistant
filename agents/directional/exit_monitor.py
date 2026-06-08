@@ -67,15 +67,16 @@ PROFIT_LOCK_PCT = 75.0             # always consult LLM above this P&L even with
 #   - Ratchet stop on REMAINING position to lock_in_pct
 #   - Sell sell_fraction of ORIGINAL qty to lock that portion in
 #
-# Retuned 2026-06-05 (v2): "ride, then scale once." The position is PROTECTED
-# the whole way up by the trailing-stop ratchet (lock at +25/+50/+80%), but
-# does NOT sell until +100% — then it banks 25% (cheap insurance: 0DTE gamma
-# makes +100%+ positions reversal-prone) and the remaining 75% rides. ABOVE
-# +100% the stop trails continuously (peak − trailing_stop_trail_gap_pct, see
-# _trailing_stop_premium), so big runners keep ratcheting (+200% → lock +180%)
-# instead of getting scaled off early. Earlier v1 sold 25% at both +25% and
-# +50%, which gave winners away before they trended. Tracked via the
-# health-check peak-vs-realized metric. Override via settings.trailing_stop_levels.
+# Retuned 2026-06-05 (v2): "ride, then scale once." Sells 25% once at +100%
+# (cheap insurance: 0DTE gamma makes +100%+ positions reversal-prone); the
+# remaining 75% rides. The discrete locks below are now just FLOORS — since
+# 2026-06-08 (v3) the trailing stop trails CONTINUOUSLY at (peak − gap, default
+# 10%) across the whole in-profit range (see _trailing_stop_premium), so the
+# stop always sits within ~10% of the high-water mark. v2 left the stop on the
+# discrete tier (a +70% peak locked only +20% → trade #51 gave back ~$1,200).
+# Tracked via the health-check peak-vs-realized metric.
+# Override the ladder via settings.trailing_stop_levels, the gap via
+# settings.trailing_stop_trail_gap_pct.
 DEFAULT_TRAILING_STOP_LEVELS: list[tuple[float, float, float]] = [
     (100.0, 0.60, 0.25),  # +100% → SELL 25% (the one scale-out); above here the
                           #          stop trails continuously (peak − gap)
@@ -212,31 +213,34 @@ def _trailing_stop_premium(
 ) -> Decimal | None:
     """Return the stop price that locks in gains at the current peak level.
 
-    Uses the discrete ladder up to its top tier; ABOVE the top tier the stop
-    trails CONTINUOUSLY — locking (peak − trailing_stop_trail_gap_pct) — so a
-    big runner keeps ratcheting instead of capping at the top tier's lock
-    (e.g. at +200% peak it locks +180%, at +300% +280%). Returns None if peak
-    is below the lowest trigger.
+    Once the peak clears the lowest ladder tier, the stop trails CONTINUOUSLY at
+    (peak − trailing_stop_trail_gap_pct) the whole way up — so it always sits
+    within `gap` of the high-water mark (e.g. gap=0.10 → +70% peak locks +60%,
+    +200% locks +190%). The discrete tier locks act only as floors. This stops
+    mid-range runners from giving back to a far-below-peak discrete lock (trade
+    #51 peaked +70% but the old discrete ladder locked just +20%). Returns None
+    if peak is below the lowest trigger (give the trade room early).
     """
     levels = _trailing_stop_levels()  # high → low
     if not levels:
         return None
 
-    top_trigger, top_lock, _ = levels[0]
-    if peak_pnl_pct >= top_trigger:
-        gap = float(get_settings().trailing_stop_trail_gap_pct)
-        # max() guards the (impossible-for-peak≥top) case and keeps it monotonic.
-        lock_pct = max(top_lock, peak_pnl_pct / 100.0 - gap)
-        return (entry_premium * (Decimal("1") + Decimal(str(lock_pct)))).quantize(
-            Decimal("0.0001")
-        )
+    lowest_trigger = levels[-1][0]
+    if peak_pnl_pct < lowest_trigger:
+        return None
 
-    for trigger_pct, lock_pct, _sell_frac in levels:
+    # Highest discrete lock the peak has earned (a floor under the trail).
+    discrete_lock = 0.0
+    for trigger_pct, lock_pct, _sell_frac in levels:  # high → low
         if peak_pnl_pct >= trigger_pct:
-            return (entry_premium * (Decimal("1") + Decimal(str(lock_pct)))).quantize(
-                Decimal("0.0001")
-            )
-    return None
+            discrete_lock = lock_pct
+            break
+
+    gap = float(get_settings().trailing_stop_trail_gap_pct)
+    lock_pct = max(discrete_lock, peak_pnl_pct / 100.0 - gap)
+    return (entry_premium * (Decimal("1") + Decimal(str(lock_pct)))).quantize(
+        Decimal("0.0001")
+    )
 
 
 def _maybe_ratchet_trailing_stop(

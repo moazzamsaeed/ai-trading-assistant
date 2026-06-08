@@ -845,44 +845,45 @@ def test_trailing_stop_premium_below_first_tier():
 
 
 def test_trailing_stop_premium_at_25pct():
-    """At +25% locks in +8% → stop at entry × 1.08."""
+    """At +25% the continuous trail (peak − 10%) gives +15%, above the +8%
+    discrete floor → stop at entry × 1.15 (v3 2026-06-08)."""
     entry = Decimal("2.00")
     result = _trailing_stop_premium(entry, 25.0)
-    assert result == (Decimal("2.00") * Decimal("1.08")).quantize(Decimal("0.0001"))
+    assert result == (Decimal("2.00") * Decimal("1.15")).quantize(Decimal("0.0001"))
 
 
 def test_trailing_stop_premium_at_50pct():
-    """At +50% locks in +20% → stop at entry × 1.20."""
+    """At +50% trails at peak − 10% → locks +40% → stop at entry × 1.40."""
     entry = Decimal("2.00")
     result = _trailing_stop_premium(entry, 50.0)
-    assert result == (Decimal("2.00") * Decimal("1.20")).quantize(Decimal("0.0001"))
+    assert result == (Decimal("2.00") * Decimal("1.40")).quantize(Decimal("0.0001"))
 
 
-def test_trailing_stop_premium_between_tiers_uses_lower():
-    """At +75% (below the +80% tier) still uses the +50% tier → +20%."""
+def test_trailing_stop_premium_trails_continuously_mid_range():
+    """At +70% the stop now trails to +60% (peak − 10%), NOT the far-below +20%
+    discrete tier — the trade #51 give-back fix (v3 2026-06-08)."""
     entry = Decimal("2.00")
-    result = _trailing_stop_premium(entry, 75.0)
-    assert result == (Decimal("2.00") * Decimal("1.20")).quantize(Decimal("0.0001"))
+    result = _trailing_stop_premium(entry, 70.0)
+    assert result == (Decimal("2.00") * Decimal("1.60")).quantize(Decimal("0.0001"))
 
 
 def test_trailing_stop_premium_at_80pct():
-    """At +80% locks in +45% → stop at entry × 1.45."""
+    """At +80% trails at peak − 10% → locks +70% → stop at entry × 1.70."""
     entry = Decimal("2.00")
     result = _trailing_stop_premium(entry, 80.0)
-    assert result == (Decimal("2.00") * Decimal("1.45")).quantize(Decimal("0.0001"))
+    assert result == (Decimal("2.00") * Decimal("1.70")).quantize(Decimal("0.0001"))
 
 
 def test_trailing_stop_continuous_above_top_tier():
-    """Above the +120% top tier the stop trails continuously at peak − 20% gap,
-    instead of capping at +75% (retuned 2026-06-05)."""
+    """Big runners keep trailing at peak − 10% gap (v3 2026-06-08)."""
     entry = Decimal("2.00")
 
     def lock(mult):
         return (Decimal("2.00") * Decimal(mult)).quantize(Decimal("0.0001"))
 
-    assert _trailing_stop_premium(entry, 120.0) == lock("2.00")  # +120% → lock +100%
-    assert _trailing_stop_premium(entry, 200.0) == lock("2.80")  # +200% → lock +180%
-    assert _trailing_stop_premium(entry, 300.0) == lock("3.80")  # +300% → lock +280%
+    assert _trailing_stop_premium(entry, 120.0) == lock("2.10")  # +120% → lock +110%
+    assert _trailing_stop_premium(entry, 200.0) == lock("2.90")  # +200% → lock +190%
+    assert _trailing_stop_premium(entry, 300.0) == lock("3.90")  # +300% → lock +290%
 
 
 def test_maybe_ratchet_updates_db_when_new_peak(session_factory):
@@ -899,9 +900,9 @@ def test_maybe_ratchet_updates_db_when_new_peak(session_factory):
         session.commit()
         trade_id = trade.id
 
-    # Position hits +35% → crosses the +25% tier → locks in +8%
+    # Position hits +35% → trails at peak − 10% → locks +25%
     result = _maybe_ratchet_trailing_stop(session_factory, trade, 35.0, Decimal("2.00"))
-    expected_stop = (Decimal("2.00") * Decimal("1.08")).quantize(Decimal("0.0001"))
+    expected_stop = (Decimal("2.00") * Decimal("1.25")).quantize(Decimal("0.0001"))
     assert result == expected_stop
 
     with session_factory() as session:
@@ -913,7 +914,9 @@ def test_maybe_ratchet_updates_db_when_new_peak(session_factory):
 
 def test_maybe_ratchet_stop_never_moves_down(session_factory):
     """Once ratcheted, the stop cannot be lowered even if P&L drops."""
-    high_stop = str((Decimal("2.00") * Decimal("1.25")).quantize(Decimal("0.0001")))  # already at +50% tier
+    # Stop already consistent with the +55% peak under the continuous trail
+    # (peak − 10% = +45%).
+    high_stop = str((Decimal("2.00") * Decimal("1.45")).quantize(Decimal("0.0001")))
 
     with session_factory() as session:
         trade = Trade(
@@ -928,7 +931,7 @@ def test_maybe_ratchet_stop_never_moves_down(session_factory):
         session.commit()
         trade_id = trade.id
 
-    # P&L has fallen to +35% — still above +30% tier but stop was at +50% tier
+    # P&L has fallen to +35% — peak stays +55%, so the trail does not move up
     result = _maybe_ratchet_trailing_stop(session_factory, trade, 35.0, Decimal("2.00"))
     # Stop must NOT be lowered — returns None (no ratchet happened)
     assert result is None
