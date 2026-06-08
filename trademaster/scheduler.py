@@ -474,11 +474,12 @@ async def _directional_scan_job(
 async def _directional_exit_job(
     *,
     signal_poster: Poster,
+    trade_poster: Poster = _noop_poster,
     log_poster: Poster = _noop_poster,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
     force: bool = False,
 ) -> None:
-    """Check open directional positions; post exits to #signals."""
+    """Check open directional positions; post exits to #signals + close detail to #trades."""
     # Do NOT skip when paused — pausing blocks new entries, not exit monitoring.
     # Open positions still need stop-loss and force-close protection.
 
@@ -511,6 +512,7 @@ async def _directional_exit_job(
             await signal_poster(format_scale_out(r))
         elif combined_text:
             await signal_poster(combined_text)  # one message to #signals
+            await _post_trade_closed(trade_poster, r.get("trade_id"))
         elif r.get("error_text"):
             await log_poster(r["error_text"])
 
@@ -518,6 +520,7 @@ async def _directional_exit_job(
 async def _trailing_stop_tick_job(
     *,
     signal_poster: Poster,
+    trade_poster: Poster = _noop_poster,
     log_poster: Poster = _noop_poster,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
 ) -> None:
@@ -547,6 +550,55 @@ async def _trailing_stop_tick_job(
             await signal_poster(format_scale_out(r))
         elif r.get("combined_text"):
             await signal_poster(r["combined_text"])
+            await _post_trade_closed(trade_poster, r.get("trade_id"))
+
+
+async def _post_trade_closed(trade_poster: Poster, trade_id) -> None:
+    """Post the full closed-trade detail to #trades (fail-open)."""
+    if not trade_id:
+        return
+    try:
+        from trademaster.db import get_trade_detail
+        from trademaster.reporting import format_trade_closed
+        detail = get_trade_detail(make_session_factory(), trade_id)
+        if detail:
+            await trade_poster(format_trade_closed(detail))
+    except Exception as e:  # noqa: BLE001
+        log.warning("trade_closed_report_failed", trade_id=trade_id, error=str(e))
+
+
+# ----------------- daily / weekly #trades summaries -----------------
+
+
+async def _daily_summary_job(*, trade_poster: Poster, log_poster: Poster = _noop_poster) -> None:
+    """End-of-day tabular breakdown of the day's closed trades → #trades."""
+    try:
+        from trademaster.db import day_bounds_utc, get_closed_directional_trades
+        from trademaster.reporting import format_trades_summary
+        start, end = day_bounds_utc()
+        trades = get_closed_directional_trades(make_session_factory(), start=start, end=end)
+        if not trades:
+            return  # silent on no-trade days
+        await trade_poster(format_trades_summary(
+            trades, title="Daily Trade Summary", period=today_et().isoformat()))
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily_summary_failed", error=str(e))
+        await log_poster(f"⚠️ Daily summary failed: `{type(e).__name__}: {e}`")
+
+
+async def _weekly_summary_job(*, trade_poster: Poster, log_poster: Poster = _noop_poster) -> None:
+    """Friday EOD tabular breakdown of the week's closed trades → #trades."""
+    try:
+        from trademaster.db import get_closed_directional_trades, week_bounds_utc
+        from trademaster.reporting import format_trades_summary
+        start, end = week_bounds_utc()
+        trades = get_closed_directional_trades(make_session_factory(), start=start, end=end)
+        period = f"week of {start.date().isoformat()}"
+        await trade_poster(format_trades_summary(
+            trades, title="Weekly Trade Summary", period=period))
+    except Exception as e:  # noqa: BLE001
+        log.warning("weekly_summary_failed", error=str(e))
+        await log_poster(f"⚠️ Weekly summary failed: `{type(e).__name__}: {e}`")
 
 
 # ----------------- iron-condor strategist -----------------
@@ -777,6 +829,7 @@ def make_scheduler(
         ),
         kwargs={
             "signal_poster": signal_poster,
+            "trade_poster": trade_poster,
             "log_poster": log_post,
         },
         id="directional_exit",
@@ -800,6 +853,7 @@ def make_scheduler(
         ),
         kwargs={
             "signal_poster": signal_poster,
+            "trade_poster": trade_poster,
             "log_poster": log_post,
         },
         id="directional_0dte_final_close",
@@ -826,6 +880,27 @@ def make_scheduler(
         misfire_grace_time=3600,
     )
 
+    # Daily trade summary — 16:05 ET Mon-Fri (after the 16:00 close, before the
+    # health check) → tabular breakdown of the day's closed trades to #trades.
+    scheduler.add_job(
+        _daily_summary_job,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=PREMARKET_TZ),
+        kwargs={"trade_poster": trade_poster, "log_poster": log_post},
+        id="daily_trade_summary",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Weekly trade summary — Friday 16:10 ET → the full week's trades to #trades.
+    scheduler.add_job(
+        _weekly_summary_job,
+        CronTrigger(day_of_week="fri", hour=16, minute=10, timezone=PREMARKET_TZ),
+        kwargs={"trade_poster": trade_poster, "log_poster": log_post},
+        id="weekly_trade_summary",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
     # Fast trailing stop tick — every 30 sec during RTH for 0DTE responsiveness.
     # Lightweight: no indicators, no LLM. Just peak update, scale-out, hard stop.
     scheduler.add_job(
@@ -839,6 +914,7 @@ def make_scheduler(
         ),
         kwargs={
             "signal_poster": signal_poster,
+            "trade_poster": trade_poster,
             "log_poster": log_post,
         },
         id="trailing_stop_tick",

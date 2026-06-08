@@ -380,3 +380,70 @@ def get_directional_trade_context(session_factory) -> dict:
             })
 
     return {"open": open_positions, "today_closed": today_closed}
+
+
+def _trade_detail(r: Trade) -> dict:
+    """Full closed-trade detail for #trades reports. total_pnl folds in the
+    scale-out partials (realized_pnl_usd is only the final leg)."""
+    e = r.extra or {}
+    final = float(r.realized_pnl_usd) if r.realized_pnl_usd is not None else 0.0
+    try:
+        partial = float(e.get("partial_realized_pnl_usd", 0) or 0)
+    except (TypeError, ValueError):
+        partial = 0.0
+    return {
+        "id": r.id,
+        "ticker": e.get("ticker") or r.symbol,
+        "action": e.get("action"),
+        "conviction": e.get("conviction"),
+        "occ": e.get("occ_symbol") or r.symbol,
+        "original_qty": e.get("original_qty"),
+        "final_qty": int(r.qty) if r.qty is not None else None,
+        "entry_price": float(r.entry_price) if r.entry_price is not None else None,
+        "exit_price": float(r.exit_price) if r.exit_price is not None else None,
+        "final_pnl": final,
+        "partial_pnl": partial,
+        "total_pnl": final + partial,
+        "peak_pnl_pct": e.get("peak_pnl_pct"),
+        "scale_out_tiers_fired": e.get("scale_out_tiers_fired"),
+        "exit_reason": e.get("exit_reason"),
+        "mode": e.get("mode"),
+        "opened_at": r.opened_at,
+        "closed_at": r.closed_at,
+    }
+
+
+def get_trade_detail(session_factory, trade_id: int) -> dict | None:
+    """Full detail for one closed trade — for the per-trade #trades report."""
+    with session_factory() as session:
+        r = session.get(Trade, trade_id)
+        return _trade_detail(r) if r is not None else None
+
+
+def get_closed_directional_trades(session_factory, *, start, end) -> list[dict]:
+    """Full detail for directional trades CLOSED in [start, end) (UTC), oldest
+    first — feeds the daily/weekly #trades summaries."""
+    with session_factory() as session:
+        rows = session.execute(
+            select(Trade)
+            .where(Trade.strategy.in_(_DIRECTIONAL_STRATEGIES))
+            .where(Trade.closed_at >= start)
+            .where(Trade.closed_at < end)
+            .order_by(Trade.closed_at)
+        ).scalars().all()
+        return [_trade_detail(r) for r in rows]
+
+
+def day_bounds_utc(today=None) -> tuple[datetime, datetime]:
+    """ET calendar-day [start, end) as UTC datetimes."""
+    today = today or today_et()
+    start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    return start, start + timedelta(days=1)
+
+
+def week_bounds_utc(today=None) -> tuple[datetime, datetime]:
+    """ET week (Mon 00:00 → next Mon) as UTC datetimes."""
+    today = today or today_et()
+    monday = today - timedelta(days=today.weekday())
+    start = datetime.combine(monday, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    return start, start + timedelta(days=7)
