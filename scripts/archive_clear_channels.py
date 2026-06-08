@@ -144,7 +144,8 @@ async def main() -> int:
             # verify archive line count == fetched count before any delete
             n_lines = sum(1 for _ in path.open())
             ok = n_lines == len(msgs)
-            print(f"#{name}: archived {len(msgs)} messages → {path} (verify={'OK' if ok else 'MISMATCH'})")
+            verify = "OK" if ok else "MISMATCH"
+            print(f"#{name}: archived {len(msgs)} messages → {path} (verify={verify})")
             if args.clear:
                 if not ok:
                     print(f"  ABORT clear for #{name}: archive verify failed")
