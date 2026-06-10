@@ -354,6 +354,67 @@ async def test_execute_aggressive_sizing(session_factory):
     assert submitted_kwargs["qty"] == 2
 
 
+async def test_medium_conviction_halves_size(session_factory):
+    """Fix C: MEDIUM conviction deploys half the budget of HIGH.
+
+    Same $5000 capital / $500 cap / $2.00 ask as the HIGH case (qty 2), but
+    MEDIUM applies the 0.5 multiplier → floor($250 / $200) = 1 contract.
+    """
+    submitted = {}
+
+    async def fake_submit(**kwargs):
+        submitted.update(kwargs)
+        return _filled_order(price=2.00)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled_order(price=2.00)
+
+    await execute_directional_signal(
+        TickerDecision("SPY", "BUY_CALL", 500.0, "0DTE", "MEDIUM", "test"),
+        today=date(2026, 1, 2),
+        mode="aggressive",
+        session_factory=session_factory,
+        strike_selector=_selected(ask=2.00),
+        submitter=fake_submit,
+        waiter=fake_wait,
+    )
+    assert submitted["qty"] == 1
+
+
+async def test_weak_rsi_downsizes_put(session_factory):
+    """Fix C: a put with RSI ≥ 50 (not confirming bearish, like #60's RSI 56)
+    gets an extra 0.5 downsize → qty 1, vs qty 2 when RSI confirms (e.g. 30)."""
+    weak_qty, strong_qty = {}, {}
+
+    async def submit_weak(**kwargs):
+        weak_qty.update(kwargs)
+        return _filled_order(price=2.00)
+
+    async def submit_strong(**kwargs):
+        strong_qty.update(kwargs)
+        return _filled_order(price=2.00)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled_order(price=2.00)
+
+    common = dict(
+        today=date(2026, 1, 2), mode="aggressive", session_factory=session_factory,
+        strike_selector=_selected(ask=2.00), waiter=fake_wait,
+    )
+    # Weak: HIGH conviction put but RSI 56 ≥ 50 → 0.5× → 1 contract.
+    await execute_directional_signal(
+        TickerDecision("SPY", "BUY_PUT", 500.0, "0DTE", "HIGH", "t", analysis={"rsi9": 56.0}),
+        submitter=submit_weak, **common,
+    )
+    # Confirming: RSI 30 < 50 → no downsize → 2 contracts.
+    await execute_directional_signal(
+        TickerDecision("SPY", "BUY_PUT", 500.0, "0DTE", "HIGH", "t", analysis={"rsi9": 30.0}),
+        submitter=submit_strong, **common,
+    )
+    assert weak_qty["qty"] == 1
+    assert strong_qty["qty"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Bug fixes — regression tests
 # ---------------------------------------------------------------------------

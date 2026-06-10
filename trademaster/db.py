@@ -322,6 +322,43 @@ def get_today_trade_count_by_conviction(session_factory) -> dict[str, int]:
     return counts
 
 
+def get_today_directional_streak(session_factory) -> tuple[str | None, int]:
+    """Trailing run of same-direction directional trades opened today.
+
+    Returns (action, streak) where action is "BUY_CALL"/"BUY_PUT" of the most
+    recent trade and streak is how many of the most-recent CONSECUTIVE trades
+    share it. A direction flip resets the run. Used by the re-entry throttle
+    (fix B) to stop piling into an exhausted one-way move — today 5 puts stacked
+    through the day and the late ones (#60) got caught by the bounce.
+    """
+    today = today_et()
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    day_end = day_start + timedelta(days=1)
+    reset_at = get_settings().baseline_reset_at
+    effective_start = max(day_start, reset_at) if reset_at is not None else day_start
+
+    _strat_to_action = {"directional_call": "BUY_CALL", "directional_put": "BUY_PUT"}
+    with session_factory() as session:
+        strategies = session.execute(
+            select(Trade.strategy)
+            .where(Trade.strategy.in_(["directional_call", "directional_put"]))
+            .where(Trade.opened_at >= effective_start)
+            .where(Trade.opened_at < day_end)
+            .order_by(Trade.opened_at.asc())
+        ).scalars().all()
+
+    if not strategies:
+        return None, 0
+    last_action = _strat_to_action.get(strategies[-1])
+    streak = 0
+    for strat in reversed(strategies):
+        if _strat_to_action.get(strat) == last_action:
+            streak += 1
+        else:
+            break
+    return last_action, streak
+
+
 _DIRECTIONAL_STRATEGIES = ["directional_call", "directional_put"]
 
 

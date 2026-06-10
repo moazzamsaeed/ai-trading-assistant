@@ -43,7 +43,7 @@ from decimal import Decimal
 from integrations import alpaca_client
 from trademaster.capital import directional_deployed_usd, get_effective_capital
 from trademaster.config import get_settings
-from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, get_today_trade_count_by_conviction, make_session_factory
+from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, get_today_trade_count_by_conviction, get_today_directional_streak, make_session_factory
 from trademaster.event_calendar import is_blackout_day
 from trademaster.logging import get_logger
 from trademaster.state import get_state
@@ -372,6 +372,21 @@ async def _directional_scan_job(
                     ticker=decision.ticker,
                     medium_today=current_counts.get("MEDIUM", 0),
                     limit=settings.max_medium_trades_per_day,
+                )
+                continue
+
+        # Re-entry throttle (fix B): once N consecutive same-direction trades
+        # have opened today, only HIGH conviction breaks through — stops chasing
+        # an exhausted one-way move (today 5 puts stacked; the late MEDIUM #60
+        # got caught by the bounce). A direction flip resets the streak.
+        if settings.reentry_same_direction_limit > 0 and decision.conviction != "HIGH":
+            streak_action, streak = get_today_directional_streak(make_session_factory())
+            if streak_action == decision.action and streak >= settings.reentry_same_direction_limit:
+                log.info(
+                    "directional_execute_skipped_reentry_throttle",
+                    ticker=decision.ticker, action=decision.action,
+                    conviction=decision.conviction, same_direction_streak=streak,
+                    limit=settings.reentry_same_direction_limit,
                 )
                 continue
 

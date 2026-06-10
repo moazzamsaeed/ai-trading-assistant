@@ -386,7 +386,31 @@ async def execute_directional_signal(
     # Cap deployed amount at max_loss_usd (pct of effective capital) so total
     # qty × premium × 100 ≤ that — bounds the worst case if the option zeroes.
     capped_position_usd = min(position_usd, max_loss_usd)
-    qty = max(1, math.floor(capped_position_usd / one_contract_cost))
+
+    # Conviction- and RSI-scaled sizing (fix C): weaker edge gets less capital.
+    size_mult = 1.0
+    size_factors: list[str] = []
+    if (decision.conviction or "HIGH").upper() == "MEDIUM":
+        size_mult *= float(settings.medium_conviction_size_mult)
+        size_factors.append(f"medium×{settings.medium_conviction_size_mult}")
+    rsi = (decision.analysis or {}).get("rsi9")
+    if rsi is not None:
+        weak = (decision.action == "BUY_PUT" and float(rsi) >= 50) or (
+            decision.action == "BUY_CALL" and float(rsi) <= 50
+        )
+        if weak:
+            size_mult *= float(settings.weak_rsi_size_mult)
+            size_factors.append(f"weak_rsi({rsi})×{settings.weak_rsi_size_mult}")
+    sized_position_usd = capped_position_usd * size_mult
+
+    qty = max(1, math.floor(sized_position_usd / one_contract_cost))
+    if size_mult < 1.0:
+        log.info(
+            "directional_execute_size_scaled",
+            ticker=decision.ticker, conviction=decision.conviction,
+            factors=", ".join(size_factors), size_mult=round(size_mult, 3),
+            sized_budget=round(sized_position_usd, 2), qty=qty,
+        )
     if capped_position_usd < position_usd:
         log.info(
             "directional_execute_qty_capped_by_loss_cap",

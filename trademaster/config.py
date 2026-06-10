@@ -41,6 +41,23 @@ class Settings(BaseSettings):
     # capital moved to $25k so position size scales with the budget.
     max_loss_per_trade_pct: float = Field(default=0.10, gt=0, le=1.0)
 
+    # Conviction-scaled sizing (fix C, 2026-06-09). MEDIUM-conviction trades
+    # deploy this fraction of the per-trade budget that a HIGH trade would —
+    # weaker edge gets less capital. Trade #60 (MEDIUM, RSI not confirming) lost
+    # full size; HIGH puts the same day all won.
+    medium_conviction_size_mult: float = Field(default=0.5, gt=0, le=1.0)
+    # Extra downsize when RSI-9 does not confirm the trade direction at entry
+    # (a put with RSI ≥ 50, or a call with RSI ≤ 50 — i.e. momentum is not yet
+    # on our side). Multiplies on top of the conviction multiplier.
+    weak_rsi_size_mult: float = Field(default=0.5, gt=0, le=1.0)
+
+    # Re-entry throttle (fix C/B, 2026-06-09). Block a NEW same-direction entry
+    # once this many consecutive same-direction trades have already opened today
+    # — stops chasing an exhausted one-way move (today 5 puts stacked; the late
+    # ones got caught by the bounce). A direction flip resets the streak. 0 =
+    # disabled. The HIGH-conviction breakout exemption is handled in code.
+    reentry_same_direction_limit: int = Field(default=3, ge=0)
+
     # The trailing stop trails CONTINUOUSLY at (peak − this gap) across the
     # whole in-profit range (once past the lowest ladder tier), so the stop
     # always sits within `gap` of the high-water mark. 0.10 → a +70% peak locks

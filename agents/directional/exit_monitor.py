@@ -62,6 +62,19 @@ HARD_FLOOR_PCT = Decimal("0.30")   # −30%: exit unconditionally, no LLM
 VOLUME_FADE_THRESHOLD = 0.7        # volume_ratio below this = momentum fading
 PROFIT_LOCK_PCT = 75.0             # always consult LLM above this P&L even with no indicator triggers
 
+# Thesis-invalidation force-exit (fix A, 2026-06-09). When a LOSING position
+# shows a confirmed momentum reversal, exit immediately WITHOUT asking the LLM —
+# the LLM kept holding broken losers (trade #60 held −15%→−25% citing "stop not
+# hit / theta negligible"). RSI-9 flipping against the position is the key tell.
+RSI_REVERSAL_CALL = 45.0           # RSI-9 falling below this against a call = bullish momentum lost
+RSI_REVERSAL_PUT = 55.0            # RSI-9 rising above this against a put = bearish momentum lost
+THESIS_INVALIDATION_MIN_SIGNALS = 2  # reversal signals needed to force-exit a loser
+# Rules (from _check_exit_rules) that count as the thesis breaking, per direction.
+_INVALIDATION_RULES = {
+    "BUY_CALL": {"price_below_vwap", "rsi_reversal_bearish", "ema_bearish_cross", "volume_fading"},
+    "BUY_PUT": {"price_above_vwap", "rsi_reversal_bullish", "ema_bullish_cross", "volume_fading"},
+}
+
 # Trailing stop + scale-out tiers: (trigger_pct, lock_in_pct, sell_fraction)
 # Walked from highest to lowest. At each crossed tier:
 #   - Ratchet stop on REMAINING position to lock_in_pct
@@ -182,7 +195,25 @@ def _close_trade_row(
     order: OrderResult | None,
     reason: str,
     llm_reasoning: str = "",
-) -> None:
+) -> bool:
+    """Close a trade row. Idempotent: if the row is already closed (a concurrent
+    exit job got there first), do nothing and return False.
+
+    The 30-sec tick and the 5-min monitor can both decide to exit the same trade
+    within the same second. Without this guard the loser of that race overwrites
+    the winner's real close — e.g. trade #57: the tick filled the hard-floor sell
+    at $1.35 (a real −50% loss) and 40 ms later the monitor's redundant sell was
+    rejected ("position not in broker") and re-marked it as a phantom, hiding the
+    real loss. First close wins.
+    """
+    if trade.closed_at is not None:
+        log.info(
+            "directional_close_skipped_already_closed",
+            trade_id=trade.id,
+            existing_reason=(trade.extra or {}).get("exit_reason"),
+            attempted_reason=reason,
+        )
+        return False
     qty = Decimal(str(trade.qty))
     entry_p = Decimal(str(trade.entry_price))
     trade.exit_price = exit_premium
@@ -195,6 +226,7 @@ def _close_trade_row(
     extra["close_status"] = order.status if order else "broker_error"
     trade.extra = extra
     session.commit()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +481,8 @@ def _check_exit_rules(action: str, snap: dict) -> list[str]:
             triggered.append("price_below_vwap")
         if rsi is not None and rsi > 75:   # RSI-9: overbought = 75 (wider than RSI-14's 70)
             triggered.append("rsi_overbought")
+        if rsi is not None and rsi < RSI_REVERSAL_CALL:  # momentum flipped bearish against the call
+            triggered.append("rsi_reversal_bearish")
         if ema20 is not None and ema50 is not None and ema20 < ema50:
             triggered.append("ema_bearish_cross")
         if vol is not None and vol < VOLUME_FADE_THRESHOLD:
@@ -458,12 +492,26 @@ def _check_exit_rules(action: str, snap: dict) -> list[str]:
             triggered.append("price_above_vwap")
         if rsi is not None and rsi < 25:   # RSI-9: oversold = 25 (wider than RSI-14's 30)
             triggered.append("rsi_oversold")
+        if rsi is not None and rsi > RSI_REVERSAL_PUT:  # momentum flipped bullish against the put
+            triggered.append("rsi_reversal_bullish")
         if ema20 is not None and ema50 is not None and ema20 > ema50:
             triggered.append("ema_bullish_cross")
         if vol is not None and vol < VOLUME_FADE_THRESHOLD:
             triggered.append("volume_fading")
 
     return triggered
+
+
+def _thesis_invalidated(action: str, triggered_rules: list[str]) -> bool:
+    """True when enough reversal signals confirm the trade thesis is broken.
+
+    Used to force-exit a LOSING position without LLM discretion (fix A). Counts
+    how many of the direction's invalidation rules fired; ≥ the threshold means
+    momentum has flipped against the position and we should cut, not hold.
+    """
+    invalidating = _INVALIDATION_RULES.get(action, set())
+    hits = sum(1 for r in triggered_rules if r in invalidating)
+    return hits >= THESIS_INVALIDATION_MIN_SIGNALS
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +682,7 @@ def _format_exit_combined(
         "trailing_stop": "🔒 trailing stop — locking in gains",
         "smart_exit": "🧠 smart exit — thesis reversed",
         "smart_profit_exit": "💰 smart profit exit — indicators say take it",
+        "thesis_invalidated": "🚫 thesis invalidated — momentum reversed, cutting loss",
         "force_close": "⏰ closing before market close",
     }.get(reason, f"closing ({reason})")
 
@@ -793,9 +842,24 @@ async def run_directional_exit_monitor(
             triggered = _check_exit_rules(action, snap)
             in_strong_profit = pnl_pct >= PROFIT_LOCK_PCT
 
+            # Thesis-invalidation hard exit (fix A): if the position is at a LOSS
+            # and momentum has confirmed-reversed against it, cut immediately —
+            # do NOT give the LLM a chance to rationalise holding (#60 was held
+            # −15%→−25% on "stop not hit / theta negligible" while RSI climbed
+            # back through 55 and volume collapsed). Winners are untouched
+            # (gated on pnl_pct < 0); they ride the trailing stop / profit logic.
+            if pnl_pct < 0 and _thesis_invalidated(action, triggered):
+                should_exit, reason = True, "thesis_invalidated"
+                log.info(
+                    "directional_exit_thesis_invalidated",
+                    trade_id=trade.id,
+                    pnl_pct=f"{pnl_pct:+.1f}%",
+                    triggered_rules=triggered,
+                )
+
             # Consult LLM if: (a) any indicator rule fired, OR (b) P&L is high enough
             # that we should proactively check whether to take the gain.
-            if triggered or in_strong_profit:
+            elif triggered or in_strong_profit:
                 should_exit, llm_reasoning = await _llm_exit_confirm(
                     trade=trade,
                     snap=snap,
@@ -826,6 +890,14 @@ async def run_directional_exit_monitor(
             continue
 
         # ---- submit close order ----
+        # Re-read fresh: the 30-sec tick may have already closed this trade in
+        # the gap since we loaded it. Skip the redundant sell (which Alpaca
+        # rejects as a phantom short-open) if so. (fix D)
+        with factory() as session:
+            fresh = session.get(Trade, trade.id)
+            if fresh is None or fresh.closed_at is not None:
+                results.append({"trade_id": trade.id, "status": "already_closed_by_other_job"})
+                continue
         try:
             order = await submitter(
                 qty=int(trade.qty),
@@ -1034,7 +1106,12 @@ async def run_trailing_stop_tick(
         if not should_exit:
             continue
 
-        # 4. Full exit of remaining qty
+        # 4. Full exit of remaining qty — re-read fresh first so we don't fire a
+        # redundant sell the 5-min monitor already submitted (fix D).
+        with factory() as session:
+            fresh = session.get(Trade, trade.id)
+            if fresh is None or fresh.closed_at is not None:
+                continue
         qty = int(trade.qty)
         try:
             order = await submitter(qty=qty, occ_symbol=occ, limit_price=current_bid)

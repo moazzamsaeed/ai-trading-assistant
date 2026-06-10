@@ -10,6 +10,7 @@ import pytest
 from agents.directional.exit_monitor import (
     HARD_FLOOR_PCT,
     _check_exit_rules,
+    _close_trade_row,
     _format_exit_combined,
     _llm_exit_confirm,
     run_directional_exit_monitor,
@@ -169,6 +170,69 @@ def test_check_exit_rules_put_ema_bullish_cross():
 
 def test_check_exit_rules_empty_snap_returns_empty():
     assert _check_exit_rules("BUY_CALL", {}) == []
+
+
+def test_check_exit_rules_put_rsi_reversal_bullish():
+    # RSI-9 climbing back above 55 against a put = momentum flipped bullish (fix A)
+    snap = _snap(rsi=60)
+    assert "rsi_reversal_bullish" in _check_exit_rules("BUY_PUT", snap)
+
+
+def test_check_exit_rules_call_rsi_reversal_bearish():
+    # RSI-9 falling below 45 against a call = momentum flipped bearish (fix A)
+    snap = _snap(rsi=40)
+    assert "rsi_reversal_bearish" in _check_exit_rules("BUY_CALL", snap)
+
+
+# ---------------------------------------------------------------------------
+# _thesis_invalidated (fix A)
+# ---------------------------------------------------------------------------
+
+
+def test_thesis_invalidated_needs_two_signals():
+    from agents.directional.exit_monitor import _thesis_invalidated
+    # One signal is not enough to force-exit.
+    assert _thesis_invalidated("BUY_PUT", ["volume_fading"]) is False
+    # #60's end-state: RSI flipped bullish + volume collapsed = 2 → invalidated.
+    assert _thesis_invalidated("BUY_PUT", ["rsi_reversal_bullish", "volume_fading"]) is True
+
+
+def test_thesis_invalidated_direction_specific():
+    from agents.directional.exit_monitor import _thesis_invalidated
+    # Call-invalidation rules must not count toward a put's thesis (and vice-versa).
+    assert _thesis_invalidated("BUY_PUT", ["price_below_vwap", "rsi_reversal_bearish"]) is False
+    assert _thesis_invalidated("BUY_CALL", ["price_below_vwap", "volume_fading"]) is True
+
+
+# ---------------------------------------------------------------------------
+# _close_trade_row idempotency (fix D — exit-job race)
+# ---------------------------------------------------------------------------
+
+
+def test_close_trade_row_first_close_wins(session_factory):
+    """A second (racing) close must NOT overwrite the first. Mirrors trade #57:
+    the tick filled a real hard-floor exit, then the monitor's redundant sell
+    tried to re-mark it as a phantom — the first close must stand."""
+    trade = _open_trade(session_factory, entry_premium=2.72)
+
+    with session_factory() as s:
+        row = s.get(Trade, trade.id)
+        # First close: the real hard-floor fill at 1.35.
+        assert _close_trade_row(
+            s, row, exit_premium=Decimal("1.35"), order=None, reason="hard_floor_stop",
+        ) is True
+
+    with session_factory() as s:
+        row = s.get(Trade, trade.id)
+        # Racing second close (phantom reconcile at a different price) is a no-op.
+        assert _close_trade_row(
+            s, row, exit_premium=Decimal("1.34"), order=None, reason="position_not_in_broker",
+        ) is False
+
+    with session_factory() as s:
+        row = s.get(Trade, trade.id)
+        assert row.exit_price == Decimal("1.35")                 # first close preserved
+        assert (row.extra or {})["exit_reason"] == "hard_floor_stop"  # not overwritten
 
 
 # ---------------------------------------------------------------------------
