@@ -386,7 +386,51 @@ def _build_analysis(action: str, snap: dict, ctx: dict) -> dict:
         "macd_signal": fnum(snap.get("macd_signal")),
         "volume_ratio": fnum(snap.get("volume_ratio_20")),
         "next_target": _next_target(action, price, ctx),
+        # Levels carried for the re-entry freshness gate (scheduler fix B).
+        "session_high": ctx.get("session_high"),
+        "session_low": ctx.get("session_low"),
+        "orb_high": ctx.get("orb_high"),
+        "orb_low": ctx.get("orb_low"),
     }
+
+
+def is_fresh_leg(
+    action: str,
+    analysis: dict | None,
+    *,
+    pullback_range_frac: float,
+    fresh_volume_min: float,
+) -> bool:
+    """Does a same-direction re-entry look like a FRESH leg, not a late chase?
+
+    Used by the scheduler's re-entry gate (fix B) on the 3rd+ consecutive
+    same-direction trade — the bucket that was 0-for-4. A fresh leg is EITHER:
+      • a pullback: price has retraced ≥ `pullback_range_frac` of the day's range
+        back from the move's extreme (consolidation → room for a new leg), OR
+      • a new-extreme breakout: price is at/through the session extreme in the
+        trade direction with volume ≥ `fresh_volume_min` (momentum continuing).
+    A chase — price stalled mid-move on tepid volume — matches neither.
+
+    Conservative: missing level data → False (treat as a chase, skip the trade).
+    """
+    a = analysis or {}
+    price = a.get("spy_price")
+    vol = a.get("volume_ratio")
+    sh = a.get("session_high")
+    sl = a.get("session_low")
+    if price is None or not sh or not sl or sh <= sl:
+        return False
+    rng = sh - sl
+    edge = 0.05 * rng  # "at the extreme" tolerance
+    if action == "BUY_PUT":
+        new_low_break = price <= sl + edge and vol is not None and vol >= fresh_volume_min
+        pullback = (price - sl) >= pullback_range_frac * rng
+        return bool(new_low_break or pullback)
+    if action == "BUY_CALL":
+        new_high_break = price >= sh - edge and vol is not None and vol >= fresh_volume_min
+        pullback = (sh - price) >= pullback_range_frac * rng
+        return bool(new_high_break or pullback)
+    return True
 
 
 def _green_lights(action: str, a: dict) -> list[str]:

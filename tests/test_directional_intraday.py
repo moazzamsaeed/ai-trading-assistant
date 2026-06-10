@@ -683,3 +683,48 @@ def test_format_setup_forming_renders_watch_alert():
     assert "Still needs: volume" in out
     assert "model will enter a CALL" in out
     assert "not an entry yet" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# is_fresh_leg — re-entry freshness gate (fix B, 2026-06-10)
+# ---------------------------------------------------------------------------
+
+def _fresh_analysis(price, *, sl=730.0, sh=740.0, vol=1.0):
+    return {"spy_price": price, "session_low": sl, "session_high": sh, "volume_ratio": vol}
+
+
+def test_fresh_leg_blocks_put_chase():
+    # Mid-move, tepid volume, no pullback, not making new lows → a chase → blocked.
+    a = _fresh_analysis(731.0, vol=1.0)  # 1pt off the 730 low (10% of range), vol < 1.5
+    assert agent.is_fresh_leg("BUY_PUT", a, pullback_range_frac=0.30, fresh_volume_min=1.5) is False
+
+
+def test_fresh_leg_allows_put_pullback():
+    # Price retraced 40% of the range back up from the low → room for a new leg.
+    a = _fresh_analysis(734.0, vol=1.0)  # (734-730)/10 = 40% ≥ 30%
+    assert agent.is_fresh_leg("BUY_PUT", a, pullback_range_frac=0.30, fresh_volume_min=1.5) is True
+
+
+def test_fresh_leg_allows_put_new_low_break_with_volume():
+    # Making new session lows with strong volume → fresh breakdown leg.
+    a = _fresh_analysis(730.0, vol=1.6)
+    assert agent.is_fresh_leg("BUY_PUT", a, pullback_range_frac=0.30, fresh_volume_min=1.5) is True
+
+
+def test_fresh_leg_new_low_break_needs_volume():
+    # At the lows but volume tepid → exhausted, not fresh → blocked.
+    a = _fresh_analysis(730.0, vol=1.1)
+    assert agent.is_fresh_leg("BUY_PUT", a, pullback_range_frac=0.30, fresh_volume_min=1.5) is False
+
+
+def test_fresh_leg_allows_call_new_high_break_with_volume():
+    a = _fresh_analysis(739.8, vol=1.6)  # at the 740 high w/ volume
+    assert agent.is_fresh_leg("BUY_CALL", a, pullback_range_frac=0.30, fresh_volume_min=1.5) is True
+
+
+def test_fresh_leg_missing_levels_is_conservative():
+    # No level data → treat as a chase (False), don't risk the gated entry.
+    out = agent.is_fresh_leg(
+        "BUY_PUT", {"spy_price": 730.0}, pullback_range_frac=0.30, fresh_volume_min=1.5
+    )
+    assert out is False

@@ -32,6 +32,7 @@ from agents.directional.exit_monitor import (
 from agents.directional.intraday import (
     format_entry_combined,
     format_setup_forming,
+    is_fresh_leg,
     run_directional_scan,
 )
 from agents.intraday.scan import run_intraday_scan
@@ -375,20 +376,28 @@ async def _directional_scan_job(
                 )
                 continue
 
-        # Re-entry throttle (fix B): once N consecutive same-direction trades
-        # have opened today, only HIGH conviction breaks through — stops chasing
-        # an exhausted one-way move (today 5 puts stacked; the late MEDIUM #60
-        # got caught by the bounce). A direction flip resets the streak.
-        if settings.reentry_same_direction_limit > 0 and decision.conviction != "HIGH":
+        # Re-entry freshness gate (fix B): once N consecutive same-direction
+        # trades have opened today, a further same-direction entry must look like
+        # a FRESH leg (pullback from the extreme, or a new-extreme break with
+        # volume) — not a late chase. The 3rd same-direction trade was 0-for-4
+        # (−$5,198), always entering as the move was spent. Conviction is NOT an
+        # exemption: two of those four losers were HIGH. A flip resets the streak.
+        if settings.reentry_same_direction_limit > 0:
             streak_action, streak = get_today_directional_streak(make_session_factory())
             if streak_action == decision.action and streak >= settings.reentry_same_direction_limit:
-                log.info(
-                    "directional_execute_skipped_reentry_throttle",
-                    ticker=decision.ticker, action=decision.action,
-                    conviction=decision.conviction, same_direction_streak=streak,
-                    limit=settings.reentry_same_direction_limit,
+                fresh = is_fresh_leg(
+                    decision.action, decision.analysis,
+                    pullback_range_frac=settings.reentry_pullback_range_frac,
+                    fresh_volume_min=settings.reentry_fresh_volume_min,
                 )
-                continue
+                if not fresh:
+                    log.info(
+                        "directional_execute_skipped_reentry_throttle",
+                        ticker=decision.ticker, action=decision.action,
+                        conviction=decision.conviction, same_direction_streak=streak,
+                        reason="not_a_fresh_leg",
+                    )
+                    continue
 
         # 15-min per-ticker cooldown
         last_open = _last_trade_open.get(decision.ticker)

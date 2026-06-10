@@ -51,12 +51,19 @@ class Settings(BaseSettings):
     # on our side). Multiplies on top of the conviction multiplier.
     weak_rsi_size_mult: float = Field(default=0.5, gt=0, le=1.0)
 
-    # Re-entry throttle (fix C/B, 2026-06-09). Block a NEW same-direction entry
-    # once this many consecutive same-direction trades have already opened today
-    # — stops chasing an exhausted one-way move (today 5 puts stacked; the late
-    # ones got caught by the bounce). A direction flip resets the streak. 0 =
-    # disabled. The HIGH-conviction breakout exemption is handled in code.
-    reentry_same_direction_limit: int = Field(default=3, ge=0)
+    # Re-entry freshness gate (fix B, 2026-06-09; tightened 2026-06-10). Once
+    # this many consecutive same-direction trades have opened today, a further
+    # same-direction entry must look like a FRESH leg — not a late chase of an
+    # exhausted move. The 3rd same-direction trade was 0-for-4 (−$5,198): it
+    # always entered as the morning move was spent and got caught by the bounce
+    # (peaks of 0–10% vs 16–242% for trades 1–2). Default 2 → the 3rd+ entry is
+    # gated. A direction flip resets the streak. 0 = disabled.
+    reentry_same_direction_limit: int = Field(default=2, ge=0)
+    # A gated re-entry is allowed only if EITHER it's pulled back ≥ this fraction
+    # of the day's range from the move's extreme (consolidation → room for a new
+    # leg), OR it's a fresh break to a new extreme with volume ≥ the floor below.
+    reentry_pullback_range_frac: float = Field(default=0.30, gt=0, le=1.0)
+    reentry_fresh_volume_min: float = Field(default=1.5, gt=0)
 
     # The trailing stop trails CONTINUOUSLY at (peak − this gap) across the
     # whole in-profit range (once past the lowest ladder tier), so the stop
