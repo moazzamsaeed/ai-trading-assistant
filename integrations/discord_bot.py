@@ -28,6 +28,8 @@ from trademaster.logging import get_logger
 log = get_logger(__name__)
 
 MESSAGE_LIMIT = 1900  # leave headroom under Discord's 2000-char cap
+EMBED_DESC_LIMIT = 4096      # Discord per-embed description cap
+EMBED_TOTAL_LIMIT = 5900     # stay safely under the 6000 chars-per-message embed total
 
 
 def _split_for_discord(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
@@ -127,8 +129,39 @@ class TradeMasterBot(commands.Bot):
             await channel.send(chunk)
         log.info("discord_posted", channel_id=channel_id, chars=len(text))
 
+    async def post_single(self, channel_id: int, text: str) -> None:
+        """Post `text` as a SINGLE Discord message (→ one notification), even when
+        it's long, by packing it into embeds (4096 chars/description, multiple
+        embeds per message) instead of splitting into separate messages.
+
+        Used for the pre-market briefing and #research synthesis so the user gets
+        one alert with all the detail, not three pings for one report. Briefings
+        that somehow exceed the ~5900-char embed budget spill into a second
+        message (rare) rather than being truncated.
+        """
+        if channel_id == 0:
+            log.warning("discord_post_skipped_no_channel")
+            return
+        channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
+        chunks = _split_for_discord(text, limit=EMBED_DESC_LIMIT)
+
+        batch: list[discord.Embed] = []
+        batch_chars = 0
+        for chunk in chunks:
+            if batch and batch_chars + len(chunk) > EMBED_TOTAL_LIMIT:
+                await channel.send(embeds=batch)
+                batch, batch_chars = [], 0
+            batch.append(discord.Embed(description=chunk, color=discord.Color.blurple()))
+            batch_chars += len(chunk)
+        if batch:
+            await channel.send(embeds=batch)
+        log.info(
+            "discord_posted_single",
+            channel_id=channel_id, chars=len(text), embeds=len(chunks),
+        )
+
     async def post_research(self, text: str) -> None:
-        await self.post(self._research_channel_id, text)
+        await self.post_single(self._research_channel_id, text)
 
     async def post_signal(self, text: str) -> None:
         """Broker-ready manual-trading signal."""
