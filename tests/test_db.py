@@ -15,6 +15,7 @@ from trademaster.db import (
     Signal,
     Trade,
     get_today_directional_streak,
+    get_today_failed_breakouts,
     make_engine,
     make_session_factory,
     today_et,
@@ -134,3 +135,41 @@ def test_directional_streak_resets_on_flip(session_factory):
     _open_directional(session_factory, "BUY_CALL", seq=2)  # direction flip
     # The trailing run is now a single call — streak resets.
     assert get_today_directional_streak(session_factory) == ("BUY_CALL", 1)
+
+
+# ---------------------------------------------------------------------------
+# get_today_failed_breakouts (evidence-based chop filter)
+# ---------------------------------------------------------------------------
+
+def _closed_directional(sf, *, action, peak, pnl, seq, exit_reason="smart_exit"):
+    strat = "directional_call" if action == "BUY_CALL" else "directional_put"
+    noon = datetime.combine(today_et(), time(12, 0), tzinfo=ET)
+    opened = (noon + timedelta(minutes=seq)).astimezone(UTC)
+    closed = (noon + timedelta(minutes=seq + 5)).astimezone(UTC)
+    with sf() as s:
+        s.add(Trade(
+            symbol="SPY260101C00500000", asset_class="option", side="buy", strategy=strat,
+            qty=Decimal("5"), entry_price=Decimal("2.00"), exit_price=Decimal("1.50"),
+            realized_pnl_usd=Decimal(str(pnl)), opened_at=opened, closed_at=closed,
+            extra={"action": action, "peak_pnl_pct": peak, "exit_reason": exit_reason},
+        ))
+        s.commit()
+
+
+def test_failed_breakouts_counts_only_immediate_reversal_losses(session_factory):
+    # ✓ failed breakout (peaked <10%, loss)
+    _closed_directional(session_factory, action="BUY_CALL", peak=5.0, pnl=-100, seq=0)
+    # ✗ winner
+    _closed_directional(session_factory, action="BUY_PUT", peak=50.0, pnl=300, seq=10)
+    # ✗ worked then reversed — peaked high, not an immediate reversal
+    _closed_directional(session_factory, action="BUY_PUT", peak=80.0, pnl=-200, seq=20)
+    # ✗ phantom excluded (infra, not a regime signal)
+    _closed_directional(session_factory, action="BUY_PUT", peak=0.0, pnl=-150, seq=30,
+                        exit_reason="position_not_in_broker")
+    fails = get_today_failed_breakouts(session_factory, peak_pct_max=10.0)
+    assert len(fails) == 1
+
+
+def test_failed_breakouts_empty_when_none(session_factory):
+    _closed_directional(session_factory, action="BUY_CALL", peak=40.0, pnl=200, seq=0)
+    assert get_today_failed_breakouts(session_factory, peak_pct_max=10.0) == []

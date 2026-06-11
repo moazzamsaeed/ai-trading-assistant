@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, time as _time
+from datetime import UTC, datetime, timedelta, time as _time
 from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -44,7 +44,7 @@ from decimal import Decimal
 from integrations import alpaca_client
 from trademaster.capital import directional_deployed_usd, get_effective_capital
 from trademaster.config import get_settings
-from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, get_today_trade_count_by_conviction, get_today_directional_streak, make_session_factory
+from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, get_today_trade_count_by_conviction, get_today_directional_streak, get_today_failed_breakouts, make_session_factory
 from trademaster.event_calendar import is_blackout_day
 from trademaster.logging import get_logger
 from trademaster.state import get_state
@@ -361,6 +361,30 @@ async def _directional_scan_job(
         key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
     )[:3]
 
+    # Evidence-based chop filter: after N failed breakouts today (entries that
+    # peaked <chop_failed_peak_pct and closed at a loss — immediate reversals),
+    # pause ALL new directional entries for chop_pause_minutes. A cluster means
+    # the regime is choppy and momentum entries keep getting trapped (today
+    # #64/#65/#66 each peaked <10% then reversed). No matter how fast we cut, we
+    # bleed on every false breakout — so stop taking them.
+    if to_execute and settings.chop_failed_breakout_limit > 0:
+        fails = get_today_failed_breakouts(
+            make_session_factory(), peak_pct_max=settings.chop_failed_peak_pct
+        )
+        if len(fails) >= settings.chop_failed_breakout_limit:
+            resume_at = max(fails) + timedelta(minutes=settings.chop_pause_minutes)
+            if datetime.now(UTC) < resume_at:
+                log.info(
+                    "directional_scan_skipped_chop",
+                    failed_breakouts=len(fails),
+                    resume_at_et=to_et(resume_at).strftime("%H:%M"),
+                )
+                await log_poster(
+                    f"🌀 Chop filter: {len(fails)} failed breakouts today "
+                    f"(entries reversing immediately) — pausing new entries until "
+                    f"{to_et(resume_at):%H:%M} ET. Exits stay active."
+                )
+                to_execute = []  # skip new entries this scan; exits run separately
 
     for decision in to_execute:
         # Tiered MEDIUM-conviction cap (0 = unlimited). Re-query each iteration

@@ -72,6 +72,17 @@ class Settings(BaseSettings):
     # (#64: a 0DTE call rode to −50% / −$1,490 while the LLM held it.)
     zdte_early_loss_cut_pct: float = Field(default=0.25, gt=0, le=1.0)
 
+    # Evidence-based chop filter (fix, 2026-06-11). After this many "failed
+    # breakouts" today — entries that peaked below chop_failed_peak_pct and
+    # closed at a loss (immediate reversals) — pause ALL new directional entries
+    # for chop_pause_minutes. A cluster of failed breakouts means the regime is
+    # choppy and momentum entries keep getting trapped (today #64/#65/#66 each
+    # peaked <10% then reversed). 0 = disabled. Pause measured from the most
+    # recent failed-breakout close.
+    chop_failed_breakout_limit: int = Field(default=2, ge=0)
+    chop_failed_peak_pct: float = Field(default=10.0, gt=0)
+    chop_pause_minutes: int = Field(default=45, ge=0)
+
     # The trailing stop trails CONTINUOUSLY at (peak − this gap) across the
     # whole in-profit range (once past the lowest ladder tier), so the stop
     # always sits within `gap` of the high-water mark. 0.10 → a +70% peak locks

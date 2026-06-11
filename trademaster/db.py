@@ -359,6 +359,49 @@ def get_today_directional_streak(session_factory) -> tuple[str | None, int]:
     return last_action, streak
 
 
+def get_today_failed_breakouts(session_factory, *, peak_pct_max: float = 10.0) -> list[datetime]:
+    """Close-timestamps (UTC) of today's 'failed breakout' directional trades —
+    entries that peaked below `peak_pct_max` AND closed at a net loss.
+
+    These are immediate-reversal entries: the breakout signal fired, we entered,
+    and price reversed before the position ever worked (peak 0–10%). A cluster of
+    them means the regime is CHOPPY and breakouts keep failing — the evidence the
+    chop filter (scheduler fix) uses to pause new entries. Phantom/reconciled
+    closes are excluded (infra noise, not a regime signal).
+    """
+    today = today_et()
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    day_end = day_start + timedelta(days=1)
+    reset_at = get_settings().baseline_reset_at
+    effective_start = max(day_start, reset_at) if reset_at is not None else day_start
+
+    out: list[datetime] = []
+    with session_factory() as session:
+        rows = session.execute(
+            select(Trade)
+            .where(Trade.strategy.in_(["directional_call", "directional_put"]))
+            .where(Trade.closed_at.is_not(None))
+            .where(Trade.opened_at >= effective_start)
+            .where(Trade.opened_at < day_end)
+        ).scalars().all()
+        for r in rows:
+            extra = r.extra or {}
+            if extra.get("exit_reason") == "position_not_in_broker":
+                continue  # phantom — infra, not a regime signal
+            try:
+                peak = float(extra.get("peak_pnl_pct", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                peak = 0.0
+            part = float(extra.get("partial_realized_pnl_usd", 0) or 0)
+            total = float(r.realized_pnl_usd or 0) + part
+            if peak < peak_pct_max and total < 0:
+                closed = r.closed_at
+                if closed.tzinfo is None:
+                    closed = closed.replace(tzinfo=UTC)
+                out.append(closed)
+    return sorted(out)
+
+
 _DIRECTIONAL_STRATEGIES = ["directional_call", "directional_put"]
 
 
