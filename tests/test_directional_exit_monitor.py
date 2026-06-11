@@ -310,6 +310,83 @@ async def test_llm_exit_confirm_failure_defaults_to_hold(session_factory):
     assert should_exit is False  # fail-safe: hold on LLM error
 
 
+async def test_exit_prompt_flags_0dte_expiry(session_factory):
+    """The exit prompt must say a 0DTE EXPIRES TODAY — the LLM misread a bare ISO
+    date as 'June 2026, ample time' and held #64 to the floor (fix 2026-06-11)."""
+    captured = {}
+
+    async def cap_llm(_tt, prompt, **_k):
+        captured["prompt"] = prompt
+        return _fake_llm("HOLD", "ok")
+
+    await _llm_exit_confirm(
+        trade=_fake_trade_obj(),  # occ SPY260101… → expiry ≤ today → 0DTE
+        snap=_snap(), triggered_rules=["price_below_vwap"],
+        current_bid=Decimal("1.00"), pnl_pct=-40.0,
+        session_factory=session_factory, llm_caller=cap_llm,
+    )
+    assert "EXPIRES TODAY" in captured["prompt"]
+    assert "0DTE" in captured["prompt"]
+
+
+async def test_exit_prompt_shows_dte_for_dated_option(session_factory):
+    """A genuinely far-dated option shows 'N DTE', not 'EXPIRES TODAY'."""
+    trade = _fake_trade_obj()
+    trade.extra = {**trade.extra, "occ_symbol": "SPY271231C00500000"}  # 2027-12-31
+    captured = {}
+
+    async def cap_llm(_tt, prompt, **_k):
+        captured["prompt"] = prompt
+        return _fake_llm("HOLD", "ok")
+
+    await _llm_exit_confirm(
+        trade=trade, snap=_snap(), triggered_rules=["volume_fading"],
+        current_bid=Decimal("2.00"), pnl_pct=0.0,
+        session_factory=session_factory, llm_caller=cap_llm,
+    )
+    assert "DTE" in captured["prompt"]
+    assert "EXPIRES TODAY" not in captured["prompt"]
+
+
+async def test_monitor_zdte_early_cut_without_llm(session_factory):
+    """0DTE + loss past −25% + price through VWAP → cut immediately, no LLM —
+    even when RSI/EMA/volume aren't warmed up (only price_below_vwap available).
+    Covers #64's early-session blind spot where fix A's ≥2-signal gate can't fire."""
+    _open_trade(session_factory, entry_premium=2.00)  # BUY_CALL, occ expired → 0DTE
+
+    async def loss_quote(_occ):
+        return _quote(bid=1.46)  # −27%: past the 25% cut, under the 30% selective floor
+
+    from integrations.alpaca_client import Bar
+
+    def _bar(close):
+        return Bar(
+            timestamp=datetime.now(UTC), open=Decimal(str(close)), high=Decimal(str(close + 0.2)),
+            low=Decimal(str(close - 0.2)), close=Decimal(str(close)), volume=8000,
+            vwap=Decimal(str(close + 3.0)),  # price < VWAP → price_below_vwap for a call
+        )
+
+    async def below_vwap_bars(*_a, **_k):
+        return [_bar(495.0) for _ in range(60)]
+
+    async def fake_sell(**_k):
+        return _filled(price=1.46)
+
+    async def fake_wait(order_id, **_k):
+        return _filled(price=1.46)
+
+    async def hold_llm(*_a, **_k):
+        return _fake_llm("HOLD", "should not be consulted on a 0DTE early-cut")
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory, quote_fetcher=loss_quote,
+        bars_fetcher=below_vwap_bars, submitter=fake_sell, waiter=fake_wait,
+        llm_caller=hold_llm, force_close=False,
+    )
+    assert results[0]["status"] == "closed"
+    assert results[0]["reason"] == "zdte_early_cut"
+
+
 # ---------------------------------------------------------------------------
 # _format_exit_combined
 # ---------------------------------------------------------------------------

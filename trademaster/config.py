@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     reentry_pullback_range_frac: float = Field(default=0.30, gt=0, le=1.0)
     reentry_fresh_volume_min: float = Field(default=1.5, gt=0)
 
+    # 0DTE indicator-independent early-cut (fix, 2026-06-11). Early in the session
+    # RSI/EMA/volume haven't warmed up, so the ≥2-signal thesis gate can't fire
+    # and the LLM mismanages 0DTE losers. On a 0DTE position past this loss with
+    # price through VWAP against it, cut immediately — no LLM, no indicator wait.
+    # (#64: a 0DTE call rode to −50% / −$1,490 while the LLM held it.)
+    zdte_early_loss_cut_pct: float = Field(default=0.25, gt=0, le=1.0)
+
     # The trailing stop trails CONTINUOUSLY at (peak − this gap) across the
     # whole in-profit range (once past the lowest ladder tier), so the stop
     # always sits within `gap` of the high-water mark. 0.10 → a +70% peak locks

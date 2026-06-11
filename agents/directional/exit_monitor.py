@@ -540,7 +540,20 @@ async def _llm_exit_confirm(
     occ = extra.get("occ_symbol", trade.symbol)
     try:
         _, expiry_date, _, _ = parse_occ_symbol(occ)
-        expiry = expiry_date.isoformat()
+        # Pass DTE explicitly — the LLM mis-read the raw ISO date "2026-06-11" as
+        # "June 2026, months away, ample time to recover" and held a 0DTE loser
+        # to the floor (#64, −$1,490). Make "expires today" unmistakable.
+        dte = (expiry_date - to_et(datetime.now(UTC)).date()).days
+        if dte <= 0:
+            expiry = (
+                f"{expiry_date.isoformat()} — ⚠️ 0DTE, EXPIRES TODAY. Theta is "
+                f"LETHAL and there is NO time to recover — do NOT hold a loser "
+                f"hoping for a bounce; cut losses fast."
+            )
+        elif dte == 1:
+            expiry = f"{expiry_date.isoformat()} — 1 DTE (expires tomorrow); theta heavy"
+        else:
+            expiry = f"{expiry_date.isoformat()} — {dte} DTE"
     except ValueError:
         expiry = "unknown"
 
@@ -683,6 +696,7 @@ def _format_exit_combined(
         "smart_exit": "🧠 smart exit — thesis reversed",
         "smart_profit_exit": "💰 smart profit exit — indicators say take it",
         "thesis_invalidated": "🚫 thesis invalidated — momentum reversed, cutting loss",
+        "zdte_early_cut": "⏱️ 0DTE early cut — losing + below VWAP, no time to recover",
         "force_close": "⏰ closing before market close",
     }.get(reason, f"closing ({reason})")
 
@@ -842,13 +856,41 @@ async def run_directional_exit_monitor(
             triggered = _check_exit_rules(action, snap)
             in_strong_profit = pnl_pct >= PROFIT_LOCK_PCT
 
+            # Is this a 0DTE (expires today)? Used by the early-cut below.
+            try:
+                _, _exp_date, _, _ = parse_occ_symbol(occ)
+                is_0dte = _exp_date <= today
+            except ValueError:
+                is_0dte = False
+            # Price broken through VWAP against the position — the one reversal
+            # signal that IS computable early (VWAP needs few bars; RSI/EMA don't).
+            vwap_broken = (
+                "price_below_vwap" in triggered if action == "BUY_CALL"
+                else "price_above_vwap" in triggered
+            )
+            zdte_cut_pct = float(get_settings().zdte_early_loss_cut_pct) * 100
+
+            # 0DTE indicator-independent early-cut (fix, 2026-06-11): early in the
+            # session RSI/EMA/volume aren't warmed up, so fix A's ≥2-signal gate
+            # can't fire and the LLM mismanages 0DTE losers ("time to recover" —
+            # there is none on a 0DTE). If a 0DTE is past the loss threshold with
+            # price through VWAP against us, cut now without the LLM. (#64 rode to
+            # −50% because only price_below_vwap was available and the LLM held.)
+            if is_0dte and pnl_pct <= -zdte_cut_pct and vwap_broken:
+                should_exit, reason = True, "zdte_early_cut"
+                log.info(
+                    "directional_exit_zdte_early_cut",
+                    trade_id=trade.id, pnl_pct=f"{pnl_pct:+.1f}%",
+                    triggered_rules=triggered,
+                )
+
             # Thesis-invalidation hard exit (fix A): if the position is at a LOSS
             # and momentum has confirmed-reversed against it, cut immediately —
             # do NOT give the LLM a chance to rationalise holding (#60 was held
             # −15%→−25% on "stop not hit / theta negligible" while RSI climbed
             # back through 55 and volume collapsed). Winners are untouched
             # (gated on pnl_pct < 0); they ride the trailing stop / profit logic.
-            if pnl_pct < 0 and _thesis_invalidated(action, triggered):
+            elif pnl_pct < 0 and _thesis_invalidated(action, triggered):
                 should_exit, reason = True, "thesis_invalidated"
                 log.info(
                     "directional_exit_thesis_invalidated",
