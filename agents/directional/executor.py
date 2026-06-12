@@ -119,6 +119,7 @@ def _persist_entry(
     conviction: str = "HIGH",
     order: OrderResult,
     entry_reasoning: str = "",
+    entry_indicators: dict | None = None,
 ) -> int:
     strategy = STRATEGY_CALL if action == "BUY_CALL" else STRATEGY_PUT
     row = Trade(
@@ -147,6 +148,10 @@ def _persist_entry(
             "filled_avg_price": (
                 str(order.filled_avg_price) if order.filled_avg_price else None
             ),
+            # Entry-time indicators, persisted for threshold calibration (e.g.
+            # ADX gate tuning) — pair these with the trade's peak/outcome later.
+            "entry_adx": (entry_indicators or {}).get("adx"),
+            "entry_rsi9": (entry_indicators or {}).get("rsi9"),
         },
     )
     session.add(row)
@@ -514,6 +519,7 @@ async def execute_directional_signal(
             conviction=decision.conviction or "HIGH",
             order=final,
             entry_reasoning=decision.reasoning,
+            entry_indicators=decision.analysis,
         )
 
     return DirectionalExecutionResult(
