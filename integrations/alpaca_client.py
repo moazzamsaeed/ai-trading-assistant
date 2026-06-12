@@ -251,15 +251,31 @@ async def get_recent_news(
             sort="desc",
         )
         raw = _client().get_news(req)
-        if hasattr(raw, "news"):
-            items = raw.news
-        elif hasattr(raw, "data"):
-            items = raw.data
-        else:
-            items = raw
-        return [_to_article(a) for a in items]
+        items = _unwrap_news(raw)
+        # Guard on `headline` so a shape we don't recognize yields 0 articles,
+        # not a list of empty ones (the bug that silently starved the bot of news).
+        return [_to_article(a) for a in items if hasattr(a, "headline")]
 
     return await asyncio.to_thread(_fetch)
+
+
+def _unwrap_news(raw) -> list:
+    """Extract the list of news objects from alpaca-py's get_news() response.
+
+    alpaca-py returns a NewsSet whose `.data` is a dict {"news": [News, ...]}.
+    The old code did `items = raw.data` and then iterated it — iterating a dict
+    yields its KEYS ("news"), so every fetch produced exactly one empty article
+    and the bot ran with no news. Unwrap to the actual list; tolerate the bare-
+    list and `.news` shapes too. Anything unrecognized → [] (fail closed)."""
+    data = getattr(raw, "data", None)
+    if isinstance(data, dict):
+        return list(data.get("news", []))
+    if isinstance(data, list):
+        return data
+    news = getattr(raw, "news", None)
+    if isinstance(news, list):
+        return news
+    return raw if isinstance(raw, list) else []
 
 
 # ====================================================================

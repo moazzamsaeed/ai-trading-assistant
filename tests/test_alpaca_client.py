@@ -84,6 +84,42 @@ async def test_get_recent_news_tolerates_missing_fields(monkeypatch):
     assert articles[0].symbols == ()
 
 
+async def test_get_recent_news_parses_real_newsset_shape(monkeypatch):
+    """Regression: alpaca-py returns NewsSet with .data == {"news": [...]} (NO
+    .news attr). The old code did `items = raw.data` and iterated the dict's
+    KEYS → one empty article every fetch → the bot ran with zero news. This is
+    the shape production actually returns; it must parse to real articles."""
+    raw_items = [
+        SimpleNamespace(
+            headline="Michigan Consumer Sentiment beats",
+            summary="June 48.9 vs 46.1 est.", url="https://example.com/1",
+            created_at=datetime(2026, 6, 12, 14, 0, tzinfo=UTC),
+            symbols=["SPY"], source="alpaca",
+        ),
+    ]
+
+    class FakeClient:
+        def __init__(self, **_):
+            pass
+
+        def get_news(self, _req):
+            return SimpleNamespace(data={"news": raw_items})  # the real shape
+
+    monkeypatch.setattr(alpaca_client, "_client", lambda: FakeClient())
+    articles = await alpaca_client.get_recent_news(("SPY",))
+    assert len(articles) == 1
+    assert articles[0].headline == "Michigan Consumer Sentiment beats"
+
+
+def test_unwrap_news_shapes():
+    # NewsSet.data dict (production), bare list, .news attr, and junk → [].
+    assert alpaca_client._unwrap_news(SimpleNamespace(data={"news": [1, 2, 3]})) == [1, 2, 3]
+    assert alpaca_client._unwrap_news(SimpleNamespace(data=[4, 5])) == [4, 5]
+    assert alpaca_client._unwrap_news(SimpleNamespace(news=[6])) == [6]
+    assert alpaca_client._unwrap_news(SimpleNamespace(data={"foo": "bar"})) == []
+    assert alpaca_client._unwrap_news(object()) == []
+
+
 # ----------------- trading client -----------------
 
 
