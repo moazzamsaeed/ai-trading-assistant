@@ -137,6 +137,57 @@ def atr(bars: list[Bar], period: int = 14) -> Decimal | None:
     return atr_val.quantize(Decimal("0.01"))
 
 
+def adx(bars: list[Bar], period: int = 14) -> Decimal | None:
+    """Average Directional Index (Wilder) — trend STRENGTH, 0–100.
+
+    Direction-agnostic: it says how strongly price is trending, not which way.
+    Roughly: <20 = choppy/no trend (momentum breakouts fail), >25 = trending.
+    Built from +DM/−DM and True Range with Wilder smoothing. Needs ≥ 2×period+1
+    bars (warmup bars from the prior session count). Returns None if too few.
+    """
+    if len(bars) < 2 * period + 1:
+        return None
+
+    trs: list[Decimal] = []
+    plus_dms: list[Decimal] = []
+    minus_dms: list[Decimal] = []
+    for i in range(1, len(bars)):
+        high, low = bars[i].high, bars[i].low
+        prev_high, prev_low, prev_close = bars[i - 1].high, bars[i - 1].low, bars[i - 1].close
+        up_move = high - prev_high
+        down_move = prev_low - low
+        plus_dms.append(up_move if (up_move > down_move and up_move > 0) else Decimal("0"))
+        minus_dms.append(down_move if (down_move > up_move and down_move > 0) else Decimal("0"))
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+
+    def _wilder(vals: list[Decimal]) -> list[Decimal]:
+        # Seed = sum of first `period`, then sm = sm − sm/period + current.
+        sm = sum(vals[:period], Decimal("0"))
+        out = [sm]
+        for v in vals[period:]:
+            sm = sm - sm / Decimal(period) + v
+            out.append(sm)
+        return out
+
+    sm_tr, sm_plus, sm_minus = _wilder(trs), _wilder(plus_dms), _wilder(minus_dms)
+    dxs: list[Decimal] = []
+    for tr_s, p_s, m_s in zip(sm_tr, sm_plus, sm_minus, strict=True):
+        if tr_s == 0:
+            dxs.append(Decimal("0"))
+            continue
+        plus_di = Decimal("100") * p_s / tr_s
+        minus_di = Decimal("100") * m_s / tr_s
+        denom = plus_di + minus_di
+        dxs.append(Decimal("0") if denom == 0 else Decimal("100") * abs(plus_di - minus_di) / denom)
+
+    if len(dxs) < period:
+        return None
+    adx_val = sum(dxs[:period], Decimal("0")) / Decimal(period)
+    for dx in dxs[period:]:
+        adx_val = (adx_val * Decimal(period - 1) + dx) / Decimal(period)
+    return adx_val.quantize(Decimal("0.01"))
+
+
 # ----------------- MACD -----------------
 
 
@@ -239,6 +290,7 @@ def snapshot(
 
     rsi_val = rsi(bars, 9)
     atr_val = atr(bars, 10)
+    adx_val = adx(bars, 14)
     macd_val, macd_sig = macd(bars, fast=6, slow=13, signal=4)
     vwap_val = vwap(vwap_bars)
     ema20_val = ema(bars, 20)
@@ -254,6 +306,7 @@ def snapshot(
         "ema20": str(ema20_val) if ema20_val is not None else None,
         "ema50": str(ema50_val) if ema50_val is not None else None,
         "atr10": str(atr_val) if atr_val is not None else None,
+        "adx": str(adx_val) if adx_val is not None else None,
         "macd": str(macd_val) if macd_val is not None else None,
         "macd_signal": str(macd_sig) if macd_sig is not None else None,
         "volume_ratio_20": str(vol_ratio_val) if vol_ratio_val is not None else None,

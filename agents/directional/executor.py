@@ -401,6 +401,13 @@ async def execute_directional_signal(
         if weak:
             size_mult *= float(settings.weak_rsi_size_mult)
             size_factors.append(f"weak_rsi({rsi})×{settings.weak_rsi_size_mult}")
+    # Weak-trend (ADX) downsize: between the block floor and the full-size
+    # threshold the trend is marginal — deploy less. Below the floor the
+    # scheduler already skipped; at/above adx_full_above it's a real trend.
+    adx = (decision.analysis or {}).get("adx")
+    if adx is not None and float(adx) < settings.adx_full_above:
+        size_mult *= float(settings.adx_weak_size_mult)
+        size_factors.append(f"weak_adx({adx})×{settings.adx_weak_size_mult}")
     sized_position_usd = capped_position_usd * size_mult
 
     qty = max(1, math.floor(sized_position_usd / one_contract_cost))

@@ -415,6 +415,42 @@ async def test_weak_rsi_downsizes_put(session_factory):
     assert strong_qty["qty"] == 2
 
 
+async def test_low_adx_downsizes(session_factory):
+    """Fix: a marginal-trend entry (ADX < adx_full_above) deploys half size; a
+    strong-trend entry (ADX ≥ threshold) gets full size."""
+    weak, strong = {}, {}
+
+    async def submit_weak(**kwargs):
+        weak.update(kwargs)
+        return _filled_order(price=2.00)
+
+    async def submit_strong(**kwargs):
+        strong.update(kwargs)
+        return _filled_order(price=2.00)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled_order(price=2.00)
+
+    common = dict(
+        today=date(2026, 1, 2), mode="aggressive", session_factory=session_factory,
+        strike_selector=_selected(ask=2.00), waiter=fake_wait,
+    )
+    # HIGH call, RSI confirming (60 > 50, no RSI downsize), ADX 20 < 25 → ×0.5 → 1.
+    await execute_directional_signal(
+        TickerDecision("SPY", "BUY_CALL", 500.0, "0DTE", "HIGH", "t",
+                       analysis={"rsi9": 60.0, "adx": 20.0}),
+        submitter=submit_weak, **common,
+    )
+    # Same but ADX 30 ≥ 25 → full size → 2.
+    await execute_directional_signal(
+        TickerDecision("SPY", "BUY_CALL", 500.0, "0DTE", "HIGH", "t",
+                       analysis={"rsi9": 60.0, "adx": 30.0}),
+        submitter=submit_strong, **common,
+    )
+    assert weak["qty"] == 1
+    assert strong["qty"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Bug fixes — regression tests
 # ---------------------------------------------------------------------------

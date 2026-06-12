@@ -423,6 +423,19 @@ async def _directional_scan_job(
                     )
                     continue
 
+        # ADX trend-strength gate (proactive chop filter): if ADX says there's
+        # no trend to ride, momentum breakouts fail — skip the entry. Direct read
+        # from price, so unlike the evidence-based filter it can refuse the FIRST
+        # bad entry. ADX unavailable (early session) → no gate (fall through).
+        adx = (decision.analysis or {}).get("adx")
+        if adx is not None and float(adx) < settings.adx_block_below:
+            log.info(
+                "directional_execute_skipped_low_adx",
+                ticker=decision.ticker, action=decision.action,
+                adx=float(adx), threshold=settings.adx_block_below,
+            )
+            continue
+
         # 15-min per-ticker cooldown
         last_open = _last_trade_open.get(decision.ticker)
         now_ts = datetime.now(UTC)

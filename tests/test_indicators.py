@@ -119,6 +119,28 @@ def test_atr_constant_range():
     assert Decimal("0.30") < a < Decimal("0.50")
 
 
+# ----------------- ADX -----------------
+
+
+def test_adx_none_when_too_few_bars():
+    # Needs ≥ 2*period+1 = 29 bars for period 14.
+    assert indicators.adx(_bars([100.0 + i for i in range(20)]), period=14) is None
+
+
+def test_adx_high_on_strong_trend():
+    # Steadily rising closes → all directional movement is +DM → ADX maxes out.
+    bars = _bars([100.0 + i for i in range(40)])
+    a = indicators.adx(bars, period=14)
+    assert a is not None and a > Decimal("40")
+
+
+def test_adx_low_on_flat_chop():
+    # Flat closes → no net directional movement → ADX ≈ 0 (choppy).
+    bars = _bars([100.0] * 40)
+    a = indicators.adx(bars, period=14)
+    assert a is not None and a < Decimal("20")
+
+
 # ----------------- volume ratio -----------------
 
 

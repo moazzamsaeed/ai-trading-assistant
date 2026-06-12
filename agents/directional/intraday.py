@@ -385,6 +385,7 @@ def _build_analysis(action: str, snap: dict, ctx: dict) -> dict:
         "macd": fnum(snap.get("macd")),
         "macd_signal": fnum(snap.get("macd_signal")),
         "volume_ratio": fnum(snap.get("volume_ratio_20")),
+        "adx": fnum(snap.get("adx")),
         "next_target": _next_target(action, price, ctx),
         # Levels carried for the re-entry freshness gate (scheduler fix B).
         "session_high": ctx.get("session_high"),

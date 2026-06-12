@@ -81,7 +81,22 @@ class Settings(BaseSettings):
     # recent failed-breakout close.
     chop_failed_breakout_limit: int = Field(default=2, ge=0)
     chop_failed_peak_pct: float = Field(default=10.0, gt=0)
-    chop_pause_minutes: int = Field(default=45, ge=0)
+    # 90 (was 45): trades are spaced ~65–75 min apart, so a 45-min pause leaked
+    # one entry per hour (#67 slipped through 2026-06-11). 90 covers the cadence.
+    chop_pause_minutes: int = Field(default=90, ge=0)
+
+    # ADX trend-strength gate (proactive chop filter, fix 2026-06-11). ADX
+    # measures trend STRENGTH (0–100, direction-agnostic): low = choppy, no trend
+    # to ride, so momentum breakouts fail. Unlike the evidence-based filter (which
+    # waits for 2 failed breakouts), this reads it from price and can refuse the
+    # FIRST bad entry. Below adx_block_below → skip the entry; between that and
+    # adx_full_above → deploy adx_weak_size_mult of normal; at/above → full size.
+    # ADX unavailable (early session, too few bars) → no gate (fail-open).
+    # Intraday 5-min thresholds run lower than the daily-chart "25" convention;
+    # tune from live data.
+    adx_block_below: float = Field(default=18.0, ge=0)
+    adx_full_above: float = Field(default=25.0, gt=0)
+    adx_weak_size_mult: float = Field(default=0.5, gt=0, le=1.0)
 
     # The trailing stop trails CONTINUOUSLY at (peak − this gap) across the
     # whole in-profit range (once past the lowest ladder tier), so the stop
