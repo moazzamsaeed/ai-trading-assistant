@@ -1283,7 +1283,7 @@ async def run_directional_scan(
     )
 
     response = await route_to_model(
-        TaskType.INTRADAY_SCAN,
+        TaskType.DIRECTIONAL_ENTRY,
         prompt,
         session_factory=factory,
     )
@@ -1356,7 +1356,7 @@ async def run_directional_scan(
         with factory() as session:
             for d in actionable:
                 row = SignalRow(
-                    task_type=TaskType.INTRADAY_SCAN.value,
+                    task_type=TaskType.DIRECTIONAL_ENTRY.value,
                     agent=AGENT_NAME,
                     action=SignalAction.ALERT_ONLY.value,
                     symbol=d.ticker,

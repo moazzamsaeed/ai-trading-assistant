@@ -23,6 +23,10 @@ log = get_logger(__name__)
 # that ever matters.
 PRICING: dict[str, dict[str, Decimal]] = {
     # Anthropic — flat per-token. https://platform.claude.com/docs
+    "claude-opus-4-8": {
+        "input": Decimal("5.00"),
+        "output": Decimal("25.00"),
+    },
     "claude-opus-4-7": {
         "input": Decimal("5.00"),
         "output": Decimal("25.00"),

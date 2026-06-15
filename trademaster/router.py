@@ -38,12 +38,23 @@ class TaskType(StrEnum):
     CRYPTO_REGIME = "crypto_regime"
     EXECUTION_DECISION = "execution_decision"
     EXIT_DECISION = "exit_decision"
+    # Directional entry decision — split out from INTRADAY_SCAN 2026-06-15 so the
+    # entry model can be upgraded independently of the news scan / market
+    # analysis (which stay on DeepSeek). Evidence: scripts/replay_model_comparison
+    # showed DeepSeek whipsaws direction in chop (CCPCPP on 06-11's −$3.3k day)
+    # while Sonnet/Opus hold a single direction (0 flips). See
+    # memory/project_entry_model_replay.md. Reversible — flip back by pointing
+    # DIRECTIONAL_ENTRY at deepseek-v4-flash below (user toggles this).
+    DIRECTIONAL_ENTRY = "directional_entry"
 
 
 MODEL_MAP: dict[TaskType, tuple[str, str]] = {
     TaskType.ORCHESTRATE: ("anthropic", "claude-opus-4-7"),
     TaskType.PRE_MARKET_RESEARCH: ("google", "gemini-2.5-pro"),
     TaskType.INTRADAY_SCAN: ("deepseek", "deepseek-v4-flash"),
+    # Directional ENTRY runs on Sonnet 4.6 (2026-06-15). To revert to the prior
+    # config, change this one line back to ("deepseek", "deepseek-v4-flash").
+    TaskType.DIRECTIONAL_ENTRY: ("anthropic", "claude-sonnet-4-6"),
     TaskType.FORMAT_ALERT: ("deepseek", "deepseek-v4-flash"),
     TaskType.OPTIONS_STRATEGY: ("deepseek", "deepseek-v4-pro"),
     TaskType.CRYPTO_REGIME: ("deepseek", "deepseek-v4-pro"),
@@ -56,6 +67,9 @@ MODEL_MAP: dict[TaskType, tuple[str, str]] = {
 # low-stakes formatting tasks.
 FALLBACK_MAP: dict[TaskType, tuple[str, str]] = {
     TaskType.INTRADAY_SCAN: ("anthropic", "claude-haiku-4-5-20251001"),
+    # Entry runs on Sonnet (Anthropic); fall back cross-provider to the prior
+    # entry model so an Anthropic outage doesn't blind the entry scan.
+    TaskType.DIRECTIONAL_ENTRY: ("deepseek", "deepseek-v4-flash"),
     TaskType.OPTIONS_STRATEGY: ("anthropic", "claude-haiku-4-5-20251001"),
     # Gemini 2.5 Pro returns 503 "high demand" intermittently. Premarket fires
     # once at 8 AM ET — no fallback means a missed briefing for the whole day.
