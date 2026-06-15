@@ -1,0 +1,20 @@
+[Unit]
+Description=TradeMaster trading daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/moazzam/ai-trading-assistant
+# Wait for DNS to actually resolve the broker host before starting (user services
+# don't reliably honor network-online.target, causing a boot-time DNS crash + restart).
+# Polls up to 60s, then proceeds regardless (Restart=always is the backstop).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do getent hosts paper-api.alpaca.markets && exit 0; sleep 2; done; echo "DNS still unresolved after 60s, starting anyway"; exit 0'
+ExecStart=/home/moazzam/ai-trading-assistant/.venv/bin/python -m trademaster.orchestrator
+Restart=always
+RestartSec=30
+# Don't restart if the cron job intentionally stopped it (clean exit = code 0)
+RestartPreventExitStatus=0
+
+[Install]
+WantedBy=default.target
