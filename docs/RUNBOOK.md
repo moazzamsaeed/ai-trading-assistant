@@ -122,6 +122,28 @@ sizing — that comes from the 30-day paper-trade.
 pkill -TERM -f "trademaster.orchestrator"
 ```
 
+## Process Management (systemd)
+
+The daemon runs as a **user** systemd service, started/stopped Mon–Fri by cron
+(07:45 ET start / 16:15 ET stop) and auto-restarted on crash (`Restart=always`,
+`RestartSec=30`, `RestartPreventExitStatus=0` so a clean cron stop isn't fought).
+
+- **Live unit:** `~/.config/systemd/user/trademaster.service`
+- **Tracked copy (canonical):** `deploy/systemd/trademaster.service` in this repo
+- An `ExecStartPre` polls DNS for `paper-api.alpaca.markets` (up to 60s) before
+  launch — user services don't reliably honor `network-online.target`, so a
+  boot-time DNS race used to crash the first start and burn a restart cycle.
+
+```bash
+systemctl --user status trademaster      # is it running?
+systemctl --user restart trademaster     # apply a unit change now
+journalctl --user -u trademaster -f       # live logs
+
+# After editing the unit, sync the repo copy and reload:
+cp ~/.config/systemd/user/trademaster.service deploy/systemd/trademaster.service
+systemctl --user daemon-reload
+```
+
 ## Kill Switch (Emergency)
 
 In Discord `#commands` channel:
@@ -153,7 +175,8 @@ This:
 - Trading does not resume until next trading day OR manual `/resume`
 
 ### NUC reboots
-- systemd restarts TradeMaster automatically (`trademaster.service` enabled)
+- systemd restarts TradeMaster automatically (`trademaster.service` enabled — see [Process Management](#process-management-systemd))
+- The unit's `ExecStartPre` waits for broker DNS to resolve before launch, so a reboot during a flaky-network window won't crash the first start
 - On startup, TradeMaster reconciles position state with Alpaca before accepting new signals
 
 ## Monitoring
