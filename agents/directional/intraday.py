@@ -156,6 +156,22 @@ STEP 2 — INDICATOR CONFLUENCE:
 
   Early conviction: HIGH = all 3 criteria + MACD aligned. MEDIUM = 2 of 3. LOW = 1 or fewer → HOLD.
 
+  ── STRONG-TREND OVERRIDE (ADX ≥ 25) — applies in early OR standard session ──
+  ADX measures trend STRENGTH. ADX ≥ 25 = a real, established trend (the SPY
+  regime label can lag and read NEUTRAL during a steady grind — trust ADX over
+  the regime label here). When ADX ≥ 25:
+  • volume_ratio > 1.0 is NOT required — DROP it from the criteria. A quiet,
+    low-volume grind in the trend direction is normal continuation, not
+    exhaustion. A strong ADX is itself the confirmation. (This is the #1 reason
+    clean trend days get missed: requiring a volume spike that only shows up at
+    the top.)
+  • Extend the RSI band in the trend direction: CALLS valid with RSI9 up to 88
+    (overbought is continuation in a confirmed uptrend), PUTS valid down to 12.
+  • Score on the remaining criteria (price vs VWAP, EMA alignment, trend-adjusted
+    RSI). All remaining criteria true + ADX ≥ 25 → HIGH.
+  This override fires ONLY when ADX ≥ 25. When ADX < 25 (weak / choppy), keep the
+  standard volume + RSI gates intact — that is what protects against chop whipsaw.
+
   ── ORB BREAKOUT OVERRIDE (before 10:30 ET) ──
   The first 60 minutes produce the day's most explosive moves. If ALL of these are true:
     • Time is before 10:30 ET
@@ -167,10 +183,13 @@ STEP 2 — INDICATOR CONFLUENCE:
     probability setup of the day. Do NOT hold waiting for EMA confirmation.
 
   ── INDICATORS ──
-  RSI9 context:
-  • > 75: overbought — momentum likely exhausted, put bias.
-  • < 25: oversold — potential snap-back, call bias.
-  • 55–72 without VWAP + volume confirmation: HOLD.
+  RSI9 context (ADX-aware — overbought/oversold means different things in a trend):
+  • > 75 with ADX < 25: overbought in a weak trend — momentum likely exhausted, put bias.
+  • > 75 with ADX ≥ 25: overbought in a STRONG uptrend — bullish CONTINUATION, not
+    exhaustion. Do NOT flip to puts or HOLD calls on overbought RSI alone.
+  • < 25 with ADX < 25: oversold — potential snap-back, call bias.
+  • < 25 with ADX ≥ 25: oversold in a STRONG downtrend — bearish continuation for puts.
+  • 55–72 without VWAP + volume confirmation: HOLD — unless ADX ≥ 25 (the trend is the confirmation).
 
   MACD (6-13-4, intraday optimised):
   • macd > signal AND rising: bullish acceleration — confirms calls.
@@ -198,7 +217,10 @@ STEP 3 — STRIKE & EXPIRY:
 STEP 4 — FINAL SANITY CHECK:
   Before recommending a trade, ask: "Is SPY actually moving? Or is it choppy/flat?"
   • If SPY has been ranging ±0.1% for the last 30 min → HOLD. Options decay on flat days.
-  • If volume is fading (volume_ratio < 1.0) → HOLD. No fuel for continuation.
+  • If volume is fading (volume_ratio < 1.0) → HOLD — UNLESS ADX ≥ 25 and price is
+    on the correct side of VWAP in the trend direction. In a confirmed strong
+    trend a low-volume grind is continuation, not lack of fuel; do NOT HOLD on low
+    volume alone. The volume-fade veto applies when ADX < 25 (weak / choppy).
   • If the signal is only marginally bullish/bearish → HOLD. Wait for a cleaner setup.
   • POSITION CHECK (see "YOUR POSITIONS & TODAY" above, when present): if you
     already hold a position in this SAME direction, do NOT add — return HOLD.
@@ -241,7 +263,7 @@ def _format_ticker_block(
             f"above_vwap: {perf.get('above_vwap', False)}"
         )
     # Core indicators — rsi9 replaces rsi14; atr10 replaces atr14; macd added
-    for key in ("vwap", "rsi9", "ema20", "ema50", "atr10", "macd", "macd_signal", "volume_ratio_20"):
+    for key in ("vwap", "rsi9", "ema20", "ema50", "atr10", "macd", "macd_signal", "volume_ratio_20", "adx"):
         v = snap.get(key)
         if v is not None:
             lines.append(f"{key}: {v}")
