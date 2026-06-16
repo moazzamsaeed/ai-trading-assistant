@@ -78,3 +78,4 @@ backtests/results/
 
 # Claude Code session state
 .claude/
+.claude/settings.local.json
