@@ -1304,12 +1304,23 @@ async def run_directional_scan(
         ticker_blocks="\n\n".join(ticker_blocks),
     )
 
-    response = await route_to_model(
-        TaskType.DIRECTIONAL_ENTRY,
-        prompt,
-        session_factory=factory,
-    )
-    decisions = _parse_decisions(response.text, tickers)
+    # DECISION HOT-PATH. Platform-first: the deterministic rules engine makes the
+    # entry decision when enabled (reproducible / backtestable / auditable);
+    # otherwise the legacy LLM path. Everything downstream is identical.
+    if get_settings().deterministic_engine:
+        from agents.directional.signal_engine import decide as _engine_decide
+        decisions = [
+            _engine_decide(t, ticker_snaps.get(t, {}), market_ctx, now) for t in tickers
+        ]
+        _model_label, _cost_label = "rules_engine", "0"
+    else:
+        response = await route_to_model(
+            TaskType.DIRECTIONAL_ENTRY,
+            prompt,
+            session_factory=factory,
+        )
+        decisions = _parse_decisions(response.text, tickers)
+        _model_label, _cost_label = response.model, str(response.cost_usd)
 
     # Hard-override: any BUY on a ticker with no bar data OR no bootstrapped
     # indicators becomes HOLD. Prevents (a) hallucinated "RSI looks bullish"
@@ -1393,8 +1404,8 @@ async def run_directional_scan(
                         "strike": d.strike,
                         "expiry": d.expiry,
                         "conviction": d.conviction,
-                        "model": response.model,
-                        "cost_usd": str(response.cost_usd),
+                        "model": _model_label,
+                        "cost_usd": _cost_label,
                     },
                     accepted=True,
                 )
@@ -1407,13 +1418,13 @@ async def run_directional_scan(
         n_tickers=len(tickers),
         n_actionable=len(actionable),
         actions=[f"{d.ticker}:{d.action}" for d in actionable],
-        cost_usd=str(response.cost_usd),
+        cost_usd=_cost_label,
     )
     scan_report = format_scan_report(
         decisions,
         now=now,
         mode=mode,
-        cost_usd=str(response.cost_usd),
+        cost_usd=_cost_label,
         n_actionable=len(actionable),
     )
     return decisions, messages, scan_report
