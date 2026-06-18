@@ -59,6 +59,16 @@ For the condor, the load-bearing assumption was **fill price**. For the strangle
 - **15-min stop grid** can't catch within-bar spikes; **worst modeled trade was −558% of nominal risk** (a single bar gapped clean through the 1.5× stop). At 3% sizing that's a **~−17% single-day account hit**. This is a high-risk strategy — *as requested* — and it can have a brutal day.
 - Flat-IV/no-skew BS pricing; 2023–2026 sample has **no 2020-style crash**; $5k is too small (wants ~$12–15k for sane 3% sizing on one strangle).
 
+**WHERE the losses actually come from — the filter is a TREND filter, not a VOL filter.** The regime filter screens on *prior-day* ADX (was yesterday trending?), so it cannot see *today's* intraday behavior in advance. It correctly stays out of big trending/volatile days — across our directional history, **every day we moved ±$1k+ (both our +$2k wins and −$3k losses) had prior-day ADX ≥ 25, so the strangle stood aside on 100% of them.** But among the low-ADX days it *does* trade, outcomes split sharply by the day's realized intraday range (2026-YTD calm-day replay, 1 lot):
+
+| intraday range (high−low / open) | days | win% | stop% | avg P&L |
+|---|---|---|---|---|
+| quiet (<0.6%) | 11 | 100% | 0% | +$128 |
+| normal (0.6–1.0%) | 22 | 82% | 0% | +$115 |
+| **choppy/wide (>1.0%)** | 28 | **64%** | **18%** | **+$34** |
+
+So the precise risk statement: **the strangle wants QUIET (tight range-bound), not "choppy."** A genuinely choppy day — big intraday swings, even with no net direction — is its *enemy*: 18% of those stop out and average P&L collapses to +$34. It still *takes* those trades (the prior-day filter can't catch a day that looked calm yesterday and swings today), and **that surprise-intraday-swing day IS the gap-stop tail** above. The residual risk isn't trend (filtered) — it's the unforecastable intraday range expansion.
+
 **So: the edge is real and cost-robust. The remaining unknown is whether the mechanical stop fills as cleanly as modeled when vol expands.** That is exactly what paper-then-tiny-real measures.
 
 ## 4b. Capital, lot-sizing & expected monthly return (real 2026-YTD replay)
