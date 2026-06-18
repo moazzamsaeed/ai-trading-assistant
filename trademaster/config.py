@@ -28,10 +28,11 @@ class Settings(BaseSettings):
 
     enable_iron_condor: bool = False
     directional_mode: Literal["aggressive", "selective"] = "selective"
-    # Platform-first: when True the directional ENTRY decision is made by the
-    # deterministic rules engine (agents/directional/signal_engine.py) instead of
-    # the LLM — reproducible, backtestable, auditable. The LLM path remains as the
-    # fallback (flag off). See docs/STRATEGY_REVIEW_2026-06-18.md.
+    # Platform-first: when True BOTH the directional ENTRY decision
+    # (signal_engine.decide) AND the EXIT confirm (exit_monitor._rules_exit_confirm)
+    # are made by deterministic rules instead of the LLM — reproducible,
+    # backtestable, auditable, no LLM in the decision hot-path. The LLM path remains
+    # as the fallback (flag off). See docs/STRATEGY_REVIEW_2026-06-18.md.
     deterministic_engine: bool = False
     # Puts-only: the long-CALL side fights two structural headwinds on SPY
     # (vol-crush on rallies + slow grind-up theta) and barely clears costs;

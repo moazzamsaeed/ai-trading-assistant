@@ -514,6 +514,26 @@ def _thesis_invalidated(action: str, triggered_rules: list[str]) -> bool:
     return hits >= THESIS_INVALIDATION_MIN_SIGNALS
 
 
+def _rules_exit_confirm(action: str, triggered: list[str], pnl_pct: float, mode: str):
+    """Deterministic replacement for the LLM exit judge (_llm_exit_confirm).
+
+    Pure, reproducible. Encodes the exact rule the LLM prompt described — exit on
+    a CONFLUENCE of fading-momentum signals (the aggressive bar: ≥2; selective also
+    exits on a single fade while in profit to protect gains). Removes the LLM's
+    noisy single-signal discretion that made `smart_exit` the biggest P&L drain
+    (−$5,235) by cutting correct-direction trades on intraday wiggles. Winners keep
+    riding the trailing stop / scale-out untouched. Returns (should_exit, reason).
+    """
+    fading = [r for r in triggered if r in _INVALIDATION_RULES.get(action, set())]
+    n = len(fading)
+    rules_str = ",".join(fading) if fading else "none"
+    if mode != "aggressive" and pnl_pct > 0 and n >= 1:
+        return True, f"deterministic exit: protect gains, {n} fading [{rules_str}]"
+    if n >= 2:
+        return True, f"deterministic exit: confluence {n} fading [{rules_str}]"
+    return False, ""
+
+
 # ---------------------------------------------------------------------------
 # LLM exit confirmation
 # ---------------------------------------------------------------------------
@@ -902,15 +922,21 @@ async def run_directional_exit_monitor(
             # Consult LLM if: (a) any indicator rule fired, OR (b) P&L is high enough
             # that we should proactively check whether to take the gain.
             elif triggered or in_strong_profit:
-                should_exit, llm_reasoning = await _llm_exit_confirm(
-                    trade=trade,
-                    snap=snap,
-                    triggered_rules=triggered,
-                    current_bid=current_bid,
-                    pnl_pct=pnl_pct,
-                    session_factory=factory,
-                    llm_caller=llm_caller,
-                )
+                # Platform-first: deterministic exit confirm (no LLM) when enabled.
+                if get_settings().deterministic_engine:
+                    should_exit, llm_reasoning = _rules_exit_confirm(
+                        action, triggered, pnl_pct, trade_mode
+                    )
+                else:
+                    should_exit, llm_reasoning = await _llm_exit_confirm(
+                        trade=trade,
+                        snap=snap,
+                        triggered_rules=triggered,
+                        current_bid=current_bid,
+                        pnl_pct=pnl_pct,
+                        session_factory=factory,
+                        llm_caller=llm_caller,
+                    )
                 if should_exit:
                     reason = "smart_profit_exit" if pnl_pct > 0 else "smart_exit"
                     log.info(
