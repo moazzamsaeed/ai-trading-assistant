@@ -61,6 +61,42 @@ For the condor, the load-bearing assumption was **fill price**. For the strangle
 
 **So: the edge is real and cost-robust. The remaining unknown is whether the mechanical stop fills as cleanly as modeled when vol expands.** That is exactly what paper-then-tiny-real measures.
 
+## 4b. Capital, lot-sizing & expected monthly return (real 2026-YTD replay)
+
+Grounded in `scripts/strangle_calm_days.py` (+ per-month breakdown): the deterministic strangle on the **calm days its filter actually trades** across 2026 YTD (Jan 1 → Jun 18, ~5.6 months, 61 trades, real VIX1D + SPY path, realistic $0.04/leg cost, **1 contract**) returned **+$4,900 (77% win)**. Mirror image: our directional engine lost **−$4,846** over the same span trading the *trending* days the strangle sat out.
+
+**Per-contract economics:** avg credit **$199**, avg nominal risk (1.5× credit stop) **$298**, on **~$69k notional** (SPY ~$694 × 100). Naked → capital is set by **broker margin (~$14k buying-power per lot, Reg-T ~20% of notional)**, NOT by trade structure.
+
+**Monthly P&L is REAL but badly lumpy — do not trust the average:**
+
+| month | trades | win | P&L (1 lot) |
+|---|---|---|---|
+| 2026-01 | 20 | 19/20 | +$2,450 |
+| 2026-02 | 19 | 14/19 | +$2,097 |
+| 2026-03 | 10 | 7/10 | +$671 |
+| 2026-04 | 3 | 2/3 | −$7 |
+| 2026-05 | 7 | 5/7 | +$311 |
+| 2026-06 | 2 | 0/2 | −$622 |
+
+**Two calm months (Jan/Feb) made nearly the whole result; four were flat-to-down.** A realistic "typical" month is **+2–4%**, a great calm month **+14–16%**, a bad/gap month **−4%** — arriving in lumps, not a smooth drip. **Do NOT annualize the ~70%/yr run-rate** off a 5.6-month, front-loaded, calm-regime sample.
+
+**By account size (P&L scales linearly with lots; margin ~$14k/lot is the binding constraint):**
+
+| Account | Prudent lots | Avg/month | ~5.6mo total | Worst month | Worst single day* |
+|---|---|---|---|---|---|
+| **$5k** | **0 — cannot hold one naked SPY lot** | — | — | — | — |
+| **$15k** | 1 (~28% BP) | +$875 (+5.8%) | +$4,900 (+33%) | −$622 (−4.1%) | −$712 (−4.7%) |
+| **$50k** | 2 (~56% BP) | +$1,750 (+3.5%) | +$9,800 (+20%) | −$1,244 (−2.5%) | −$1,424 (−2.8%) |
+| **$50k aggressive** | 3 (~84% BP) | +$2,625 (+5.3%) | +$14,700 (+29%) | −$1,866 (−3.7%) | −$2,136 (−4.3%) |
+
+\* worst single day = the **modeled** gap-stop at constant-vol fills — **real fills under a vol spike would be worse.**
+
+**Two capital constraints that are easy to miss:**
+1. **$5k can't run this at all** — one naked SPY lot needs ~$14k margin; the account is below the minimum to *hold* the position (would require portfolio margin or a defined-risk version, which reintroduces the leg-cost problem that killed the condor). **~$14–15k is the floor for a single lot.**
+2. **Naked short-option margin EXPANDS as price runs at your strikes** — i.e. mid-trade, on a bad day, exactly when you're losing. Sizing near the BP ceiling risks a **forced liquidation at the worst moment**. The unused buffer *is* a risk control: on $50k, **2 lots is the prudent ceiling, 3 is the high-risk edge.**
+
+**Bottom line:** ~**+2–4%/month "normal," mid-single-digits on average, in lumps**, on a **~$14k-per-lot** capital base — but every dollar of it still rides on the two unconfirmed assumptions (real stop-fill quality under vol expansion; whether the calm-regime edge holds through a trending/vol stretch — June was −4%). Capital sizes the dollars; it does not create or confirm the edge.
+
 ## 5. Build plan (not started)
 
 1. **Paper-test to MEASURE real stop fills** under live vol — the one assumption the backtest can't prove. Reuse the deterministic-engine pattern (pure `decide()` + rules exit) already shipped for directional.
