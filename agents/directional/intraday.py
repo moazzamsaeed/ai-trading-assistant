@@ -563,25 +563,55 @@ def format_directional_plan(
     return "\n".join(lines)
 
 
+def format_engine_research_line(decisions: list) -> str:
+    """One-liner per ticker of what the DETERMINISTIC engine decided, appended to
+    the #research market analysis so the LLM's market *commentary* and the engine's
+    actual rules *decision* sit side-by-side (they can diverge — the LLM no longer
+    drives trades).
+    """
+    out = ["", "🤖 **Engine decision (deterministic rules, not the LLM commentary above):**"]
+    for d in decisions:
+        why = d.reasoning.split(": ", 1)[-1] if ": " in d.reasoning else d.reasoning
+        if d.action == "HOLD":
+            forming = (d.analysis or {}).get("forming") if d.analysis else None
+            tail = f" · 👀 {forming['note']}" if forming else ""
+            out.append(f"  • {d.ticker}: HOLD — {why}{tail}")
+        else:
+            out.append(f"  • {d.ticker}: **{d.action} / {d.conviction}** — {why}")
+    return "\n".join(out)
+
+
 def format_setup_forming(
     d: TickerDecision, *, mode: str = "selective"
 ) -> str:
     """Pre-emptive 'setup forming' WATCH alert for #signals.
 
-    Fired on a strong near-miss — BEFORE the model would enter — to prep manual
+    Fired on a strong near-miss — BEFORE the engine would enter — to prep manual
     traders for a forming move. This is the anticipatory first signal; the
-    'model entered' confirmation comes later, only if/when it actually triggers.
+    'engine entered' confirmation comes later, only if/when it actually triggers.
     """
     a = d.analysis or {}
     f = a.get("forming", {})
     would_be = f.get("would_be_action", "BUY_CALL")
     is_call = would_be == "BUY_CALL"
     opt = "CALL" if is_call else "PUT"
-    criteria_met = f.get("criteria_met", 0)
-    missing = f.get("missing", [])
     spy_price = a.get("spy_price")
     px = f"${float(spy_price):.2f}" if spy_price else "current levels"
 
+    # Deterministic engine forming: ADX/VWAP-based, no 4-criteria framework.
+    if f.get("engine"):
+        return "\n".join([
+            f"👀 **{d.ticker} {opt} setup forming** [{mode.upper()} · watching]",
+            "",
+            f"  {f.get('note', 'trend building')}",
+            "",
+            f"If it confirms near {px}, the engine will enter a {opt} — manual "
+            "traders, get ready.",
+            "_Heads-up only — not an entry yet._",
+        ])
+
+    criteria_met = f.get("criteria_met", 0)
+    missing = f.get("missing", [])
     lines = [
         f"👀 **{d.ticker} {opt} setup forming** [{mode.upper()} · watching]",
         "",
@@ -592,7 +622,7 @@ def format_setup_forming(
     if missing:
         lines.append(f"⏳ Still needs: {', '.join(missing)}.")
     lines += [
-        f"If it confirms near {px}, the model will enter a {opt} — manual "
+        f"If it confirms near {px}, the engine will enter a {opt} — manual "
         f"traders, get ready.",
         "_Heads-up only — not an entry yet._",
     ]
@@ -622,7 +652,7 @@ def format_entry_combined(
         manual_expiry = wk.strftime("%b %-d")
 
     return (
-        f"{icon} **{decision.ticker} {action_word} — model entered** [{mode.upper()}]\n"
+        f"{icon} **{decision.ticker} {action_word} — engine entered** [{mode.upper()}]\n"
         f"\n"
         f"Model: **{qty}×** `{occ}` @ **${entry_premium}**/share (${total_cost} total)\n"
         f"**Manual entry: Buy {decision.ticker} {manual_expiry} "
@@ -1363,24 +1393,40 @@ async def run_directional_scan(
     else:  # aggressive
         actionable = [d for d in decisions if d.action != "HOLD" and d.conviction in ("MEDIUM", "HIGH")]
 
-    # Near-miss logging: for every HOLD with valid bars + bootstrapped
-    # indicators, check criteria against PRODUCTION thresholds (vol≥1.3).
-    # Skips tickers with missing bars or null indicators — those can't
-    # meaningfully be near-misses, and including them would produce noise.
-    forming = _log_near_misses(
-        [d for d in decisions if d.action == "HOLD" and d.ticker not in blocked],
-        ticker_snaps=ticker_snaps,
-        spy_regime=market_ctx.get("spy_regime", "NEUTRAL"),
-        session_factory=factory,
-    )
-    # Attach forming-setup context to the matching HOLD decisions so the
-    # scheduler can post pre-emptive "setup forming" alerts (Option A).
-    if forming:
-        decisions = [
-            replace(d, analysis={**forming[d.ticker]["snap"], "forming": forming[d.ticker]})
-            if d.action == "HOLD" and d.ticker in forming else d
-            for d in decisions
-        ]
+    # Near-miss / "setup forming" detection. With the deterministic engine the
+    # near-miss must use the ENGINE's own logic (ADX/VWAP), not the old 4-criteria
+    # vol/RSI thresholds the engine ignores — otherwise forming alerts fire for
+    # setups the engine would never trade.
+    if get_settings().deterministic_engine:
+        from agents.directional.signal_engine import forming_signal as _engine_forming
+        eng_forming = {}
+        for d in decisions:
+            if d.action == "HOLD" and d.ticker not in blocked:
+                fs = _engine_forming(d.ticker, ticker_snaps.get(d.ticker, {}))
+                if fs:
+                    eng_forming[d.ticker] = fs
+        if eng_forming:
+            decisions = [
+                replace(d, analysis={
+                    **(ticker_snaps.get(d.ticker) or {}),
+                    "spy_price": (ticker_snaps.get(d.ticker) or {}).get("last_close"),
+                    "forming": eng_forming[d.ticker],
+                }) if d.action == "HOLD" and d.ticker in eng_forming else d
+                for d in decisions
+            ]
+    else:
+        forming = _log_near_misses(
+            [d for d in decisions if d.action == "HOLD" and d.ticker not in blocked],
+            ticker_snaps=ticker_snaps,
+            spy_regime=market_ctx.get("spy_regime", "NEUTRAL"),
+            session_factory=factory,
+        )
+        if forming:
+            decisions = [
+                replace(d, analysis={**forming[d.ticker]["snap"], "forming": forming[d.ticker]})
+                if d.action == "HOLD" and d.ticker in forming else d
+                for d in decisions
+            ]
 
     # Persist one Signal row per actionable decision.
     today = now.date()

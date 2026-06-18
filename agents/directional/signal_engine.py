@@ -44,6 +44,46 @@ def _f(v):
         return None
 
 
+FORMING_ADX_LO = 20.0   # trend building below the ADX_MIN entry threshold
+FORMING_DIST_LO = 0.05  # VWAP separation building below the DIST_MIN entry threshold
+
+
+def forming_signal(ticker: str, snap: dict) -> dict | None:
+    """Engine-native near-miss: a setup that's CLOSE to an entry but not there yet.
+
+    Replaces the old 4-criteria near-miss (which used vol/RSI thresholds the engine
+    ignores → inconsistent "setup forming" alerts). Puts-focus: only forming PUT
+    setups are surfaced when puts-only is on. Returns a `forming` dict the
+    scheduler/format_setup_forming consume, or None.
+    """
+    price = _f(snap.get("last_close"))
+    vwap = _f(snap.get("vwap"))
+    ema = _f(snap.get("ema20"))
+    adx = _f(snap.get("adx"))
+    if None in (price, vwap, ema, adx) or price <= 0:
+        return None
+    up = price > vwap and price > ema
+    down = price < vwap and price < ema
+    if not (up or down):
+        return None
+    if up and _puts_only():
+        return None
+    dist = abs(price - vwap) / price * 100.0
+    if adx >= ADX_OVEREXT or dist > DIST_OVEREXT:
+        return None  # overextended — not "forming", and the engine wouldn't enter
+    action = "BUY_CALL" if up else "BUY_PUT"
+    word = "up" if up else "down"
+    if FORMING_ADX_LO <= adx < ADX_MIN and dist >= DIST_MIN:
+        note = f"{word}-trend in place, ADX {adx:.1f} building toward {ADX_MIN:.0f}"
+    elif adx >= ADX_MIN and FORMING_DIST_LO <= dist < DIST_MIN:
+        note = (f"{word}-trend + ADX {adx:.1f}, VWAP separation {dist:.2f}% "
+                f"building toward {DIST_MIN:.2f}%")
+    else:
+        return None
+    return {"would_be_action": action, "engine": True, "note": note,
+            "adx": round(adx, 1), "dist": round(dist, 2)}
+
+
 def _puts_only() -> bool:
     try:
         from trademaster.config import get_settings

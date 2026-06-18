@@ -3,7 +3,7 @@
 The whole point of the platform-first refactor is that the decision is now a pure,
 testable function. These lock in the validated trend-follow + sweet-spot rules.
 """
-from agents.directional.signal_engine import decide, ENGINE_VERSION
+from agents.directional.signal_engine import decide, forming_signal, ENGINE_VERSION
 
 
 def _snap(price, vwap, ema20, adx, **extra):
@@ -78,6 +78,27 @@ def test_puts_only_skips_calls(monkeypatch):
     assert decide("SPY", _snap(745.0, 743.7, 743.5, 34.0)).action == "HOLD"
     # downtrend still produces a PUT
     assert decide("SPY", _snap(745.0, 746.3, 746.5, 35.0)).action == "BUY_PUT"
+
+
+def test_forming_detects_near_put():
+    # downtrend in place, ADX 22 building toward the 25 entry threshold
+    fs = forming_signal("SPY", _snap(745.0, 746.2, 746.4, 22.0))
+    assert fs and fs["would_be_action"] == "BUY_PUT" and fs["engine"] is True
+
+
+def test_forming_none_when_overextended():
+    assert forming_signal("SPY", _snap(745.0, 746.0, 746.2, 55.0)) is None
+
+
+def test_forming_none_when_already_a_trade():
+    # ADX 35 + good separation is an ENTRY, not a forming near-miss
+    assert forming_signal("SPY", _snap(745.0, 746.3, 746.5, 35.0)) is None
+
+
+def test_forming_puts_only_skips_call_forming(monkeypatch):
+    import agents.directional.signal_engine as se
+    monkeypatch.setattr(se, "_puts_only", lambda: True)
+    assert se.forming_signal("SPY", _snap(745.0, 743.5, 743.3, 22.0)) is None
 
 
 def test_decision_is_deterministic():

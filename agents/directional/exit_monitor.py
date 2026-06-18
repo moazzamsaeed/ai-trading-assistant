@@ -724,7 +724,7 @@ def _format_exit_combined(
     icon = "📈" if action == "BUY_CALL" else "📉"
 
     lines = [
-        f"{icon} **{ticker} {option_word} — model closed** [{mode.upper()}]",
+        f"{icon} **{ticker} {option_word} — engine closed** [{mode.upper()}]",
         "",
         f"Reason: {reason_text}",
     ]

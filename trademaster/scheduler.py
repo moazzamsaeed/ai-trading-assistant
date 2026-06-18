@@ -321,6 +321,11 @@ async def _directional_scan_job(
         except Exception as e:  # noqa: BLE001
             log.warning("market_analysis_failed", error=str(e))
             report = scan_report
+        # Append the deterministic engine's actual decision so #research shows the
+        # LLM commentary AND what the rules decided (they can diverge now).
+        if get_settings().deterministic_engine:
+            from agents.directional.intraday import format_engine_research_line
+            report = f"{report}\n{format_engine_research_line(decisions)}"
         await research_poster(report)
         _last_research_post = now
         if event_due:
