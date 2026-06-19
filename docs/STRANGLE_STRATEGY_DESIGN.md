@@ -127,6 +127,29 @@ The idea (good instinct): route by prior-day ADX — quiet day → short strangl
 - **Trend day (ADX≥25) → FLAT.** Long gamma is −EV; short premium is uncertified and tail-heavy. Per gate discipline (the same standard that correctly rejected the trend engine at DSR 1.3%), trend days are cash.
 - *Optional, opt-in only:* a high-risk appetite MAY harvest trend-day premium as an **experimental sleeve at ~⅓ sizing**, explicitly logged as uncertified — but only after the quiet-day strangle proves real stop-fills in paper. Not part of the core system; do not size it as if it passed.
 
+## 4d. ⭐ BROKER CONSTRAINT → WIDE IRON CONDOR is the deployable winner (2026-06-19)
+
+**Blocker found:** the naked strangle **cannot run on Alpaca.** Verified against the account: `options_approved_level=3`, `multiplier=1` (cash), `shorting_enabled=False`. **Alpaca caps everyone at Level 3 (defined-risk spreads) — no naked/uncovered options, ever.** Only a paper key (`PK…`) is configured; Alpaca's L3 ceiling applies to live too. Naked requires Level 4 + margin → Tastytrade/IBKR/Schwab (all validated to support API + naked, but need a broker switch + ~$25k naked-approval minimum). See [[broker-options-ceiling-alpaca-level3]].
+
+**The fix beat expectations.** `scripts/backtest_wide_condor.py` = the strangle recipe (k=0.5 shorts, ADX<25 regime filter, real VIX1D, intraday stop) with far-OTM long wings → 4-leg defined-risk (`OrderClass.MLEG`), Alpaca-Level-3-executable. Expected it to re-break on 4-leg cost (the *original* condor `backtest_vrp.py` degraded to DSR 56% realistic). **It did NOT — PASSES at every cost level:**
+
+| cost (per leg) | OOS Sharpe | DSR | win | worst trade | maxDD @3% |
+|---|---|---|---|---|---|
+| optimistic $0.02 | ~3.5 | **100.0%** | 77% | −102% | −6% |
+| realistic $0.04 | **+3.10** | **99.9%** | 76% | −104% | −6% |
+| conservative $0.06 | +2.40 | **97.7%** | 76% | −105% | −6% |
+
+**Why it works when the original condor failed:** the two strangle-era improvements the original `backtest_vrp.py` LACKED — the **ADX regime filter** (sell only on calm days) + the **intraday stop** (cut losers). The walk-forward picks **narrow $5 wings**, so **leg count was never the real problem** — trading indiscriminately and holding to the wing was. Adding wings to the *filtered + stopped* recipe costs little edge and adds a hard tail cap.
+
+**The defined-risk version is STRICTLY BETTER for our situation than the naked strangle:**
+- ✅ **Deployable on Alpaca today** — Level 3, multi-leg, no naked approval, no broker switch, no $25k minimum.
+- ✅ **Capped, known tail** — worst trade −104% of risk (vs naked strangle's **−558%**); maxDD −6% @3% (vs **−22%**). Removes the strangle's scariest caveat (undefined tail / stop-fill-under-vol-expansion — the wing catches it even if the stop slips).
+- ✅ **Works on small capital** — defined risk ≈ **$300/condor** (buying power = max loss), so no ~$14–25k naked floor; runs on a few $k.
+- ✅ **Higher risk-adjusted return** (OOS Sharpe +3.10 vs strangle +2.5), because risk per trade is smaller and defined.
+- ⚠️ **Trade-off:** lower *absolute* credit per trade (you pay for the wings), and it still shares the modeling caveats (constant-vol intraday marks, flat-IV/no-skew BS, no 2020-style crash in sample, IEX data). But the load-bearing *tail* caveat is now structurally bounded.
+
+**DECISION: pursue the WIDE IRON CONDOR on Alpaca, not the naked strangle.** Same VRP edge, same calm-day regime filter, deployable now, better tail, smaller capital. The naked strangle stays the theoretical ceiling for a future broker move, but the condor is the one to build. The remaining unknown is the same for both: **real multi-leg fills** (paper → tiny real). Section 5 build plan now targets the condor (4-leg MLEG executor) rather than a 2-leg naked seller.
+
 ## 5. Build plan (not started)
 
 1. **Paper-test to MEASURE real stop fills** under live vol — the one assumption the backtest can't prove. Reuse the deterministic-engine pattern (pure `decide()` + rules exit) already shipped for directional.
