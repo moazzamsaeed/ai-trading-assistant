@@ -154,6 +154,86 @@ def _pick_wing(
     return best
 
 
+def _closest_strike(
+    options: list[OptionQuote], *, option_type: str, target: Decimal, side: str,
+) -> OptionQuote:
+    """Pick the quoted option whose strike is closest to `target`.
+
+    `side` ∈ {"short","long"} only affects which quote side must be live:
+    shorts must have a bid (we sell), longs an ask (we buy). Raises if the
+    closest strike is more than $1 from target (chain too sparse)."""
+    need = (lambda q: q.bid > 0) if side == "short" else (lambda q: q.ask > 0)
+    cands = [q for q in options if q.option_type == option_type and need(q)]
+    if not cands:
+        raise IronCondorBuildError(f"no quoted {side} {option_type}s near {target}")
+    best = min(cands, key=lambda q: abs(q.strike - target))
+    if abs(best.strike - target) > Decimal("1.0"):
+        raise IronCondorBuildError(
+            f"no {option_type} strike within $1 of {target} (closest {best.strike})"
+        )
+    return best
+
+
+def build_condor_at_strikes(
+    chain: list[OptionQuote],
+    *,
+    short_put: Decimal,
+    long_put: Decimal,
+    short_call: Decimal,
+    long_call: Decimal,
+    qty: int = 1,
+) -> IronCondorPlan:
+    """Build an iron condor at EXPLICIT target strikes (from the deterministic
+    condor_engine), picking the closest available chain strike for each leg.
+
+    Unlike build_iron_condor (which selects shorts by delta), this matches the
+    VIX1D-expected-move strikes the engine computed. Max loss uses the ACTUAL
+    selected strikes (put/call spread widths may differ if the chain is sparse).
+    """
+    if qty <= 0:
+        raise IronCondorBuildError(f"qty must be > 0, got {qty}")
+    puts = [q for q in chain if q.option_type == "put"]
+    calls = [q for q in chain if q.option_type == "call"]
+    if not puts or not calls:
+        raise IronCondorBuildError("chain missing puts or calls")
+
+    sp = _closest_strike(puts, option_type="put", target=short_put, side="short")
+    lp = _closest_strike(puts, option_type="put", target=long_put, side="long")
+    sc = _closest_strike(calls, option_type="call", target=short_call, side="short")
+    lc = _closest_strike(calls, option_type="call", target=long_call, side="long")
+    if not (lp.strike < sp.strike < sc.strike < lc.strike):
+        raise IronCondorBuildError(
+            f"degenerate strikes after fill: {lp.strike}/{sp.strike}/{sc.strike}/{lc.strike}"
+        )
+
+    credit = (sp.mid + sc.mid) - (lp.mid + lc.mid)
+    if credit <= 0:
+        raise IronCondorBuildError(f"non-positive credit: {credit}")
+    # max loss = wider of the two spread widths, minus credit (defined-risk)
+    actual_wing = max(sp.strike - lp.strike, lc.strike - sc.strike)
+    credit_per_contract = credit * HUNDRED
+    max_loss_per_contract = (actual_wing * HUNDRED) - credit_per_contract
+    if max_loss_per_contract <= 0:
+        raise IronCondorBuildError(
+            f"max loss not positive: wing={actual_wing}, credit={credit_per_contract}"
+        )
+
+    plan = IronCondorPlan(
+        short_put=sp, long_put=lp, short_call=sc, long_call=lc, qty=qty,
+        credit_per_contract=credit_per_contract,
+        max_loss_per_contract=max_loss_per_contract,
+        wing_width=actual_wing,
+    )
+    log.info(
+        "condor_built_at_strikes",
+        short_put_strike=str(sp.strike), short_call_strike=str(sc.strike),
+        wing_width=str(actual_wing), qty=qty,
+        credit_per_contract=str(credit_per_contract),
+        max_loss_per_contract=str(max_loss_per_contract),
+    )
+    return plan
+
+
 def build_iron_condor(
     chain: list[OptionQuote],
     *,
