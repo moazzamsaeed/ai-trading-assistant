@@ -150,6 +150,28 @@ The idea (good instinct): route by prior-day ADX — quiet day → short strangl
 
 **DECISION: pursue the WIDE IRON CONDOR on Alpaca, not the naked strangle.** Same VRP edge, same calm-day regime filter, deployable now, better tail, smaller capital. The naked strangle stays the theoretical ceiling for a future broker move, but the condor is the one to build. The remaining unknown is the same for both: **real multi-leg fills** (paper → tiny real). Section 5 build plan now targets the condor (4-leg MLEG executor) rather than a 2-leg naked seller.
 
+## 4e. Condor capital & risk-sizing (incl. high-risk 10%)
+
+Per-lot economics (winning condor, 497 calm-day trades 2023–2026, ~144/yr, **74% win**, realistic cost):
+- avg credit **$164/lot**, avg **defined risk (max loss) $336/lot** (range $270–394), **worst single trade −104% of risk** (gap through the wing + cost), avg P&L **+$57/trade (+17% of risk)**.
+- **Two capital answers.** (a) **Bare minimum to hold 1 lot ≈ $336** — Alpaca holds maintenance margin = the defined max loss, nothing more. No $14–25k naked floor. (b) **Prudent capital = risk-sizing**: capital/lot = $336 ÷ risk-fraction. The constraint is risk appetite, not a margin floor; scale lots by adding capital.
+
+**Fixed-fraction sizing, compounded over the full 2023–2026 sample (honest tail, not the benign 2026 stretch):**
+
+| Risk/trade | Capital/lot | Total ret (3.45yr) | CAGR | maxDD | Worst day |
+|---|---|---|---|---|---|
+| **3%** (conservative) | ~$11,200 | +455% | +64% | **−6%** | −3.1% |
+| **5%** (aggressive ceiling) | ~$6,720 | +1,576% | +126% | **−11%** | −5.2% |
+| **10%** (high-risk) | ~$3,360 | +23,090% | +385% | **−20%** | **−10.4%** |
+
+**Reading the 10% row honestly — do NOT bank the +23,090%:**
+- It's a **fixed-fraction compounding illusion**. The strategy front-loads (Jan/Feb carried 2026); at 10% sizing, *sequence risk* dominates — a bad cluster early compounds down as violently as the headline compounds up. The friendly ordering is not guaranteed.
+- **Worst single trade −104% of risk → −10.4% of account in ONE trade** at 10% sizing; two bad days in a week stack toward −20%+. The **wings are the only reason 10% isn't ruin** (they cap each trade near 1× risk). Naked at 10% would be account-ending.
+- Every number is **modeled fills**. Real multi-leg/stop/gap-through-wing fills come in worse. At 3% that trims the edge; **at 10% a −20% modeled maxDD can be −30%+ live.**
+- **Risk-theory:** with negative skew + a −104% worst case, the growth-optimal (Kelly) fraction is well below 10%. Betting 10% is **over-betting** — past the growth peak, where you take more drawdown for *less* long-run compounding and sharply higher ruin probability.
+
+**Sizing guidance:** even for high risk tolerance, **5% is the aggressive-but-sane ceiling**; 3% is the default. **10% is a hard ceiling to approach only after months of real-fill data confirm the tail behaves** — not a starting point. Disciplined path: prove real fills in paper → 3% on tiny real → step toward 5% → treat 10% as the gambling edge, never the plan.
+
 ## 5. Build plan (not started)
 
 1. **Paper-test to MEASURE real stop fills** under live vol — the one assumption the backtest can't prove. Reuse the deterministic-engine pattern (pure `decide()` + rules exit) already shipped for directional.
