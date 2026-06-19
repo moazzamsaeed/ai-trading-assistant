@@ -353,8 +353,8 @@ def test_make_scheduler_registers_iron_condor_job_when_enabled():
     assert job is not None
     fields = {f.name: str(f) for f in job.trigger.fields}
     assert fields["day_of_week"] == "mon-fri"
-    assert fields["hour"] == "9"
-    assert fields["minute"] == "45"
+    assert fields["hour"] == "10"
+    assert fields["minute"] == "0"
 
 
 async def test_iron_condor_job_skipped_when_paused(monkeypatch):

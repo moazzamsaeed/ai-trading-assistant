@@ -37,7 +37,10 @@ from agents.directional.intraday import (
 )
 from agents.intraday.scan import run_intraday_scan
 from agents.options.exit_monitor import run_exit_monitor
-from agents.options.strategist import run_iron_condor_strategist
+from agents.options.strategist import (
+    run_deterministic_condor,
+    run_iron_condor_strategist,
+)
 from agents.research.premarket import run_premarket_briefing
 from decimal import Decimal
 
@@ -693,11 +696,17 @@ async def _iron_condor_entry_job(
         log.info("iron_condor_skipped_closed", next_open=str(clock.next_open))
         return
 
+    # Deterministic VRP condor (LLM-free) is the default brain, matching the
+    # directional side's deterministic_engine flag. Flip the flag to fall back
+    # to the legacy LLM strategist.
+    deterministic = get_settings().deterministic_engine
+    strategist_fn = run_deterministic_condor if deterministic else run_iron_condor_strategist
     try:
-        _signal, signals_text, trade_text = await run_iron_condor_strategist()
+        _signal, signals_text, trade_text = await strategist_fn()
     except Exception as e:  # noqa: BLE001
         log.error(
             "iron_condor_strategist_failed",
+            deterministic=deterministic,
             error=str(e),
             error_type=type(e).__name__,
         )
@@ -991,13 +1000,14 @@ def make_scheduler(
     )
 
     if enable_iron_condor:
-        # Iron-condor entry: 9:45 ET Mon-Fri (STRATEGIES.md 9:45-10:30 window).
+        # Condor entry: 10:00 ET Mon-Fri — matches the validated backtest entry
+        # time (expected-move + 360-min-to-close strike calc assume 10:00).
         scheduler.add_job(
             _iron_condor_entry_job,
             CronTrigger(
                 day_of_week="mon-fri",
-                hour=9,
-                minute=45,
+                hour=10,
+                minute=0,
                 timezone=PREMARKET_TZ,
             ),
             kwargs={
