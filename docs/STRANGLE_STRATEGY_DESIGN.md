@@ -172,6 +172,21 @@ Per-lot economics (winning condor, 497 calm-day trades 2023–2026, ~144/yr, **7
 
 **Sizing guidance:** even for high risk tolerance, **5% is the aggressive-but-sane ceiling**; 3% is the default. **10% is a hard ceiling to approach only after months of real-fill data confirm the tail behaves** — not a starting point. Disciplined path: prove real fills in paper → 3% on tiny real → step toward 5% → treat 10% as the gambling edge, never the plan.
 
+## 4f. Trend-day sleeve to cut downtime — works, but marginal + fragile (gate-ignored)
+
+**Motivation:** the calm-day condor sits out ~43% of days (trending: ADX≥25; almost never the VIX1D≥40 crisis filter — 5 days in 3.5yr), with sit-outs that *cluster* (longest run ~93 trading days ≈ 19 weeks). Goal: put the idle trending days to work. `scripts/backtest_trend_sleeve.py`. **DSR gate ignored per request, but EV still measured** — a halt rule can't make a −EV strategy +EV.
+
+**Hard constraint:** the sleeve MUST be a defensive premium *seller*, not a buyer — buying premium on trend days is −EV (§4c). So: a **wider defensive condor** (k=1.0 shorts vs calm 0.5, same $5 wings, stop 1.5×, **half size**), only on ADX≥25 days. Plus the user's **weekly state machine**: a BIG LOSS (ror ≤ −0.70) **parks** the sleeve for the rest of the ISO week; a BIG WIN (ror ≥ +0.20) **halts** it for the week (lock the gain); the calm condor runs regardless.
+
+**Result (modeled, $60k, calm 5% + sleeve 2.5%):**
+- ✅ **Downtime 57% → 97% of days traded** — the stated goal, achieved.
+- ✅ **Sleeve is +EV**: +2.5% of risk/trade, 78% win (343 trades; 2 big-loss-parks, 6 big-win-halts in 3.5yr).
+- ⚠️ **But it adds only +$316/mo (+7.5%)** on $60k (calm condor +$4,220/mo → combined +$4,536/mo). The trend-day edge is **~4× thinner than calm days (+2.5% vs ~+11% of risk)** — lots of trades, each barely moves the needle. Calm condor stays **~93% of income.**
+- ⚠️ **The park/halt rules barely matter** — the defined-risk wings already cap each loss, so "park on big loss" fires only twice in 3.5yr; "halt on big win" mostly just clips upside (net slightly *reduces* return). Reasonable discipline, but the wings do the protecting.
+- 🚩 **Cost-FRAGILE — the load-bearing risk:** sleeve nets ~$10/condor vs the calm condor's ~$37; and **volatile days have wider bid-ask.** Modest real-fill cost increase pushes the thin edge to **~0 or negative.** On live fills the sleeve may not be worth trading at all.
+
+**VERDICT:** legitimate **experimental sleeve**, not a second engine. Deploy ONLY after the calm condor is live+proven, at tiny size, and **measure its real volatile-day fills specifically** (most likely to die on cost). **Key reframe: the downtime was avoided RISK, not lost INCOME** — the idle days are the strategy dodging the regime that fed the old directional engine its −$3,347 days. Capital math for the $2k/mo goal stays anchored on the calm condor (~$60k conservative); the sleeve might add a little on top once proven, or wash out on real fills.
+
 ## 5. Build plan (not started)
 
 1. **Paper-test to MEASURE real stop fills** under live vol — the one assumption the backtest can't prove. Reuse the deterministic-engine pattern (pure `decide()` + rules exit) already shipped for directional.
