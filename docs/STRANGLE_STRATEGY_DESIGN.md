@@ -107,6 +107,26 @@ Grounded in `scripts/strangle_calm_days.py` (+ per-month breakdown): the determi
 
 **Bottom line:** ~**+2–4%/month "normal," mid-single-digits on average, in lumps**, on a **~$14k-per-lot** capital base — but every dollar of it still rides on the two unconfirmed assumptions (real stop-fill quality under vol expansion; whether the calm-regime edge holds through a trending/vol stretch — June was −4%). Capital sizes the dollars; it does not create or confirm the edge.
 
+## 4c. Dual-strategy / regime-router verdict — RESOLVED ON EVIDENCE
+
+The idea (good instinct): route by prior-day ADX — quiet day → short strangle, trend day → some other strategy — so there's "a rule for every regime." The two sides are genuine greek complements (short strangle = short gamma; a trend strategy = long gamma). We tested BOTH candidate trend-day legs through the same gate. Scripts: `backtest_trend_leg.py`, `backtest_modulated_seller.py`.
+
+| Regime (prior-day ADX) | Candidate tested | OOS Sharpe | DSR | Verdict |
+|---|---|---|---|---|
+| **Quiet (<25)** | Short strangle (`backtest_strangle.py`) | +2.5 | 98–99% | **PASS** ✅ — the strategy |
+| **Trend (≥25), long gamma** | Long straddle (`backtest_trend_leg.py`) | **−2.14** | **0%** | **FAIL** ❌ — −EV in *and* out of sample |
+| **Trend (≥25), short premium** | Defensive/skewed strangle (`backtest_modulated_seller.py`) | +0.84 | **6%** | **MARGINAL** ⚠️ — +EV but uncertified |
+
+**Three findings that close the question:**
+1. **Long gamma on trend days is structurally −EV** (IS −2.05, OOS −2.14, DSR 0%, 26% win) — not overfitting (decay +0.09), not cost (same at optimistic). The VRP that *pays* the strangle *charges* the straddle: on a trend day IV is already rich, so the buyer rarely earns back the premium. **There is no regime where buying SPY 0DTE premium is +EV.** This also kills the original "deploy a trend strategy on volatile days" plan — and a 10%-of-capital halt can't rescue a −EV leg, it only bounds the bleed.
+2. **Selling premium on trend days is mildly +EV but fails the gate** (OOS +0.84, 72% win, +18%/trade, but DSR 6% realistic / 0.1% conservative). Thin sample (364 high-ADX days → 5 folds / 105 OOS trades) and a *worse* negative tail than quiet days (worst −742% of risk vs −558%) keep it below the bar.
+3. **Direction is unextractable even on trend days** — the modulated-seller walk-forward picked `skew=0.0`; recentering the strangle toward the prior-day trend added nothing. Only the *defensive* width + tight stop carried the small edge. (Third independent confirmation, after the original engine and the long leg.)
+
+**VERDICT: the system is ONE gate-proven strategy + a default of CASH — not two active engines.**
+- **Quiet day (ADX<25, VIX1D<40) → short strangle.** (the only certified edge)
+- **Trend day (ADX≥25) → FLAT.** Long gamma is −EV; short premium is uncertified and tail-heavy. Per gate discipline (the same standard that correctly rejected the trend engine at DSR 1.3%), trend days are cash.
+- *Optional, opt-in only:* a high-risk appetite MAY harvest trend-day premium as an **experimental sleeve at ~⅓ sizing**, explicitly logged as uncertified — but only after the quiet-day strangle proves real stop-fills in paper. Not part of the core system; do not size it as if it passed.
+
 ## 5. Build plan (not started)
 
 1. **Paper-test to MEASURE real stop fills** under live vol — the one assumption the backtest can't prove. Reuse the deterministic-engine pattern (pure `decide()` + rules exit) already shipped for directional.
