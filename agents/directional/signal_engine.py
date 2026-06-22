@@ -23,7 +23,7 @@ Bump ENGINE_VERSION on any rule change so persisted decisions stay auditable.
 """
 from __future__ import annotations
 
-ENGINE_VERSION = "trend_follow_v1"
+ENGINE_VERSION = "trend_follow_v2"   # v2: S/R-aware (don't buy into the level just ahead)
 
 # Thresholds — calibrated from the conviction stratification on SPY 15-min,
 # 2023→2026 (scripts/backtest_trend_0dte.py). Kept as module constants for now;
@@ -35,6 +35,11 @@ ADX_OVEREXT = 50.0       # at/above → overextended, reverts → HOLD
 DIST_MIN = 0.10          # % |close−VWAP|; below → no separation / no edge → HOLD
 DIST_SWEET_HI = 0.25     # HIGH-conviction upper VWAP-distance bound
 DIST_OVEREXT = 0.50      # above → overextended → HOLD
+
+# S/R headroom (v2): a trend entry needs room to run to the next level. The risk
+# is buying calls into overhead resistance, or puts into support just below.
+HEADROOM_MIN = 0.15      # % to the nearest opposing level; below → no room → HOLD
+HEADROOM_COMFORT = 0.30  # % below → room is tight → cap conviction at MEDIUM
 
 
 def _f(v):
@@ -92,6 +97,43 @@ def _puts_only() -> bool:
         return False
 
 
+def _collect_levels(market_ctx: dict | None) -> list[float]:
+    """Candidate S/R price levels from market_ctx — same sources as the LLM
+    key-levels block: prior-day high/low/close, MA5/MA10, ORB high/low, session
+    high/low. Returns sorted positive floats. Fail-open ([] when unavailable)."""
+    if not market_ctx:
+        return []
+    md = market_ctx.get("multi_day") or {}
+    out = []
+    for v in (md.get("prev_high"), md.get("prev_low"), md.get("prev_close"),
+              md.get("ma5"), md.get("ma10"),
+              market_ctx.get("orb_high"), market_ctx.get("orb_low"),
+              market_ctx.get("session_high"), market_ctx.get("session_low")):
+        f = _f(v)
+        if f and f > 0:
+            out.append(f)
+    return sorted(out)
+
+
+def _headroom(price: float, action: str, levels: list[float]):
+    """% distance to the level standing in the trade's way (overhead resistance
+    for a call, support below for a put), and that level. (None, None) if none —
+    e.g. a clean breakout with nothing ahead. Fail-open."""
+    if not levels or price <= 0:
+        return None, None
+    if action == "BUY_CALL":
+        ahead = [l for l in levels if l > price]
+        if not ahead:
+            return None, None
+        lvl = min(ahead)
+        return (lvl - price) / price * 100.0, lvl
+    ahead = [l for l in levels if l < price]   # BUY_PUT → support below
+    if not ahead:
+        return None, None
+    lvl = max(ahead)
+    return (price - lvl) / price * 100.0, lvl
+
+
 def decide(ticker: str, snap: dict, market_ctx: dict | None = None, now=None):
     """Pure function: indicator snapshot → TickerDecision. No I/O, no LLM."""
     # Imported here to avoid a circular import (intraday imports this lazily).
@@ -124,11 +166,27 @@ def decide(ticker: str, snap: dict, market_ctx: dict | None = None, now=None):
         return hold("puts-only mode: skipping long-call signal (robust side is puts)")
     sweet = ADX_SWEET_LO <= adx < ADX_SWEET_HI and DIST_MIN <= dist <= DIST_SWEET_HI
     conviction = "HIGH" if sweet else "MEDIUM"
+
+    # S/R gate (v2): don't buy into the level just ahead. Fail-open: if market_ctx
+    # carries no usable levels, _headroom returns None and the trade proceeds.
+    hr, lvl = _headroom(price, action, _collect_levels(market_ctx))
+    sr_note = ""
+    if hr is not None:
+        kind = "resistance" if action == "BUY_CALL" else "support"
+        if hr < HEADROOM_MIN:
+            return hold(f"{action} blocked — {kind} ${lvl:.2f} only {hr:.2f}% "
+                        f"ahead (< {HEADROOM_MIN:.2f}%), no room to run")
+        if hr < HEADROOM_COMFORT and conviction == "HIGH":
+            conviction = "MEDIUM"  # tight room → don't size up
+            sr_note = f", {kind} ${lvl:.2f} {hr:.2f}% ahead (capped)"
+        else:
+            sr_note = f", {hr:.2f}% to {kind} ${lvl:.2f}"
+
     strike = round(price)  # ATM reference; executor's select_best_strike refines it
     reason = (
         f"{ENGINE_VERSION}: {'UP' if up else 'DOWN'}-trend "
         f"(price {price:.2f} {'>' if up else '<'} vwap {vwap:.2f} & ema {ema:.2f}), "
-        f"ADX {adx:.1f}, VWAP-dist {dist:.2f}% → {action}/{conviction}"
+        f"ADX {adx:.1f}, VWAP-dist {dist:.2f}%{sr_note} → {action}/{conviction}"
     )
     analysis = _build_analysis(action, snap, market_ctx or {})
     return TickerDecision(ticker, action, float(strike), "0DTE", conviction, reason, analysis)

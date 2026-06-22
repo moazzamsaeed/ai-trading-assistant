@@ -24,11 +24,14 @@ from sqlalchemy.orm import Session
 from agents.options.executor import execute_iron_condor
 from integrations import alpaca_client
 from integrations.alpaca_client import OptionQuote, StockQuote
+from agents.options.condor_engine import decide_condor, vix1d_from_chain
 from strategies.spy_0dte_iron_condor import (
     IronCondorBuildError,
     IronCondorPlan,
+    build_condor_at_strikes,
     build_iron_condor,
 )
+from trademaster import indicators
 from trademaster import risk_manager
 from trademaster.config import get_settings
 from trademaster.db import Signal as SignalRow
@@ -408,6 +411,138 @@ async def run_iron_condor_strategist(
         trade_id=execution.trade_id,
         pending_id=getattr(execution, "pending_id", None),
     )
+    trade_text = format_trade_telemetry(plan, open_signal, execution)
+    return open_signal, signals_text, trade_text
+
+
+async def _prior_day_adx(
+    daily_fetcher: Callable[..., object], *, now: datetime,
+) -> float | None:
+    """Prior-day Wilder ADX(14) on SPY daily bars — the condor's regime gate.
+    Excludes today's partial bar so there's no lookahead. Fail-open → None."""
+    try:
+        bars = await daily_fetcher(UNDERLYING, limit=40)
+    except Exception as e:  # noqa: BLE001
+        log.warning("condor_prior_adx_fetch_failed", error=str(e))
+        return None
+    today = to_et(now).date()
+    prior = [b for b in bars if to_et(b.timestamp).date() < today]
+    val = indicators.adx(prior, period=14)
+    return float(val) if val is not None else None
+
+
+async def run_deterministic_condor(
+    *,
+    qty: int = 1,
+    now: datetime | None = None,
+    session_factory: Callable[[], Session] | None = None,
+    stock_fetcher: Callable[[str], object] = alpaca_client.get_latest_stock_quote,
+    chain_fetcher: Callable[..., object] = alpaca_client.get_options_chain,
+    daily_fetcher: Callable[..., object] = alpaca_client.get_daily_bars,
+    account_fetcher: Callable[[], object] | None = None,
+    executor: Callable[..., object] = execute_iron_condor,
+) -> tuple[Signal, str | None, str | None]:
+    """LLM-FREE iron-condor pipeline — the deterministic VRP condor.
+
+    Mirrors run_iron_condor_strategist's plumbing (persist/risk/execute) but the
+    DECISION comes from agents.options.condor_engine.decide_condor() instead of an
+    LLM: calm-day regime filter (prior-day ADX<25 & VIX1D<40), strikes at 0.5× the
+    VIX1D expected move, $5 wings. VIX1D is derived live from the chain.
+    """
+    now = now or datetime.now(UTC)
+    factory = session_factory or make_session_factory()
+    expiry: date = now.date()
+
+    spy: StockQuote = await stock_fetcher(UNDERLYING)
+    spy_mid = spy.mid if spy.mid > 0 else (spy.bid or spy.ask)
+    spot = float(spy_mid)
+
+    prior_adx = await _prior_day_adx(daily_fetcher, now=now)
+
+    chain = await chain_fetcher(
+        UNDERLYING, expiry=expiry,
+        strike_lo=spy_mid - CHAIN_HALF_WIDTH, strike_hi=spy_mid + CHAIN_HALF_WIDTH,
+    )
+    chain = _enrich_chain_with_bs_greeks(chain, spot=spy_mid, now=now)
+
+    now_et = to_et(now)
+    close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    mtc = max((close_et - now_et).total_seconds() / 60.0, 1.0)
+    vix1d = vix1d_from_chain(chain, spot, mtc)
+
+    decision = decide_condor(spot, vix1d, prior_adx, mtc)
+    log.info("condor_engine_decision", action=decision.action, reason=decision.reason,
+             vix1d=vix1d, prior_adx=prior_adx)
+
+    extra = {
+        "engine": decision.version, "spy_mid": str(spy_mid),
+        "vix1d": f"{vix1d:.2f}" if vix1d is not None else None,
+        "prior_adx": f"{prior_adx:.2f}" if prior_adx is not None else None,
+        "expected_move": f"{decision.expected_move:.2f}" if decision.expected_move else None,
+    }
+
+    if not decision.is_trade:
+        sig = await _persist_hold(factory, reasoning=decision.reason, extra=extra)
+        return sig, None, None
+
+    # build the condor at the engine's target strikes
+    try:
+        plan = build_condor_at_strikes(
+            chain,
+            short_put=Decimal(str(decision.short_put)),
+            long_put=Decimal(str(decision.long_put)),
+            short_call=Decimal(str(decision.short_call)),
+            long_call=Decimal(str(decision.long_call)),
+            qty=qty,
+        )
+    except IronCondorBuildError as e:
+        extra["error"] = str(e)
+        sig = await _persist_hold(factory, reasoning=f"condor build failed: {e}", extra=extra)
+        return sig, None, None
+
+    extra.update({
+        "short_put_strike": str(plan.short_put.strike),
+        "short_call_strike": str(plan.short_call.strike),
+        "wing_width": str(plan.wing_width),
+        "credit_per_contract": str(plan.credit_per_contract),
+        "max_loss_per_contract": str(plan.max_loss_per_contract),
+    })
+
+    order = plan.to_trade_order()
+    open_signal = Signal(
+        task_type=TaskType.OPTIONS_STRATEGY.value, agent=AGENT_NAME,
+        action=SignalAction.OPEN, symbol=UNDERLYING, confidence=1.0,
+        reasoning=decision.reason, order=order, extra=extra,
+    )
+    persisted_id = await _persist(factory, open_signal, accepted=None)
+
+    validate_kwargs: dict = {"signal_id": persisted_id, "session_factory": factory}
+    if account_fetcher is not None:
+        validate_kwargs["account_fetcher"] = account_fetcher
+    try:
+        await risk_manager.validate_signal(open_signal, **validate_kwargs)
+    except RiskRejectionError as e:
+        with factory() as s:
+            row = s.get(SignalRow, persisted_id)
+            if row is not None:
+                row.accepted = False
+                row.rejection_reason = str(e)
+                s.commit()
+        log.info("condor_rejected_by_risk", reason=str(e))
+        return open_signal, None, None
+
+    with factory() as s:
+        row = s.get(SignalRow, persisted_id)
+        if row is not None:
+            row.accepted = True
+            s.commit()
+
+    signals_text = format_manual_signal(plan, open_signal)
+    execution = await executor(
+        plan, session_factory=factory, summary=signals_text, signal_id=persisted_id,
+    )
+    log.info("condor_execution", executed=execution.executed, reason=execution.reason,
+             trade_id=execution.trade_id, pending_id=getattr(execution, "pending_id", None))
     trade_text = format_trade_telemetry(plan, open_signal, execution)
     return open_signal, signals_text, trade_text
 

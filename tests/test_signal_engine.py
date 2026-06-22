@@ -106,3 +106,51 @@ def test_decision_is_deterministic():
     a = decide("SPY", s)
     b = decide("SPY", s)
     assert (a.action, a.conviction, a.strike) == (b.action, b.conviction, b.strike)
+
+
+# ---- S/R gate (v2): don't buy into the level just ahead ----
+
+def _ctx(**levels):
+    """market_ctx with S/R sources. e.g. _ctx(session_high=746.0)."""
+    md_keys = {"prev_high", "prev_low", "prev_close", "ma5", "ma10"}
+    ctx, md = {}, {}
+    for k, v in levels.items():
+        (md if k in md_keys else ctx)[k] = v
+    if md:
+        ctx["multi_day"] = md
+    return ctx
+
+
+def test_call_blocked_by_overhead_resistance():
+    # uptrend that would BUY_CALL, but session_high $745.4 is only ~0.05% above $745
+    s = _snap(745.0, 743.7, 743.5, 34.0)
+    d = decide("SPY", s, _ctx(session_high=745.4))
+    assert d.action == "HOLD" and "blocked" in d.reasoning and "resistance" in d.reasoning
+
+
+def test_put_blocked_by_support_just_below():
+    # downtrend that would BUY_PUT, but ORB low $744.6 is ~0.05% below $745
+    s = _snap(745.0, 746.3, 746.5, 35.0)
+    d = decide("SPY", s, _ctx(orb_low=744.6))
+    assert d.action == "HOLD" and "blocked" in d.reasoning and "support" in d.reasoning
+
+
+def test_high_conviction_capped_when_room_tight():
+    # would be HIGH (ADX 34, sweet dist), resistance ~0.2% ahead → tight → MEDIUM
+    s = _snap(745.0, 743.7, 743.5, 34.0)
+    d = decide("SPY", s, _ctx(session_high=746.5))
+    assert d.action == "BUY_CALL" and d.conviction == "MEDIUM"
+
+
+def test_clean_breakout_keeps_high_when_room_ahead():
+    # resistance far away (or none ahead) → full conviction retained
+    s = _snap(745.0, 743.7, 743.5, 34.0)
+    d = decide("SPY", s, _ctx(session_high=752.0))
+    assert d.action == "BUY_CALL" and d.conviction == "HIGH"
+
+
+def test_no_levels_fails_open():
+    # no market_ctx → no S/R block, behaves as v1
+    s = _snap(745.0, 743.7, 743.5, 34.0)
+    assert decide("SPY", s).action == "BUY_CALL"
+    assert decide("SPY", s, {}).action == "BUY_CALL"

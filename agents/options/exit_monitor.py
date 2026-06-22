@@ -4,11 +4,11 @@ Runs every few minutes during RTH. For each open SPY iron-condor `trades`
 row, fetches fresh quotes for the four legs, computes the current exit
 debit, and submits a closing order when any of these fire:
 
-- **50% profit target**: exit when current debit ≤ credit_received / 2
-  (we've captured half the premium; lock it in)
-- **2× stop loss**: exit when current debit ≥ 3 × credit_received
-  (running loss is 2× the credit collected; cap the bleed)
+- **1.5× stop loss**: exit when current debit ≥ 2.5 × credit_received
+  (running loss is 1.5× the credit collected; the validated condor stop)
 - **Force close at/after 15:50 ET**: time-based; we never hold past close
+  (≈ the backtest's close settlement). NO profit target — the condor's edge is
+  full-credit expiries, so we hold winners to the force-close.
 
 P&L per contract = entry_credit - exit_debit (positive = profit).
 On fill, the `trades` row is updated with exit_price, realized_pnl_usd,
@@ -24,6 +24,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from agents.options.condor_engine import STOP_MULT, stop_breached
 from integrations import alpaca_client
 from integrations.alpaca_client import OptionQuote, OrderResult
 from trademaster.db import Trade, make_session_factory
@@ -83,16 +84,14 @@ def _decide_exit(
     exit_debit: Decimal,
     force: bool,
 ) -> tuple[bool, str]:
-    """Return (should_exit, reason)."""
+    """Return (should_exit, reason) — matches the validated condor backtest:
+    a 1.5×-credit intraday stop + force-close, and NO profit target (the edge
+    comes from full-credit expiries; a 50% PT would cap winners and degrade it).
+    Stop fires when buy-back debit ≥ credit × (1 + STOP_MULT)."""
     if force:
         return True, "force_close_15:50"
-    # 50% PT
-    if exit_debit <= credit_received / Decimal("2"):
-        return True, "profit_target_50pct"
-    # 2x stop: loss = exit_debit - credit_received >= 2 * credit_received
-    # → exit_debit >= 3 * credit_received
-    if exit_debit >= credit_received * Decimal("3"):
-        return True, "stop_loss_2x"
+    if stop_breached(float(credit_received), float(exit_debit)):
+        return True, f"stop_loss_{STOP_MULT:g}x"
     return False, ""
 
 

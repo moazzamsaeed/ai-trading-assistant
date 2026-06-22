@@ -819,9 +819,15 @@ async def get_daily_bars(
     """
     def _fetch() -> list[Bar]:
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        # IEX returns nothing for a bare `limit` request with no start date
+        # (esp. outside market hours), which silently breaks ADX / prev-close /
+        # MA features. Anchor an explicit lookback window: ~2× the requested
+        # sessions in calendar days (+10 buffer for weekends/holidays).
+        start = datetime.now(UTC) - timedelta(days=limit * 2 + 10)
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            start=start,
             limit=limit,
             feed=DataFeed.IEX,
         )

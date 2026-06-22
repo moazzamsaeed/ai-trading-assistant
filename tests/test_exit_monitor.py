@@ -26,23 +26,26 @@ def session_factory():
 # ----------------- _decide_exit -----------------
 
 
-def test_decide_exit_profit_target():
-    exit_, why = _decide_exit(
+def test_decide_exit_no_profit_target():
+    # 50% of credit captured is NOT an exit anymore — we hold winners to expiry
+    exit_, _ = _decide_exit(
         credit_received=Decimal("80"), exit_debit=Decimal("40"), force=False
     )
-    assert exit_ and why == "profit_target_50pct"
+    assert not exit_
 
 
-def test_decide_exit_stop_loss_2x():
+def test_decide_exit_stop_loss_1_5x():
+    # stop fires at debit ≥ 2.5 × credit (1.5× loss). 80 → 200 threshold.
     exit_, why = _decide_exit(
-        credit_received=Decimal("80"), exit_debit=Decimal("240"), force=False
+        credit_received=Decimal("80"), exit_debit=Decimal("200"), force=False
     )
-    assert exit_ and why == "stop_loss_2x"
+    assert exit_ and why == "stop_loss_1.5x"
 
 
-def test_decide_exit_hold_in_normal_range():
+def test_decide_exit_below_stop_holds():
+    # debit 199 < 200 threshold → hold
     exit_, _ = _decide_exit(
-        credit_received=Decimal("80"), exit_debit=Decimal("100"), force=False
+        credit_received=Decimal("80"), exit_debit=Decimal("199"), force=False
     )
     assert not exit_
 
@@ -177,30 +180,20 @@ async def test_monitor_holds_when_neither_threshold_hit(session_factory):
         assert row.closed_at is None
 
 
-async def test_monitor_closes_at_profit_target(session_factory):
+async def test_monitor_holds_at_half_credit_no_profit_target(session_factory):
+    # NO profit target on the deterministic condor — capturing 50% of credit
+    # ($40 debit vs $80 credit) must HOLD (winners ride to the force-close).
     trade_id = _ic_trade(session_factory)
-
-    # Aim for $40 debit per contract → 50% PT triggers.
     chain = _chain_at_debit(Decimal("0.40"))
-
-    submitted: dict = {}
 
     async def chain_fetcher(*_a, **_k):
         return chain
 
-    async def submitter(**kwargs):
-        submitted.update(kwargs)
-        return OrderResult(
-            order_id="close_1",
-            status="new",
-            filled_avg_price=None,
-            filled_qty=Decimal("0"),
-            submitted_at=datetime.now(UTC),
-            raw_status="new",
-        )
+    async def submitter(**_):
+        raise AssertionError("should not submit a close on a held winner")
 
     async def waiter(_id, *, timeout_s):
-        return _fake_fill("0.42")  # close cost per share
+        raise AssertionError("should not wait on a held winner")
 
     results = await run_exit_monitor(
         session_factory=session_factory,
@@ -209,25 +202,15 @@ async def test_monitor_closes_at_profit_target(session_factory):
         waiter=waiter,
         force_close=False,
     )
-    assert len(results) == 1
-    r = results[0]
-    assert r["status"] == "closed"
-    assert r["reason"] == "profit_target_50pct"
-    assert submitted["short_put"] == "SPY260511P00495000"
-
+    assert results[0]["status"] == "hold"
     with session_factory() as s:
-        row = s.get(Trade, trade_id)
-        assert row.closed_at is not None
-        assert row.exit_price == Decimal("42.00")  # filled debit
-        # P&L = entry credit (80) - exit debit (42) = 38, qty=1
-        assert row.realized_pnl_usd == Decimal("38.00")
-        assert row.extra["exit_reason"] == "profit_target_50pct"
+        assert s.get(Trade, trade_id).closed_at is None
 
 
 async def test_monitor_closes_at_stop_loss(session_factory):
     trade_id = _ic_trade(session_factory)
 
-    # 2x stop fires when debit >= 3 * credit = $240. Push debit to $260.
+    # 1.5x stop fires when debit >= 2.5 * credit = $200. Push debit to $260.
     chain = _chain_at_debit(Decimal("2.60"))
 
     async def chain_fetcher(*_a, **_k):
@@ -253,7 +236,7 @@ async def test_monitor_closes_at_stop_loss(session_factory):
         waiter=waiter,
         force_close=False,
     )
-    assert results[0]["reason"] == "stop_loss_2x"
+    assert results[0]["reason"] == "stop_loss_1.5x"
     with session_factory() as s:
         row = s.get(Trade, trade_id)
         assert row.realized_pnl_usd == Decimal("80.00") - Decimal("265.00")  # -185
