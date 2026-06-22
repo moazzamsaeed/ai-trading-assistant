@@ -130,9 +130,13 @@ async def main(submit: bool) -> None:
     else:
         print("  (engine HOLDs today — no live plan; this is expected on trend/crisis days)")
 
-    # 8. execution probe — independent of today's regime decision
+    # 8. execution probe — independent of today's regime decision.
+    # NOTE: the paper simulator fills MLEG orders regardless of marketability, so a
+    # "non-marketable" credit limit does NOT prevent a fill (confirmed 2026-06-22 —
+    # the probe filled and left a live position). So we treat a fill as a possible
+    # outcome and CLOSE it immediately; we only fall back to cancel if it rested.
     if submit:
-        print("\n── MLEG EXECUTION PROBE (non-marketable, will cancel) ──")
+        print("\n── MLEG EXECUTION PROBE (submits a real test order; self-closes) ──")
         try:
             # build a test condor near ATM regardless of the regime gate
             kp, lp = round(spot) - 3, round(spot) - 8
@@ -141,7 +145,6 @@ async def main(submit: bool) -> None:
                 enriched, short_put=Decimal(kp), long_put=Decimal(lp),
                 short_call=Decimal(kc), long_call=Decimal(lc), qty=1,
             )
-            # 3× market credit → non-marketable (won't fill)
             limit = (test.credit_per_contract * Decimal("3")).quantize(Decimal("0.01"))
             order = await alpaca_client.submit_iron_condor_entry(
                 qty=1, limit_credit_per_contract=limit,
@@ -150,8 +153,30 @@ async def main(submit: bool) -> None:
             )
             _line("MLEG submit status", f"{order.status} (id {order.order_id})")
             print("  ✅ account ACCEPTED a 4-leg MLEG order — Level-3 execution confirmed.")
-            await alpaca_client.cancel_order(order.order_id)
-            _line("cancel", "sent ✅")
+
+            # Settle, then determine fill vs rest and clean up accordingly.
+            await asyncio.sleep(2.0)
+            final = await alpaca_client.get_order(order.order_id)
+            _line("settled status", final.status)
+            if str(final.status).lower().endswith("filled") or "filled" in str(final.status).lower():
+                print("  ⚠️  paper engine FILLED the test order — closing the position to stay flat.")
+                close = await alpaca_client.submit_iron_condor_close(
+                    qty=1, limit_debit_per_contract=Decimal("150"),
+                    short_put=test.short_put.occ_symbol, long_put=test.long_put.occ_symbol,
+                    short_call=test.short_call.occ_symbol, long_call=test.long_call.occ_symbol,
+                )
+                _line("close order", f"{close.status} (id {close.order_id})")
+            else:
+                await alpaca_client.cancel_order(order.order_id)
+                _line("cancel", "sent ✅")
+
+            await asyncio.sleep(2.0)
+            poss = [p for p in await alpaca_client.get_positions()
+                    if p.symbol in {test.short_put.occ_symbol, test.long_put.occ_symbol,
+                                    test.short_call.occ_symbol, test.long_call.occ_symbol}]
+            _line("flat after probe?", "yes ✅" if not poss else f"NO — {len(poss)} legs OPEN ⚠️")
+            for p in poss:
+                print(f"     still open: {p.symbol} {p.qty} {p.side}")
         except Exception as e:  # noqa: BLE001
             print(f"  ❌ MLEG probe FAILED: {type(e).__name__}: {e}")
             print("     → the account may not execute 4-leg defined-risk orders; investigate before go-live.")
