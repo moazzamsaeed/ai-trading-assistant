@@ -1459,6 +1459,19 @@ async def run_directional_scan(
             session.commit()
         messages = [format_directional_signal(d, today=today, mode=mode) for d in actionable]
 
+    # Per-ticker decision log — surfaces each engine verdict (incl. the S/R
+    # gate's block/cap/clear note in `reasoning`) to journald. Without this only
+    # actionable decisions persist to the DB; HOLDs vetoed by S/R were Discord-only.
+    for d in decisions:
+        log.info(
+            "directional_decision",
+            ticker=d.ticker,
+            action=d.action,
+            conviction=d.conviction,
+            strike=d.strike,
+            reasoning=d.reasoning,
+        )
+
     log.info(
         "directional_scan_complete",
         n_tickers=len(tickers),
