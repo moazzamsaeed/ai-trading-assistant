@@ -843,6 +843,51 @@ async def get_daily_bars(
     return await asyncio.to_thread(_fetch)
 
 
+# Extended-hours span IEX returns on multi-day fetches before our RTH filter:
+# ~04:00–20:00 ET = 16h. Used to size req_limit so the oldest-first response
+# always spans start→now instead of exhausting on prior sessions.
+_EXT_HOURS_MIN = 16 * 60
+# Calendar-day cushion added on top of the session walk-back. The walk only
+# accounts for weekends; it CANNOT see market holidays. A Monday whose computed
+# "1 session back" lands on a holiday (e.g. Juneteenth 2026-06-19, Good Friday)
+# would otherwise anchor `start` to a no-data day and fetch ZERO warmup bars,
+# leaving EMA50/volume_ratio_20 None for the first ~4h of the session (observed
+# live 2026-06-22). Five extra calendar days absorbs any single holiday plus a
+# long weekend. Over-fetched older bars are harmlessly trimmed by bars[-limit:].
+_HOLIDAY_PAD_DAYS = 5
+
+
+def _warmup_window(
+    now_et: datetime,
+    *,
+    warmup_days: int,
+    limit: int,
+    timeframe_minutes: int,
+) -> tuple[datetime, int]:
+    """Compute (start, req_limit) for a warmup bar fetch.
+
+    Walks back `warmup_days` trading sessions (weekend-padded) plus a fixed
+    holiday safety margin, then sizes req_limit to cover the whole start→now
+    span INCLUDING extended-hours bars (filtered out later), so the oldest-first
+    Alpaca response always reaches today's latest bar. Pure/synchronous so the
+    calendar math is unit-testable without hitting the network.
+    """
+    weekday = now_et.weekday()  # 0=Mon ... 4=Fri
+    days_back = warmup_days
+    # Walking back across the weekend costs 2 extra calendar days per Monday.
+    for _ in range(warmup_days):
+        if weekday == 0:  # Monday → previous Friday
+            days_back += 2
+        weekday = (weekday - 1) % 7
+    days_back += _HOLIDAY_PAD_DAYS
+    start = (now_et - timedelta(days=days_back)).replace(
+        hour=9, minute=30, second=0, microsecond=0
+    )
+    bars_per_day = max(1, _EXT_HOURS_MIN // timeframe_minutes)
+    req_limit = days_back * bars_per_day + limit + 50
+    return start, req_limit
+
+
 async def get_recent_bars(
     symbol: str,
     *,
@@ -875,22 +920,10 @@ async def get_recent_bars(
         rth_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
 
         if warmup_days > 0:
-            # Alpaca returns OLDEST-first up to req_limit, so a 3-day-back start
-            # with limit=250 can fully exhaust on prior-session bars and never
-            # reach today's. Anchor to the start of the most recent trading day
-            # that's `warmup_days` sessions back, padding for weekends so the
-            # response always reaches NOW.
-            weekday = now_et.weekday()  # 0=Mon ... 4=Fri
-            days_back = warmup_days
-            # Walking back across the weekend costs 2 extra calendar days.
-            for _ in range(warmup_days):
-                if weekday == 0:  # Monday → previous Friday
-                    days_back += 2
-                weekday = (weekday - 1) % 7
-            start = (now_et - timedelta(days=days_back)).replace(
-                hour=9, minute=30, second=0, microsecond=0
+            start, req_limit = _warmup_window(
+                now_et, warmup_days=warmup_days, limit=limit,
+                timeframe_minutes=timeframe_minutes,
             )
-            req_limit = max(limit + 120, 200)
         else:
             start = rth_open if now_et >= rth_open else now_et.replace(hour=4, minute=0, second=0, microsecond=0)
             req_limit = limit

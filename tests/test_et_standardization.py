@@ -289,6 +289,59 @@ def test_rth_bar_anchor_at_exact_open_uses_rth(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Warmup-window holiday robustness — get_recent_bars(warmup_days>0)
+# ---------------------------------------------------------------------------
+
+
+def test_warmup_window_reaches_prior_session_across_holiday():
+    """Monday 2026-06-22: the prior 'session' the calendar walk lands on is
+    Friday 06-19 — Juneteenth, a market holiday with no bars. The old logic
+    anchored start to that holiday and fetched ZERO warmup bars (EMA50 None for
+    ~4h, observed live). The window must reach back PAST the holiday to the real
+    prior session (Thursday 06-18).
+    """
+    from integrations.alpaca_client import _warmup_window
+
+    now_et = to_et(datetime(2026, 6, 22, 15, 0, tzinfo=UTC))  # Mon 11:00 ET
+    start, req_limit = _warmup_window(
+        now_et, warmup_days=1, limit=60, timeframe_minutes=5
+    )
+    # Must start at/before the real prior trading session, not on the holiday.
+    assert start.date() < date(2026, 6, 19)
+    assert start.date() <= date(2026, 6, 18)
+    assert start.hour == 9 and start.minute == 30
+
+
+def test_warmup_window_req_limit_spans_extended_hours_to_now():
+    """req_limit must exceed the raw (extended-hours-inclusive) bar count over
+    the whole start→now span, or the oldest-first response exhausts before
+    reaching today and ema50 never bootstraps.
+    """
+    from integrations.alpaca_client import _warmup_window
+
+    now_et = to_et(datetime(2026, 6, 22, 15, 0, tzinfo=UTC))
+    start, req_limit = _warmup_window(
+        now_et, warmup_days=1, limit=60, timeframe_minutes=5
+    )
+    days_spanned = (now_et.date() - start.date()).days
+    raw_bars_upper_bound = days_spanned * (16 * 60 // 5)  # ext-hours bars/day
+    assert req_limit > raw_bars_upper_bound
+    assert req_limit >= 60  # never below the requested count
+
+
+def test_warmup_window_normal_weekday_still_covers_a_prior_session():
+    """A plain Wednesday with no nearby holiday still reaches ≥1 prior session."""
+    from integrations.alpaca_client import _warmup_window
+
+    now_et = to_et(datetime(2026, 5, 13, 15, 0, tzinfo=UTC))  # Wed 11:00 ET
+    start, _ = _warmup_window(
+        now_et, warmup_days=1, limit=60, timeframe_minutes=5
+    )
+    assert start.date() < date(2026, 5, 13)  # strictly before today
+    assert (date(2026, 5, 13) - start.date()).days >= 2  # reaches prior session(s)
+
+
+# ---------------------------------------------------------------------------
 # Round-trip: ET conversions don't drift
 # ---------------------------------------------------------------------------
 
