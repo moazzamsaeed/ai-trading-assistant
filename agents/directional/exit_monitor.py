@@ -62,6 +62,30 @@ HARD_FLOOR_PCT = Decimal("0.30")   # −30%: exit unconditionally, no LLM
 VOLUME_FADE_THRESHOLD = 0.7        # volume_ratio below this = momentum fading
 PROFIT_LOCK_PCT = 75.0             # always consult LLM above this P&L even with no indicator triggers
 
+# 0DTE THETA BACKSTOP (2026-06-23): a TIGHTER, TIME-SCALED unconditional loss cut
+# for 0DTE longs ONLY, sitting between the thesis-based exits and the −50%/−30%
+# hard floor. It cuts on loss magnitude alone (no VWAP / thesis-reversal needed),
+# closing the gap where a stalled-but-NOT-reversed long bleeds toward the floor
+# while price clings to VWAP (trade #79: −44% before thesis finally broke). Theta
+# accelerates into the close with less time to recover, so the stop TIGHTENS
+# through the session. (cutoff_hour_ET, loss_fraction): cut when the loss reaches
+# the fraction for the first window whose cutoff_hour the current ET hour is below.
+ZDTE_THETA_BACKSTOP: list[tuple[int, float]] = [
+    (12, 0.40),   # before 12:00 ET → cut at −40%
+    (14, 0.30),   # 12:00–13:59 ET → cut at −30%
+    (24, 0.22),   # 14:00 ET onward → cut at −22%
+]
+
+
+def zdte_theta_backstop_pct(et_now: datetime) -> float:
+    """Time-scaled 0DTE loss-cut threshold (positive fraction) for the given ET
+    time, tightening through the session as theta bites. See ZDTE_THETA_BACKSTOP.
+    Pure/synchronous so the schedule is unit-testable without market state."""
+    for cutoff_hour, frac in ZDTE_THETA_BACKSTOP:
+        if et_now.hour < cutoff_hour:
+            return frac
+    return ZDTE_THETA_BACKSTOP[-1][1]
+
 # Thesis-invalidation force-exit (fix A, 2026-06-09). When a LOSING position
 # shows a confirmed momentum reversal, exit immediately WITHOUT asking the LLM —
 # the LLM kept holding broken losers (trade #60 held −15%→−25% citing "stop not
@@ -717,6 +741,7 @@ def _format_exit_combined(
         "smart_profit_exit": "💰 smart profit exit — indicators say take it",
         "thesis_invalidated": "🚫 thesis invalidated — momentum reversed, cutting loss",
         "zdte_early_cut": "⏱️ 0DTE early cut — losing + below VWAP, no time to recover",
+        "zdte_theta_backstop": "⏳ 0DTE theta backstop — capping the bleed, theta won't recover",
         "force_close": "⏰ closing before market close",
     }.get(reason, f"closing ({reason})")
 
@@ -836,8 +861,30 @@ async def run_directional_exit_monitor(
         # uses −50% to match its wider stop. Both act as unconditional floors with no LLM.
         hard_floor = Decimal("0.50") if trade_mode == "aggressive" else HARD_FLOOR_PCT
 
+        # 0DTE? (expires today) — gates the time-scaled theta backstop below and is
+        # reused by the early-cut later, so compute it once here.
+        try:
+            _, _exp_date, _, _ = parse_occ_symbol(occ)
+            is_0dte = _exp_date <= today
+        except ValueError:
+            is_0dte = False
+        theta_backstop = zdte_theta_backstop_pct(et_now)
+
         if trade_force:
             should_exit, reason = True, "force_close"
+
+        # Time-scaled theta backstop: 0DTE long past the time-of-day loss threshold,
+        # cut on loss magnitude ALONE (no VWAP/thesis needed). Tighter than the
+        # hard floor, so it fires first and bounds the theta bleed.
+        elif is_0dte and pnl_pct <= -theta_backstop * 100:
+            should_exit, reason = True, "zdte_theta_backstop"
+            log.info(
+                "directional_exit_zdte_theta_backstop",
+                trade_id=trade.id, occ=occ,
+                pnl_pct=f"{pnl_pct:+.1f}%",
+                threshold=f"-{theta_backstop * 100:.0f}%",
+                et_hour=et_now.hour,
+            )
 
         elif current_bid <= entry_p * (Decimal("1") - hard_floor):
             should_exit, reason = True, "hard_floor_stop"
@@ -876,12 +923,7 @@ async def run_directional_exit_monitor(
             triggered = _check_exit_rules(action, snap)
             in_strong_profit = pnl_pct >= PROFIT_LOCK_PCT
 
-            # Is this a 0DTE (expires today)? Used by the early-cut below.
-            try:
-                _, _exp_date, _, _ = parse_occ_symbol(occ)
-                is_0dte = _exp_date <= today
-            except ValueError:
-                is_0dte = False
+            # is_0dte already computed above (gates the theta backstop + early-cut).
             # Price broken through VWAP against the position — the one reversal
             # signal that IS computable early (VWAP needs few bars; RSI/EMA don't).
             vwap_broken = (

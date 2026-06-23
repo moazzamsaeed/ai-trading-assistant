@@ -14,7 +14,29 @@ from agents.directional.exit_monitor import (
     _format_exit_combined,
     _llm_exit_confirm,
     run_directional_exit_monitor,
+    zdte_theta_backstop_pct,
 )
+from trademaster.timeutils import ET
+
+# 10:00 ET (June=EDT → 14:00 UTC): theta backstop is −40% here, so the −25%/−30%
+# hard-floor/early-cut scenarios behave exactly as they did pre-backstop.
+_MORNING_NOW = datetime(2026, 6, 23, 14, 0, tzinfo=UTC)
+
+
+def test_theta_backstop_tightens_through_session():
+    """0DTE theta backstop: −40% before noon → −30% midday → −22% after 2pm ET."""
+    def at(h, m=0):
+        return zdte_theta_backstop_pct(datetime(2026, 6, 23, h, m, tzinfo=ET))
+
+    assert at(9, 45) == 0.40          # early session — most room
+    assert at(11, 59) == 0.40         # just before noon
+    assert at(12, 0) == 0.30          # noon boundary tightens
+    assert at(13, 30) == 0.30
+    assert at(14, 0) == 0.22          # 2pm boundary tightens again
+    assert at(15, 50) == 0.22         # late — tightest
+    # monotonically non-increasing through the day (never loosens)
+    pcts = [at(h) for h in range(9, 16)]
+    assert pcts == sorted(pcts, reverse=True)
 from integrations.alpaca_client import OptionQuote, OrderResult
 from trademaster.db import Base, Trade, make_engine, make_session_factory
 from trademaster.llm.types import LLMResponse
@@ -379,7 +401,7 @@ async def test_monitor_zdte_early_cut_without_llm(session_factory):
         return _fake_llm("HOLD", "should not be consulted on a 0DTE early-cut")
 
     results = await run_directional_exit_monitor(
-        session_factory=session_factory, quote_fetcher=loss_quote,
+        session_factory=session_factory, now=_MORNING_NOW, quote_fetcher=loss_quote,
         bars_fetcher=below_vwap_bars, submitter=fake_sell, waiter=fake_wait,
         llm_caller=hold_llm, force_close=False,
     )
@@ -477,6 +499,7 @@ async def test_monitor_hard_floor_exits_immediately(session_factory):
 
     results = await run_directional_exit_monitor(
         session_factory=session_factory,
+        now=_MORNING_NOW,
         quote_fetcher=low_quote,
         bars_fetcher=no_bars,
         submitter=fake_sell,
@@ -735,10 +758,13 @@ async def test_weekly_force_closed_on_expiry_day(session_factory):
 # ---------------------------------------------------------------------------
 
 
-def _open_trade_mode(session_factory, *, entry_premium: float = 2.00, mode: str) -> Trade:
+def _open_trade_mode(
+    session_factory, *, entry_premium: float = 2.00, mode: str,
+    occ: str = "SPY260101C00500000",
+) -> Trade:
     with session_factory() as session:
         trade = Trade(
-            symbol="SPY260101C00500000",
+            symbol=occ,
             asset_class="option",
             side="buy",
             strategy="directional_call",
@@ -748,7 +774,7 @@ def _open_trade_mode(session_factory, *, entry_premium: float = 2.00, mode: str)
             extra={
                 "ticker": "SPY",
                 "action": "BUY_CALL",
-                "occ_symbol": "SPY260101C00500000",
+                "occ_symbol": occ,
                 "mode": mode,
                 "stop_premium": str(
                     Decimal(str(entry_premium)) * (
@@ -780,6 +806,7 @@ async def test_hard_floor_selective_triggers_at_30pct(session_factory):
 
     results = await run_directional_exit_monitor(
         session_factory=session_factory,
+        now=_MORNING_NOW,
         quote_fetcher=quote_at_floor,
         bars_fetcher=no_bars,
         submitter=fake_sell,
@@ -804,6 +831,7 @@ async def test_hard_floor_aggressive_does_not_trigger_at_30pct(session_factory):
 
     results = await run_directional_exit_monitor(
         session_factory=session_factory,
+        now=_MORNING_NOW,
         quote_fetcher=quote_at_30pct,
         bars_fetcher=no_bars,
         llm_caller=fake_llm,
@@ -813,8 +841,11 @@ async def test_hard_floor_aggressive_does_not_trigger_at_30pct(session_factory):
 
 
 async def test_hard_floor_aggressive_triggers_at_50pct(session_factory):
-    """Bug 5: aggressive hard floor fires at -50% (entry=2.00, floor=1.00)."""
-    _open_trade_mode(session_factory, entry_premium=2.00, mode="aggressive")
+    """Bug 5: aggressive hard floor fires at -50% (entry=2.00, floor=1.00).
+    Uses a NON-0DTE occ (2027 expiry) so the 0DTE theta backstop (which would
+    pre-empt at -22%/-40%) does not apply — isolates the hard-floor mechanism."""
+    _open_trade_mode(session_factory, entry_premium=2.00, mode="aggressive",
+                     occ="SPY271231C00500000")
 
     async def quote_at_50pct(_occ):
         return _quote(bid=1.00)  # exactly -50%
@@ -837,6 +868,65 @@ async def test_hard_floor_aggressive_triggers_at_50pct(session_factory):
         force_close=False,
     )
     assert results[0]["reason"] == "hard_floor_stop"
+
+
+async def test_theta_backstop_morning_preempts_50pct_floor(session_factory):
+    """0DTE aggressive at -45% in the MORNING: the theta backstop (-40% before
+    noon) cuts BEFORE the -50% hard floor is reached — capping the bleed."""
+    _open_trade_mode(session_factory, entry_premium=2.00, mode="aggressive")  # 0DTE occ
+
+    async def quote_45pct(_occ):
+        return _quote(bid=1.10)  # -45%: past -40% theta, not yet the -50% floor
+
+    async def no_bars(*_a, **_k):
+        return []
+
+    async def fake_sell(**_kw):
+        return _filled(price=1.10)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=1.10)
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        now=_MORNING_NOW,
+        quote_fetcher=quote_45pct,
+        bars_fetcher=no_bars,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        force_close=False,
+    )
+    assert results[0]["reason"] == "zdte_theta_backstop"
+
+
+async def test_theta_backstop_afternoon_tightens_to_22pct(session_factory):
+    """0DTE aggressive at -25% AFTER 2pm ET: the theta backstop has tightened to
+    -22%, so a loss that would HOLD in the morning is cut late in the day."""
+    _open_trade_mode(session_factory, entry_premium=2.00, mode="aggressive")  # 0DTE occ
+    afternoon = datetime(2026, 6, 23, 19, 0, tzinfo=UTC)  # 15:00 ET → theta -22%
+
+    async def quote_25pct(_occ):
+        return _quote(bid=1.50)  # -25%: past -22% theta, well short of the -50% floor
+
+    async def no_bars(*_a, **_k):
+        return []
+
+    async def fake_sell(**_kw):
+        return _filled(price=1.50)
+
+    async def fake_wait(order_id, **_kw):
+        return _filled(price=1.50)
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory,
+        now=afternoon,
+        quote_fetcher=quote_25pct,
+        bars_fetcher=no_bars,
+        submitter=fake_sell,
+        waiter=fake_wait,
+        force_close=False,
+    )
+    assert results[0]["reason"] == "zdte_theta_backstop"
 
 
 async def test_profit_lock_triggers_llm_without_indicator_rules(session_factory):
