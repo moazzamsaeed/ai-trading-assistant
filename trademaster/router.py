@@ -50,7 +50,11 @@ class TaskType(StrEnum):
 
 MODEL_MAP: dict[TaskType, tuple[str, str]] = {
     TaskType.ORCHESTRATE: ("anthropic", "claude-opus-4-7"),
-    TaskType.PRE_MARKET_RESEARCH: ("google", "gemini-2.5-pro"),
+    # Primary swapped google→anthropic 2026-06-24: Gemini 2.5 Pro 503'd at ~8 AM
+    # ET three mornings straight (sustained "high demand"), failing the briefing
+    # daily. Claude Sonnet is reliable for this once-daily long-form synthesis;
+    # Gemini is now the fallback. Pair with the long timeout in premarket.py.
+    TaskType.PRE_MARKET_RESEARCH: ("anthropic", "claude-sonnet-4-6"),
     TaskType.INTRADAY_SCAN: ("deepseek", "deepseek-v4-flash"),
     # Directional ENTRY runs on Sonnet 4.6 (2026-06-15). To revert to the prior
     # config, change this one line back to ("deepseek", "deepseek-v4-flash").
@@ -71,10 +75,10 @@ FALLBACK_MAP: dict[TaskType, tuple[str, str]] = {
     # entry model so an Anthropic outage doesn't blind the entry scan.
     TaskType.DIRECTIONAL_ENTRY: ("deepseek", "deepseek-v4-flash"),
     TaskType.OPTIONS_STRATEGY: ("anthropic", "claude-haiku-4-5-20251001"),
-    # Gemini 2.5 Pro returns 503 "high demand" intermittently. Premarket fires
-    # once at 8 AM ET — no fallback means a missed briefing for the whole day.
-    # Use Claude Sonnet for the fallback since the prompt is long-form synthesis.
-    TaskType.PRE_MARKET_RESEARCH: ("anthropic", "claude-sonnet-4-6"),
+    # Premarket fires once at 8 AM ET — no fallback means a missed briefing for
+    # the whole day. Gemini is the fallback now that Anthropic is primary (swap
+    # of 2026-06-24); if Anthropic is down, Gemini still produces the briefing.
+    TaskType.PRE_MARKET_RESEARCH: ("google", "gemini-2.5-pro"),
 }
 
 

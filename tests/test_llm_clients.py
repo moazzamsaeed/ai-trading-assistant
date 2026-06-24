@@ -31,7 +31,7 @@ async def test_anthropic_success(monkeypatch):
             create=AsyncMock(return_value=_anthropic_response("hi", 10, 5))
         )
     )
-    monkeypatch.setattr(anthropic_client, "_client", lambda: mock)
+    monkeypatch.setattr(anthropic_client, "_client", lambda *a, **k: mock)
 
     resp = await anthropic_client.complete("hello")
 
@@ -52,7 +52,7 @@ async def test_anthropic_retries_then_succeeds(monkeypatch):
         return _anthropic_response("ok2", 1, 1)
 
     monkeypatch.setattr(anthropic_client, "_call_once", fake_call_once)
-    monkeypatch.setattr(anthropic_client, "_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(anthropic_client, "_client", lambda *a, **k: SimpleNamespace())
 
     resp = await anthropic_client.complete("x")
     assert resp.text == "ok2"
@@ -67,7 +67,7 @@ async def test_anthropic_auth_error_does_not_retry(monkeypatch):
         raise AuthError("bad key")
 
     monkeypatch.setattr(anthropic_client, "_call_once", fake_call_once)
-    monkeypatch.setattr(anthropic_client, "_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(anthropic_client, "_client", lambda *a, **k: SimpleNamespace())
 
     with pytest.raises(AuthError):
         await anthropic_client.complete("x")
@@ -79,7 +79,7 @@ async def test_anthropic_exhausted_retries_raises_provider_error(monkeypatch):
         raise ProviderError("5xx everytime")
 
     monkeypatch.setattr(anthropic_client, "_call_once", fake_call_once)
-    monkeypatch.setattr(anthropic_client, "_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(anthropic_client, "_client", lambda *a, **k: SimpleNamespace())
 
     with pytest.raises(ProviderError):
         await anthropic_client.complete("x")
@@ -100,7 +100,7 @@ async def test_deepseek_success(monkeypatch):
         return _deepseek_response("hi", 100, 50)
 
     monkeypatch.setattr(deepseek_client, "_call_once", fake_call_once)
-    monkeypatch.setattr(deepseek_client, "_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(deepseek_client, "_client", lambda *a, **k: SimpleNamespace())
 
     resp = await deepseek_client.complete("hello", model="deepseek-v4-flash")
     assert resp.text == "hi"
@@ -120,7 +120,7 @@ async def test_deepseek_rate_limit_then_success(monkeypatch):
         return _deepseek_response("done", 1, 1)
 
     monkeypatch.setattr(deepseek_client, "_call_once", fake_call_once)
-    monkeypatch.setattr(deepseek_client, "_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(deepseek_client, "_client", lambda *a, **k: SimpleNamespace())
 
     resp = await deepseek_client.complete("x", model="deepseek-v4-pro")
     assert resp.text == "done"
@@ -142,7 +142,7 @@ async def test_google_success(monkeypatch):
         return _google_response("hi", 20, 10)
 
     monkeypatch.setattr(google_client, "_call_once", fake_call_once)
-    monkeypatch.setattr(google_client, "_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(google_client, "_client", lambda *a, **k: SimpleNamespace())
 
     resp = await google_client.complete("hello")
     assert resp.text == "hi"
@@ -159,7 +159,7 @@ async def test_google_provider_error_retries_and_fails(monkeypatch):
         raise ProviderError("500")
 
     monkeypatch.setattr(google_client, "_call_once", fake_call_once)
-    monkeypatch.setattr(google_client, "_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(google_client, "_client", lambda *a, **k: SimpleNamespace())
 
     with pytest.raises(ProviderError):
         await google_client.complete("x")

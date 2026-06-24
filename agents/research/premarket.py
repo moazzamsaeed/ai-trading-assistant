@@ -143,10 +143,15 @@ async def run_premarket_briefing(
         events_block=_format_events_block(events, now.date()),
     )
 
+    # Long-form synthesis, once-daily, latency-insensitive → generous timeout so
+    # a multi-thousand-token briefing doesn't trip the hot-path 30s default (the
+    # bug that failed the briefing 3 mornings running). Applies to primary AND
+    # fallback (route_to_model forwards client_kwargs to both).
     response = await route_to_model(
         TaskType.PRE_MARKET_RESEARCH,
         prompt,
         session_factory=factory,
+        timeout_s=180.0,
     )
 
     signal = Signal(

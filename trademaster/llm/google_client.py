@@ -10,6 +10,7 @@ import time
 
 from google import genai
 from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from tenacity import (
     RetryError,
     retry,
@@ -29,8 +30,12 @@ PROVIDER = "google"
 DEFAULT_TIMEOUT_S = 30.0
 
 
-def _client() -> genai.Client:
-    return genai.Client(api_key=get_settings().google_api_key.get_secret_value())
+def _client(timeout_s: float = DEFAULT_TIMEOUT_S) -> genai.Client:
+    # HttpOptions.timeout is in MILLISECONDS.
+    return genai.Client(
+        api_key=get_settings().google_api_key.get_secret_value(),
+        http_options=genai_types.HttpOptions(timeout=int(timeout_s * 1000)),
+    )
 
 
 async def _call_once(client: genai.Client, *, model: str, prompt: str):
@@ -49,9 +54,17 @@ async def _call_once(client: genai.Client, *, model: str, prompt: str):
         raise ProviderError(f"google transport error: {e}") from e
 
 
-async def complete(prompt: str, *, model: str = "gemini-3.1-pro-preview") -> LLMResponse:
-    """Single-turn generate_content call. Retries on rate-limit and 5xx."""
-    client = _client()
+async def complete(
+    prompt: str,
+    *,
+    model: str = "gemini-3.1-pro-preview",
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> LLMResponse:
+    """Single-turn generate_content call. Retries on rate-limit and 5xx.
+
+    `timeout_s` overrides the per-request timeout for long-form jobs.
+    """
+    client = _client(timeout_s)
     started = time.perf_counter()
 
     retrying = retry(

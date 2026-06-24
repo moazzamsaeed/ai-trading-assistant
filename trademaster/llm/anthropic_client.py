@@ -29,10 +29,10 @@ DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_MAX_TOKENS = 4096
 
 
-def _client() -> anthropic.AsyncAnthropic:
+def _client(timeout_s: float = DEFAULT_TIMEOUT_S) -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(
         api_key=get_settings().anthropic_api_key.get_secret_value(),
-        timeout=DEFAULT_TIMEOUT_S,
+        timeout=timeout_s,
     )
 
 
@@ -67,9 +67,15 @@ async def complete(
     *,
     model: str = "claude-opus-4-7",
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> LLMResponse:
-    """Single-turn Messages API call. Retries on rate-limit and 5xx."""
-    client = _client()
+    """Single-turn Messages API call. Retries on rate-limit and 5xx.
+
+    `timeout_s` overrides the per-request timeout — raise it for long-form,
+    latency-insensitive jobs (e.g. the once-daily pre-market briefing) so a
+    multi-thousand-token synthesis doesn't trip the hot-path 30s default.
+    """
+    client = _client(timeout_s)
     started = time.perf_counter()
 
     retrying = retry(

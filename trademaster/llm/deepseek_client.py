@@ -37,11 +37,11 @@ DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_MAX_TOKENS = 4096
 
 
-def _client() -> AsyncOpenAI:
+def _client(timeout_s: float = DEFAULT_TIMEOUT_S) -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key=get_settings().deepseek_api_key.get_secret_value(),
         base_url=BASE_URL,
-        timeout=DEFAULT_TIMEOUT_S,
+        timeout=timeout_s,
     )
 
 
@@ -69,9 +69,13 @@ async def complete(
     *,
     model: str,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> LLMResponse:
-    """Single-turn chat call. `model` is `deepseek-v4-pro` or `deepseek-v4-flash`."""
-    client = _client()
+    """Single-turn chat call. `model` is `deepseek-v4-pro` or `deepseek-v4-flash`.
+
+    `timeout_s` overrides the per-request timeout for long-form jobs.
+    """
+    client = _client(timeout_s)
     started = time.perf_counter()
 
     retrying = retry(
