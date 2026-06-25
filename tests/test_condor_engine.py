@@ -26,22 +26,27 @@ def test_calm_day_sells_condor():
     assert CONDOR_VERSION in d.reason
 
 
-def test_trending_day_holds():
-    d = decide_condor(spot=600.0, vix1d=12.0, prior_adx=ADX_MAX, minutes_to_close=MTC)
-    assert d.action == "HOLD" and "trending" in d.reason
-    assert d.short_put is None
+def test_high_adx_trades_in_v2():
+    # v2 (2026-06-25): the prior-day DAILY-ADX gate was DROPPED. A high-ADX but
+    # calm-VIX1D day now TRADES (validated by scripts/backtest_condor_vix_gate.py).
+    d = decide_condor(spot=600.0, vix1d=12.0, prior_adx=45.0, minutes_to_close=MTC)
+    assert d.action == "SELL_CONDOR"
+    assert d.short_put is not None
 
 
-def test_crisis_vol_holds():
+def test_high_vol_holds():
+    # VIX1D at/above the cap (now 35) → stand aside.
     d = decide_condor(spot=600.0, vix1d=VIX1D_MAX, prior_adx=15.0, minutes_to_close=MTC)
-    assert d.action == "HOLD" and "crisis" in d.reason
+    assert d.action == "HOLD" and "VIX1D" in d.reason
 
 
 def test_missing_inputs_hold():
-    assert decide_condor(None, 12.0, 18.0, MTC).action == "HOLD"
-    assert decide_condor(600.0, None, 18.0, MTC).action == "HOLD"
-    assert decide_condor(600.0, 12.0, None, MTC).action == "HOLD"
-    assert decide_condor(0.0, 12.0, 18.0, MTC).action == "HOLD"
+    assert decide_condor(None, 12.0, 18.0, MTC).action == "HOLD"       # spot
+    assert decide_condor(600.0, None, 18.0, MTC).action == "HOLD"      # vix1d
+    assert decide_condor(600.0, 12.0, 18.0, None).action == "HOLD"     # minutes_to_close
+    assert decide_condor(0.0, 12.0, 18.0, MTC).action == "HOLD"        # spot <= 0
+    # v2: prior_adx is telemetry-only — None no longer blocks the trade.
+    assert decide_condor(600.0, 12.0, None, MTC).action == "SELL_CONDOR"
 
 
 def test_higher_vix_widens_strikes():

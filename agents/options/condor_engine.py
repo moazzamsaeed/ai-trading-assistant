@@ -4,9 +4,11 @@ Pure, reproducible, backtestable, auditable — the options-side analogue of
 agents/directional/signal_engine.py. Mirrors scripts/backtest_wide_condor.py
 EXACTLY so the live decision matches the validated backtest:
 
-  • REGIME FILTER: trade only on calm days — prior-day Wilder ADX < 25 AND
-    VIX1D < 40 (vol points). Trending / crisis days → HOLD (the 43% of days the
-    edge avoids; see docs/STRANGLE_STRATEGY_DESIGN.md §4d).
+  • REGIME FILTER (v2, 2026-06-25): trade when forward VIX1D < 35 (vol points).
+    The prior-day DAILY-ADX gate was DROPPED — it was over-conservative (skipped
+    calm-implied-vol days that the validation gate showed are tradeable; see
+    scripts/backtest_condor_vix_gate.py: VIX1D<35 alone → DSR 99%, ~2× coverage).
+    prior_adx is retained as telemetry only. High-vol days → HOLD.
   • STRIKES: short put / short call at spot ∓ 0.5 × (VIX1D expected move),
     long wings $5 further OTM. Expected move EM = spot · VIX1D · √T, T in
     TRADING time (252×390 min/yr) — MUST match VIX1D's trading-time annualization
@@ -26,11 +28,17 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-CONDOR_VERSION = "vrp_condor_v1"
+CONDOR_VERSION = "vrp_condor_v2"
 
 # --- rules (promote to settings.* when tuning; kept as constants for parity) ---
-ADX_MAX = 25.0            # prior-day Wilder ADX ≥ this → trending → HOLD
-VIX1D_MAX = 40.0          # VIX1D (vol points) ≥ this → crisis vol → HOLD
+# v2 (2026-06-25): GATE on forward VIX1D ONLY; the prior-day DAILY-ADX gate was
+# dropped — backtest (scripts/backtest_condor_vix_gate.py) showed it was
+# over-conservative: VIX1D<35 alone PASSES the validation gate (DSR 99%, OOS
+# Sharpe +2.54 after costs) while trading ~2× the days the daily-ADX filter
+# skipped (calm-implied-vol but daily-trending days). prior_adx is now
+# TELEMETRY ONLY (logged, never gates) — see [[project_condor_vix_gate]].
+VIX1D_MAX = 35.0          # VIX1D (vol points) ≥ this → too rich/crisis vol → HOLD
+ADX_MAX = 25.0            # DEPRECATED as a gate in v2; retained for reference/telemetry
 K_SHORT = 0.5             # short strikes at 0.5 × expected move
 WING = 5.0                # long-wing width ($)
 STOP_MULT = 1.5           # intraday stop: exit when buy-back ≥ (1 + STOP_MULT)×credit
@@ -116,14 +124,13 @@ def decide_condor(
         return CondorDecision("HOLD", f"{CONDOR_VERSION}: {reason}",
                               vix1d=vix1d, prior_adx=prior_adx)
 
-    if None in (spot, vix1d, prior_adx, mtc) or spot <= 0:
-        return hold("inputs missing (spot/vix1d/adx/time)")
+    # v2: prior_adx is telemetry only — NOT required and NOT a gate.
+    if None in (spot, vix1d, mtc) or spot <= 0:
+        return hold("inputs missing (spot/vix1d/time)")
     if vix1d <= 0:
         return hold(f"invalid VIX1D ({vix1d})")
     if vix1d >= VIX1D_MAX:
-        return hold(f"crisis vol (VIX1D {vix1d:.1f} ≥ {VIX1D_MAX:.0f}) — stand aside")
-    if prior_adx >= ADX_MAX:
-        return hold(f"trending (prior-day ADX {prior_adx:.1f} ≥ {ADX_MAX:.0f}) — stand aside")
+        return hold(f"vol too rich (VIX1D {vix1d:.1f} ≥ {VIX1D_MAX:.0f}) — stand aside")
 
     T = max(mtc, 1.0) / YEAR_MIN
     em = spot * (vix1d / 100.0) * math.sqrt(T)
@@ -137,8 +144,9 @@ def decide_condor(
     if not (long_put < short_put < short_call < long_call):
         return hold(f"degenerate strikes ({long_put}/{short_put}/{short_call}/{long_call})")
 
-    reason = (f"{CONDOR_VERSION}: calm (ADX {prior_adx:.1f}<{ADX_MAX:.0f}, "
-              f"VIX1D {vix1d:.1f}<{VIX1D_MAX:.0f}); EM ${em:.2f} → condor "
+    adx_note = f", ADX {prior_adx:.1f}" if prior_adx is not None else ""
+    reason = (f"{CONDOR_VERSION}: calm (VIX1D {vix1d:.1f}<{VIX1D_MAX:.0f}{adx_note}); "
+              f"EM ${em:.2f} → condor "
               f"{long_put:.0f}/{short_put:.0f} - {short_call:.0f}/{long_call:.0f}")
     return CondorDecision(
         "SELL_CONDOR", reason,
