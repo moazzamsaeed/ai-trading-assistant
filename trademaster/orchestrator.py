@@ -57,6 +57,7 @@ async def _run() -> None:
             signal_poster=bot.post_signal,
             trade_poster=bot.post_trade,
             log_poster=bot.post_log,
+            stock_signal_poster=bot.post_stock_signal,
         )
         scheduler.start()
 

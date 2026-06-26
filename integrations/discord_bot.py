@@ -81,6 +81,7 @@ class TradeMasterBot(commands.Bot):
         self._trades_channel_id = _chan(settings.discord_channel_trades)
         self._logs_channel_id = _chan(settings.discord_channel_logs)
         self._watchlist_channel_id = _chan(settings.discord_channel_watchlist)
+        self._stock_signals_channel_id = _chan(settings.discord_channel_stock_signals)
         self._guild_id = _chan(settings.discord_guild_id)
         self._app_ready = asyncio.Event()
         self._owner_id: int | None = None
@@ -178,6 +179,10 @@ class TradeMasterBot(commands.Bot):
     async def post_watchlist(self, text: str) -> None:
         """Current watchlist snapshot — posted on add/remove/seed."""
         await self.post(self._watchlist_channel_id, text)
+
+    async def post_stock_signal(self, text: str) -> None:
+        """Alert-only equities scanner signal (#stock-signals)."""
+        await self.post(self._stock_signals_channel_id, text)
 
     # ---------- slash commands ----------
 

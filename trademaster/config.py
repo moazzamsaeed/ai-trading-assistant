@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # companion change — conviction did not predict edge, so don't up-size HIGH.
     directional_puts_only: bool = False
 
+    # Isolated, alert-only equities signal scanner (separate stock watchlist +
+    # Discord channel; no execution, no shared capital/risk with SPY strategies).
+    enable_equities_scanner: bool = False
+
     # Event-day blackout (NFP/CPI/FOMC). Disabled 2026-06-05 to let the LLM
     # trade event days during the paper-validation phase — we want data on every
     # regime, including high-volatility catalyst days, before deciding whether
@@ -197,6 +201,7 @@ class Settings(BaseSettings):
     discord_channel_logs: str = ""
     discord_channel_commands: str = ""
     discord_channel_watchlist: str = ""
+    discord_channel_stock_signals: str = ""  # equities scanner alerts (#stock-signals)
 
     database_url: str = "sqlite:///data/trademaster.db"
 

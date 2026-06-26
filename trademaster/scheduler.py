@@ -819,6 +819,44 @@ async def _trade_health_check_job(
         log.info("trade_health_check_clean")
 
 
+async def _equities_scan_job(
+    *,
+    stock_signal_poster: Poster,
+    log_poster: Poster = _noop_poster,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+) -> None:
+    """ALERT-ONLY equities scan: run the trend engine over the separate equities
+    watchlist and post plain-language buy-call/buy-put signals to #stock-signals.
+    NEVER executes — fully isolated from the SPY condor/trend strategies."""
+    from agents.equities.scanner import (
+        actionable_changed, format_equities_signal, run_equities_scan,
+    )
+    try:
+        clock = await clock_fetcher()
+        if not clock.is_open:
+            log.info("equities_scan_skipped_closed")
+            return
+    except Exception as e:  # noqa: BLE001 — proceed; per-ticker fetch is fail-open
+        log.warning("equities_scan_clock_failed", error=str(e))
+    try:
+        decisions = await run_equities_scan()
+    except Exception as e:  # noqa: BLE001
+        log.warning("equities_scan_failed", error=str(e))
+        await log_poster(f"equities scan failed: {e}")
+        return
+    posted = 0
+    for d in decisions:
+        if not actionable_changed(d):
+            continue
+        price = (d.analysis or {}).get("spy_price")  # key name is legacy; holds the ticker price
+        try:
+            await stock_signal_poster(format_equities_signal(d, price=price))
+            posted += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("equities_signal_post_failed", ticker=d.ticker, error=str(e))
+    log.info("equities_scan_complete", n_decisions=len(decisions), posted=posted)
+
+
 def make_scheduler(
     *,
     research_poster: Poster,
@@ -826,6 +864,7 @@ def make_scheduler(
     trade_poster: Poster,
     log_poster: Poster | None = None,
     enable_iron_condor: bool | None = None,
+    stock_signal_poster: Poster | None = None,
 ) -> AsyncIOScheduler:
     """Build an AsyncIOScheduler with all standing jobs registered.
 
@@ -1057,6 +1096,24 @@ def make_scheduler(
             id="iron_condor_force_close",
             replace_existing=True,
             misfire_grace_time=120,
+        )
+
+    # Isolated, alert-only equities scanner — registered only when enabled AND a
+    # poster is wired. 15-min RTH, offset from the SPY scan's :00/:15/:30/:45 to
+    # avoid simultaneous data-fetch bursts. No execution; no SPY-strategy coupling.
+    if get_settings().enable_equities_scanner and stock_signal_poster is not None:
+        scheduler.add_job(
+            _equities_scan_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-15",
+                minute="5,20,35,50",
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={"stock_signal_poster": stock_signal_poster, "log_poster": log_post},
+            id="equities_scan",
+            replace_existing=True,
+            misfire_grace_time=300,
         )
 
     log.info("scheduler_built", jobs=[j.id for j in scheduler.get_jobs()])
