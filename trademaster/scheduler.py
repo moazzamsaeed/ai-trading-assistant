@@ -830,6 +830,7 @@ async def _equities_scan_job(
     NEVER executes — fully isolated from the SPY condor/trend strategies."""
     from agents.equities.scanner import (
         actionable_changed, format_equities_signal, run_equities_scan,
+        write_signals_snapshot,
     )
     try:
         clock = await clock_fetcher()
@@ -844,6 +845,7 @@ async def _equities_scan_job(
         log.warning("equities_scan_failed", error=str(e))
         await log_poster(f"equities scan failed: {e}")
         return
+    write_signals_snapshot(decisions)  # current-state file for the Mission Control dashboard
     posted = 0
     for d in decisions:
         if not actionable_changed(d):

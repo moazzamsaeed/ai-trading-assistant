@@ -113,6 +113,22 @@ async def test_run_equities_scan_fail_open(monkeypatch):
     assert "BBB" not in tickers      # raising ticker was isolated, not fatal
 
 
+def test_write_signals_snapshot(tmp_path):
+    import json
+    decisions = [
+        _decision("BUY_PUT", "MEDIUM", "META", 550.0),
+        TickerDecision("QQQ", "HOLD", None, None, "LOW", "trend_follow_v2: weak trend"),
+    ]
+    path = tmp_path / "equities_signals.json"
+    scanner.write_signals_snapshot(decisions, now=NOW, path=path)
+    data = json.loads(path.read_text())
+    assert "updated_at" in data
+    by = {s["ticker"]: s for s in data["signals"]}
+    assert by["META"]["action"] == "BUY_PUT" and by["META"]["conviction"] == "MEDIUM"
+    assert by["META"]["price"] == 550.0           # from analysis (actionable)
+    assert by["QQQ"]["action"] == "HOLD" and by["QQQ"]["price"] is None  # HOLD included, no price
+
+
 @pytest.mark.asyncio
 async def test_run_equities_scan_skips_empty_bars(monkeypatch):
     monkeypatch.setattr(scanner, "equities_tickers", lambda: ["AAA"])

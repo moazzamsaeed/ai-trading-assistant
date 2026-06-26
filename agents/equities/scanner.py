@@ -10,6 +10,7 @@ job lives in `trademaster/scheduler.py`.
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,6 +24,9 @@ from trademaster.timeutils import to_et
 log = get_logger(__name__)
 
 EQUITIES_WATCHLIST_PATH = Path("data/watchlist_equities.json")
+# Current-state snapshot (latest decision per ticker) consumed read-only by the
+# Mission Control dashboard. Written every scan; includes HOLDs.
+EQUITIES_SIGNALS_PATH = Path("data/equities_signals.json")
 CONVICTIONS_POSTED = ("HIGH", "MEDIUM")
 
 
@@ -99,6 +103,43 @@ async def run_equities_scan(
         except Exception as e:  # noqa: BLE001 — isolate per-ticker failures
             log.warning("equities_scan_ticker_failed", ticker=t, error=str(e))
     return decisions
+
+
+def write_signals_snapshot(
+    decisions: list[TickerDecision],
+    *,
+    now: datetime | None = None,
+    path: Path = EQUITIES_SIGNALS_PATH,
+) -> None:
+    """Persist the latest decision per ticker to a JSON file for the Mission
+    Control dashboard (a read-only consumer). Includes HOLDs so the table shows
+    current state for every stock. Best-effort — never raises into the scan.
+
+    Shape: {"updated_at": iso, "signals": [{ticker, action, conviction,
+    reasoning, price}]}. `price` is the scan-time last_close when available
+    (None for HOLDs); the dashboard shows a live price separately.
+    """
+    now = now or datetime.now(UTC)
+    try:
+        out = {
+            "updated_at": now.isoformat(),
+            "signals": [
+                {
+                    "ticker": d.ticker,
+                    "action": d.action,
+                    "conviction": d.conviction,
+                    "reasoning": d.reasoning,
+                    "price": (d.analysis or {}).get("spy_price"),  # legacy key = ticker price
+                }
+                for d in decisions
+            ],
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(out, indent=2))
+        tmp.replace(path)  # atomic swap so the dashboard never reads a half-written file
+    except Exception as e:  # noqa: BLE001
+        log.warning("equities_signals_snapshot_failed", error=str(e))
 
 
 def format_equities_signal(d: TickerDecision, *, price: float | None = None) -> str:
