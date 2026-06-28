@@ -34,3 +34,12 @@ Phase 4 plan is fully designed and approved. Implementation begins next session.
 
 ## TradeMaster repo: NO CHANGES for Phase 4
 All Phase 4 work is in the two new repos. `ai-trading-assistant/` is read-only from the ecosystem's perspective.
+
+## ⭐ LIVE OPERATIONAL STATE (verified 2026-06-28 — supersedes the design notes above where they differ)
+Hermes is BUILT and running, not just designed:
+- **Agent install:** `~/.hermes/hermes-agent/` (Python pkg + own venv + CLI `hermes_cli`). Runtime home `~/.hermes/` holds the real `config.yaml`, `.env` (secrets), `SOUL.md` (persona), `state.db` (~138MB), `sessions/`, `memories/` (Hermes's OWN memory, separate from Claude Code's), `kanban.db`, `cron/`, `hooks/`, `skills/` (28 dirs).
+- **Always-on service:** `hermes-gateway.service` (user systemd, ACTIVE since ~06-22) = `hermes_cli gateway run` — the Discord/messaging integration. Listens in #hermes, posts to #status. This is how you reach Hermes. Telegram/WhatsApp configured-but-off.
+- **Config repo:** `~/projects/hermes-config/` — `registry.yaml` (single source of truth; currently only `trademaster`; Mission Control reads the SAME file), `config.yaml`, `skills/` (core/run_claude_code.yaml = delegate to Claude Code; trademaster/{status,logs,restart,watchlist,backtest}.yaml). Model = Claude Sonnet 4.6 (BYO Anthropic key).
+- **⚠️ Port-9119 admin dashboard NOT running** (config defines it; nothing listening) — the gateway is the active surface, Mission Control is the visual dashboard.
+- **Crons are Hermes-INTERNAL** (`hermes_cli cron` / `~/.hermes/cron/`), NOT systemd timers — so a systemd/crontab check shows nothing. The weekly-review cron + autocommit hook live here; macro-news cron disabled (see [[project_hermes_learning_loop]]).
+- How it ties together: you message Hermes in Discord → it uses Sonnet 4.6 + skills/registry to operate registered projects (status/logs/restart/backtest) and delegate coding to Claude Code (tracked on Kanban). TradeMaster = one registered "lego piece".

@@ -1,7 +1,7 @@
 - [User profile](user_role.md) — retail trader/dev building personal-projects ecosystem; TradeMaster is one component
 - [Signal format rules](feedback_signal_jargon.md) — manual trading signals in #signals must be plain language, no options jargon
 - [TradeMaster overview](project_trademaster_overview.md) — what the system is + current build state
-- [Current focus + next steps](project_current_focus.md) — ⭐ AS OF 06-25: first $10k paper week (condor+trend). Condor v2 (VIX1D<35) shipped, goes live Fri 06-26. Trend leg confirmed −EV (1-min backtest + live). Edge = SELLING premium (condor), not buying. Week ~flat (+$192, one lucky trade).
+- [Current focus + next steps](project_current_focus.md) — ⭐ AS OF 06-28: paper wk1 done GREEN (~$10,238). Condor v2 (VIX1D<35) LIVE, FIRST trade 06-26 = WIN +$46 (track fill haircut). Equities scanner + Mission Control "Stock Signals" section LIVE (first signals Mon 06-29; user restart MC). Hermes mapped. Open threads in doc.
 - [Loss-prevention package + news fix](project_loss_prevention_package.md) — 06-08→06-12 week of fixes: trailing stop, thesis-invalidation exit, freshness gate (3rd-trade was 0-for-4), conviction/RSI/ADX sizing, 0DTE early-cut, chop filters, exit-race fix, #trades reporting, and the bot-was-news-blind parse bug. All knobs provisional.
 - [ADX calibration pending](project_adx_calibration_pending.md) — durable systemd timer auto-runs scripts/calibrate_adx.py on 2026-06-17 ~8 AM ET → posts to #logs. ADX 18/25 + chop knobs are first-pass; entry_adx/rsi9 now persisted for tuning.
 - [Phase 4 ecosystem decisions](project_phase4_ecosystem.md) — Hermes + Mission Control key design decisions, do not re-debate

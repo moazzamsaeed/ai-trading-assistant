@@ -1,10 +1,28 @@
 ---
-name: Current focus — paper week 1 results + condor v2 gate (as of 2026-06-25)
-description: As of 2026-06-25. First $10k paper week of the condor+trend build. Condor v2 (VIX1D<35) shipped, goes live Fri 06-26. Trend leg confirmed −EV. Full trade-by-trade record in linked memories.
+name: Current focus — paper week 1 done + condor v2 first WIN + equities scanner & MC section live (as of 2026-06-28)
+description: As of 2026-06-28. Paper week 1 complete. Condor v2 (VIX1D<35) live, took its first trade 06-26 = WIN +$46. Equities signal scanner + Mission Control "Stock Signals" section shipped. Hermes setup mapped. Open threads below.
 type: project
 originSessionId: 788694ac-3dc6-4a75-8ce6-fb5dfedd7148
 ---
-## ⭐⭐ Status as of 2026-06-25 (CURRENT — first paper week of the condor+trend build)
+## ⭐⭐⭐ Status as of 2026-06-28 (CURRENT — handoff after a big build session)
+
+**Paper week 1 (06-22→26) DONE, GREEN, and the proven edge fired.** Effective capital ~$10,238 (+$238 / +2.4%). The week's signal: the CONDOR (the +EV edge) finally traded and won.
+
+- **CONDOR v2 (VIX1D<35 gate) IS LIVE and took its FIRST trade 06-26 = WIN +$46.** Shipped `6cc1d20`: dropped the over-conservative prior-day DAILY-ADX gate (it shut the condor out all week as daily ADX climbed 26.8→45.8), replaced with forward VIX1D<35 (backtest `scripts/backtest_condor_vix_gate.py`: DSR 99%, ~2× coverage). #83 fired on exactly the day v1 would've blocked (prior-day ADX 45.8 but VIX1D 28.6), held to 15:50 force-close, kept ~96% of credit. ⚠️ **TRACK the entry-fill HAIRCUT** (the 4-leg cost-fragility): #83 filled $48 vs $58.50 model = 17.9%; `scripts/condor_fill_tracker.py` reads it from the DB across fills. n=1 — if ~18% persists it erodes the edge. See [[project_condor_vix_gate]].
+- **TREND leg = −EV, fully confirmed** (1-min-with-costs backtest + live). 4 trades wk1 net +$192 but carried by ONE lucky put (#82). Exit machinery (S/R gate, theta backstop, trailing stop) all validated live. See [[project_exit_theta_gap]], [[project_1min_backtest_verdict]].
+- **NEW: isolated alert-only EQUITIES SIGNAL SCANNER — LIVE 06-26.** 9 stocks (META/QQQ/AMZN/MSFT/NVDA/GOOGL/SNOW/PLTR/MU) through the SAME trend engine → plain-language buy-call/put signals to Discord #stock-signals. NO execution, fully separate from SPY. `ENABLE_EQUITIES_SCANNER=true`, channel `1520182662042615982`. First real signals Mon 06-29. See [[project_equities_scanner]].
+- **NEW: Mission Control "Stock Signals" dashboard section** (separate `~/projects/mission-control` repo, `03dff91`): top-level section, table of the 9 stocks w/ LIVE Alpaca price + latest signal per row. ⚠️ **USER MUST RESTART their Mission Control server** (`cd ~/projects/mission-control && npm run build && npm run start`) to see it. See [[project_equities_scanner]].
+- **HERMES setup mapped 06-28** (corrects the 44-day-old design memory): runs as `~/.hermes/hermes-agent` gateway service (active), config in `~/projects/hermes-config` (registry.yaml + skills), Sonnet 4.6, Discord-driven. Port-9119 admin dashboard NOT running. See [[project_phase4_ecosystem]].
+- **Briefing fix** (`64c4e97`) verified working (Anthropic-primary + 180s timeout); **holiday-warmup fix** (`8ca8034`); **per-ticker decision logging** (`de805e1`). All shipped wk1.
+
+**⏳ OPEN THREADS (resume here):**
+1. **Track condor entry-fill haircut across next week's fills** — run `scripts/condor_fill_tracker.py` as condors fill 06-29+; watch the avg trend (down = edge survives, ~18%+ persistent = cost-fragility problem).
+2. **Equities scanner first live signals Mon 06-29** — watch #stock-signals; confirm it posts cleanly.
+3. **Mission Control** — user to restart MC server for the Stock Signals section.
+4. Everything committed+pushed (trading repo HEAD `a78adb4`; MC `03dff91`). Memory backed up to GitHub `docs/agent-memory/`. Daemon paper Mon-Fri 7:45-16:15 ET.
+
+---
+## Status as of 2026-06-25 (first paper week of the condor+trend build)
 
 **THE WEEK (06-22→06-26): $10k paper, deterministic condor + S/R trend engine both live. Effective capital ≈ $10,192 (~+$192, ~flat — one big winner carrying the −EV leg).**
 
