@@ -48,7 +48,7 @@
 **H3. SPY-only beats multi-ticker**
 - Origin: failure mode #1 — individual stocks indistinguishable from coin flip directionally.
 - Evidence: pre-pivot multi-ticker win rate ~21%. Need SPY-only baseline.
-- Disproves if: SPY-only win rate stays ≤25% after n=40.
+- Disproves if: SPY-only win rate stays ≤25% after n=40, **OR SPY expectancy stays ≤$0/trade after n=40** (added 2026-06-28: a positive win rate with negative expectancy does not validate H3 — "beats multi-ticker" must mean makes money, not just wins more often. First read: SPY win 44.7% but net −$1,980 / expectancy negative on n=47).
 
 **H4. Standard intraday indicators (VWAP/RSI/EMA/MACD) lack edge**
 - Origin: 21% win rate across 33+ trades with this indicator set.
@@ -59,7 +59,7 @@
 **H5. MEDIUM conviction 0DTE on SPY is acceptable (vs blocked for stocks)**
 - Origin: failure mode #4 — MEDIUM block was correct for illiquid stocks; assumed not needed for SPY.
 - Evidence: n=0 with new config. **Risk:** if MEDIUM trades dominate losses, this assumption is wrong.
-- Disproves if: MEDIUM trades have win rate <15% over n=10.
+- Disproves if: MEDIUM trades have win rate <15% over n=10, **OR MEDIUM expectancy is materially below HIGH expectancy at n≥10** (added 2026-06-28: win rate alone is insufficient. First read: MEDIUM win 39% (n=23) clears the 15% floor but net −$2,914 — the worst tier, worse than UNKNOWN, while HIGH is +$697. A decent win rate with the worst expectancy is not "acceptable").
 
 ---
 
@@ -267,3 +267,5 @@
   - **Wed 06-03:** 0 trades. 7 BUY_PUT signals all blocked by the strike-range bug (see I8); 52 near-misses, all correctly-held puts in a choppy NEUTRAL range (no follow-through). The daily-trade count cap (6) was never hit — budget was never the constraint.
   - **Signal/observability upgrades shipped this week:** trade health-check daily cron (`77d4dc2`); LLM context enrichment — intraday price-path, open-position/today-outcome awareness, consolidated key-levels map (`e792807`); full trade-lifecycle #signals messaging — plan → entry → per-tier scale-out → close, with a green-light checklist (`fcd4898`); chain-fetch retry + no-dangling-plan skip notice (`7ebc1b4`).
   - **Put execution fix (`f2d2170`, I8):** the binding constraint on the bearish side. Puts can finally fill as of 2026-06-04.
+- **2026-06-28** — **Self-learning loop Phase 1 (feature capture)** — `agents/directional/executor.py::_persist_entry` now logs (pure observability, zero trade-behavior change, 591 tests pass): `entry_hour_et`/`entry_et`, `spy_regime`/`vol_regime`/`entry_vix` (surfaced via `intraday._build_analysis`), and entry fill-cost `entry_quote_mid`/`entry_quote_ask`/`entry_fill_haircut_per_share`. The hypothesis engine now reports `by_hour_et` (retroactive from opened_at) and `by_vol_regime` cohorts → the "hour-of-day" and "vol-regime" open questions below are now answerable. First read: 10:00 ET expectancy +$214/trade (n=11) vs negative 9/12/13 ET. Design: `docs/SELF_LEARNING_LOOP.md`. Deferred: true VIX1D (needs chain fetch) and exit-side fill-haircut.
+- **2026-06-28** — Added the **hypothesis-review engine** (`scripts/hypothesis_review.py`): for each active hypothesis (H1–H5) it gathers evidence and asks Sonnet 4.6 for a verdict against that hypothesis's own "disproves if" criterion, proposing specific KB edits (human-applied, same as the weekly review). Evidence = live-DB stats always (per-ticker→H3, per-conviction→H5, peak buckets/tier hits→H1, peak-to-realized gap→H2, post-2026-05-28 SPY cohort→H4) + opt-in historical backtests (`--backtests` runs `backtest_trend_0dte`/`backtest_engine` for H3/H4). Folded into the Friday cron (`d56f500aa927`) DB-only; deep backtest runs are on-demand. Hypotheses are mirrored as a hardcoded `HYPOTHESES` registry in the script — **when you add/retire a hypothesis here, update that list too.** Writes `data/hypotheses/YYYY-MM-DD.md`.

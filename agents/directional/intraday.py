@@ -409,6 +409,11 @@ def _build_analysis(action: str, snap: dict, ctx: dict) -> dict:
         "volume_ratio": fnum(snap.get("volume_ratio_20")),
         "adx": fnum(snap.get("adx")),
         "next_target": _next_target(action, price, ctx),
+        # Phase-1 observability (pure logging — carried so the executor can
+        # persist regime/vol context with each trade; nothing here gates a trade).
+        "spy_regime": ctx.get("spy_regime"),
+        "vol_regime": ctx.get("vol_regime"),
+        "vix": fnum(ctx.get("vix")),
         # Levels carried for the re-entry freshness gate (scheduler fix B).
         "session_high": ctx.get("session_high"),
         "session_low": ctx.get("session_low"),
