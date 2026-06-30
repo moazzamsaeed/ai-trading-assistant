@@ -95,12 +95,25 @@ HYPOTHESES = [
         ),
         "evidence": ["by_conviction", "backtest_engine"],
     },
+    {
+        "id": "H6",
+        "title": "The early-afternoon (~12:00-13:00 ET) entry window is structurally weak",
+        "disprove": (
+            "the backtest shows 12-13 ET is NOT worse than other hours over "
+            "2023-2026 (avg favorable move at 12-13 ET ~= other hours) => the live "
+            "13ET loss cluster was small-sample variance. Confirms only if BOTH the "
+            "backtest hour buckets show 12-13 ET structurally negative AND live "
+            "by_hour_et keeps 12-13 ET worst at n>=40."
+        ),
+        "evidence": ["by_hour_et", "backtest_hour_of_day"],
+    },
 ]
 
 # Backtest CLIs invoked as `python -m <module> <args...>` from the project root.
 BACKTESTS: dict[str, list[str]] = {
     "backtest_trend_0dte": ["-m", "scripts.backtest_trend_0dte", "SPY"],
     "backtest_engine": ["-m", "scripts.backtest_engine"],
+    "backtest_hour_of_day": ["-m", "scripts.backtest_hour_of_day", "SPY"],
 }
 
 

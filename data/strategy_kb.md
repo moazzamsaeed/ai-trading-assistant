@@ -61,6 +61,12 @@
 - Evidence: n=0 with new config. **Risk:** if MEDIUM trades dominate losses, this assumption is wrong.
 - Disproves if: MEDIUM trades have win rate <15% over n=10, **OR MEDIUM expectancy is materially below HIGH expectancy at n≥10** (added 2026-06-28: win rate alone is insufficient. First read: MEDIUM win 39% (n=23) clears the 15% floor but net −$2,914 — the worst tier, worse than UNKNOWN, while HIGH is +$697. A decent win rate with the worst expectancy is not "acceptable").
 
+**H6. The early-afternoon (≈12:00–13:00 ET) entry window is structurally weak — skip it**
+- Origin (2026-06-29): conviction × hour-of-day cross-tab on live directional trades found 13:00 ET is a loss graveyard across ALL conviction tiers (13ET: HIGH −$565/trade n=5, MEDIUM −$375 n=5, row −$241/trade n=22, win 18%); 12ET also negative (−$68/trade n=15). This emerged from the H5 investigation: MEDIUM's bleed was ~half concentrated at 13ET, and HIGH's apparent edge was two n=1 outliers (14/15 ET +$2,150/+$2,001) — so the real signal is time-of-day, not conviction. Backtestable via `scripts/backtest_hour_of_day.py` (and `by_hour_et` in the hypothesis engine).
+- Confirms if: a 12–13 ET entry block raises overall directional expectancy out-of-sample (backtest hour buckets show negative avg favorable move at 12–13 ET vs positive elsewhere, on n≥hundreds/hour) AND live by_hour_et keeps showing 12–13 ET worst at n≥40.
+- Disproves if: the backtest shows 12–13 ET is NOT structurally worse (avg favorable move at 12–13 ET ≈ other hours over 2023–2026) — i.e. the live 13ET cluster was small-sample variance.
+- **Backtest verdict (2026-06-29, `backtest_hour_of_day` SPY, 8,082 trend signals 2023→2026, model-free 60m favorable move): 12–13 ET framing DISPROVED.** 13ET avg favorable move = −0.002% (≈flat, n=1437), 12ET = +0.004% (POSITIVE, n=1608) — the live −$241/trade 13ET graveyard (n=22) was mostly small-sample variance. **Reframe → the structurally weak window is the MORNING (9ET −0.013% n=509, 10ET −0.011% n=1323), corroborated by the live 9ET row (−$464/trade). Strongest hour = 14ET (+0.022%).** Caveat: model-free (no theta/spread); magnitudes are basis points, so after 0DTE costs the directional edge is marginal at every hour — consistent with [[project_strategy_review_0618]] (no demonstrated directional edge). Next: re-test as a MORNING-skip (block 9–10 ET) on the cost-aware engine backtest before any live change.
+
 ---
 
 ## Dead hypotheses (tested, rejected)
