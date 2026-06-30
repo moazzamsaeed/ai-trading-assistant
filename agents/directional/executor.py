@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
@@ -33,6 +34,8 @@ from trademaster.db import Trade, make_session_factory
 from trademaster.logging import get_logger
 
 log = get_logger(__name__)
+
+ET = ZoneInfo("America/New_York")  # for entry-time-of-day observability logging
 
 STRATEGY_CALL = "directional_call"
 STRATEGY_PUT = "directional_put"
@@ -120,8 +123,21 @@ def _persist_entry(
     order: OrderResult,
     entry_reasoning: str = "",
     entry_indicators: dict | None = None,
+    entry_quote_mid: Decimal | None = None,
+    entry_quote_ask: Decimal | None = None,
 ) -> int:
     strategy = STRATEGY_CALL if action == "BUY_CALL" else STRATEGY_PUT
+    ind = entry_indicators or {}
+    # Entry fill-haircut: how far above mid we actually filled (spread cost paid
+    # on the way in). filled-vs-mid in $/share. Pure observability — computed
+    # from data already in hand at fill time, no extra I/O, gates nothing.
+    fill_haircut = None
+    if entry_quote_mid is not None:
+        try:
+            fill_haircut = round(float(entry_premium) - float(entry_quote_mid), 4)
+        except (TypeError, ValueError):
+            fill_haircut = None
+    now_et = datetime.now(ET)
     row = Trade(
         symbol=occ,
         asset_class="option",
@@ -150,8 +166,20 @@ def _persist_entry(
             ),
             # Entry-time indicators, persisted for threshold calibration (e.g.
             # ADX gate tuning) — pair these with the trade's peak/outcome later.
-            "entry_adx": (entry_indicators or {}).get("adx"),
-            "entry_rsi9": (entry_indicators or {}).get("rsi9"),
+            "entry_adx": ind.get("adx"),
+            "entry_rsi9": ind.get("rsi9"),
+            # Phase-1 observability fields (self-learning loop). PURE LOGGING —
+            # none of these affect the trade; they let the hypothesis engine
+            # answer the KB's open questions (hour-of-day / vol-regime effects,
+            # fill-cost drag). See docs/SELF_LEARNING_LOOP.md.
+            "entry_hour_et": now_et.hour,
+            "entry_et": now_et.strftime("%H:%M"),
+            "spy_regime": ind.get("spy_regime"),
+            "vol_regime": ind.get("vol_regime"),
+            "entry_vix": ind.get("vix"),
+            "entry_quote_mid": str(entry_quote_mid) if entry_quote_mid is not None else None,
+            "entry_quote_ask": str(entry_quote_ask) if entry_quote_ask is not None else None,
+            "entry_fill_haircut_per_share": fill_haircut,
         },
     )
     session.add(row)
@@ -520,6 +548,8 @@ async def execute_directional_signal(
             order=final,
             entry_reasoning=decision.reasoning,
             entry_indicators=decision.analysis,
+            entry_quote_mid=getattr(quote, "mid", None),
+            entry_quote_ask=getattr(quote, "ask", None),
         )
 
     return DirectionalExecutionResult(
