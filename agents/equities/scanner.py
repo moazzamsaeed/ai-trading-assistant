@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agents.directional.intraday import TickerDecision
-from agents.directional.signal_engine import decide as _decide
+from agents.equities.strategy import decide_equity as _decide
 from integrations import alpaca_client
 from trademaster import indicators, watchlist
 from trademaster.logging import get_logger
@@ -99,7 +99,7 @@ async def run_equities_scan(
                 daily = await daily_fetcher(t, limit=12)
             except Exception:  # noqa: BLE001 — S/R is fail-open without dailies
                 daily = []
-            decisions.append(_decide(t, snap, _ticker_market_ctx(bars, daily, now), now))
+            decisions.append(_decide(t, bars, snap, _ticker_market_ctx(bars, daily, now), now))
         except Exception as e:  # noqa: BLE001 — isolate per-ticker failures
             log.warning("equities_scan_ticker_failed", ticker=t, error=str(e))
     return decisions
