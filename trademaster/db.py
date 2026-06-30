@@ -514,6 +514,39 @@ def get_closed_directional_trades(session_factory, *, start, end) -> list[dict]:
         return [_trade_detail(r) for r in rows]
 
 
+def get_condor_trades(session_factory, *, start, end) -> list[dict]:
+    """0DTE iron condors OPENED in [start, end) (UTC) — both still-open (held to
+    expiry) and closed. Feeds the daily #trades summary so a condor traded today
+    is reported even when it expires worthless and is only booked next morning.
+    (Filtered by opened_at because 0DTE open = expiry = the trading day.)"""
+    with session_factory() as session:
+        rows = session.execute(
+            select(Trade)
+            .where(Trade.strategy == "spy_0dte_ic")
+            .where(Trade.opened_at >= start)
+            .where(Trade.opened_at < end)
+            .order_by(Trade.opened_at)
+        ).scalars().all()
+        out = []
+        for r in rows:
+            e = r.extra or {}
+            out.append({
+                "id": r.id,
+                "credit": float(r.entry_price) if r.entry_price is not None else 0.0,
+                "qty": int(r.qty) if r.qty is not None else 0,
+                "opened_at": r.opened_at,
+                "closed_at": r.closed_at,
+                "realized_pnl_usd": (
+                    float(r.realized_pnl_usd) if r.realized_pnl_usd is not None else None),
+                "exit_reason": e.get("exit_reason"),
+                "short_put": e.get("short_put"), "long_put": e.get("long_put"),
+                "short_call": e.get("short_call"), "long_call": e.get("long_call"),
+                "max_loss_per_contract": e.get("max_loss_per_contract"),
+                "expiry": e.get("expiry"),
+            })
+        return out
+
+
 def day_bounds_utc(today=None) -> tuple[datetime, datetime]:
     """ET calendar-day [start, end) as UTC datetimes."""
     today = today or today_et()
