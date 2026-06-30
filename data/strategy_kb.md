@@ -143,6 +143,15 @@
 - **Lesson: `no_affordable_strike` / `spread_filtered_count=0` means "the strikes we *searched* were untradeable," NOT "the feed has no quotes."** Check the requested strike range before blaming market data. (This is the inverse of the I4/I7 silent-failure reflex — here the data was fine and the bug was ours.)
 - **Watch:** if BUY_PUT execution rate stays at zero now that puts can fill, re-investigate — but the structural blocker is gone.
 
+**I9. Winning 0DTE condor never booked — settlement gap (2026-06-29, trade #84)**
+- Trade #84 (SPY 0DTE iron condor, $58 credit, shorts 732P/742C) finished a near-max WIN (SPY closed inside 732–742, all legs worthless) but sat `open` in the DB hours after the close. Two failures stacked:
+  - **Intraday MLEG close rejected.** At 15:50 ET the force-close fired but Alpaca rejected the 4-leg `buy_to_close` with `APIError 42210000: "position intent mismatch, inferred: buy_to_open, specified: buy_to_close"` — the short call 742C had already been swept from the book before 15:50, so the order referenced a leg no longer held. (Same overloaded code as the IOC/position-not-in-book cases — audit message text, not just the code.)
+  - **Reconciler was directional-only.** `trademaster/reconciler.py` queried `closed_at IS NULL` rows only for `{directional_call, directional_put}`, so an open condor was invisible to it. Combined with the 16:15 `trademaster-stop.timer` firing before settlement, the row would have stayed a permanent phantom (NOT self-healed at next startup, as first assumed).
+- **Manual fix that day:** booked #84 at `realized +$58` (`exit_reason=expired_full_credit`).
+- **Code fix (2026-06-29):** the reconciler now settles expired condors by PAYOFF, not by order — parses leg strikes from the OCCs, fetches the underlying's expiry-day close (`get_daily_bars`), computes the iron-condor intrinsic (one side can finish ITM, capped at recorded max loss), books `(credit − debit) × qty` dated to 16:00 ET on expiry, `exit_reason=expired_settled`. Condor legs are registered so the reconciler's "broker-open-not-in-DB" check stops false-warning on them. 8 new tests in `tests/test_reconciler.py`.
+- **Pattern:** settlement of expiring positions must not depend on a live order succeeding (quotes vanish / legs get swept near expiry). Compute the deterministic expiry payoff from the underlying close. Also: any new strategy type must be covered by the reconciler, not just directional.
+- **Watch:** if any `spy_0dte_ic` row is still `open` the morning after its expiry, the startup settlement failed — escalate.
+
 ---
 
 ## Operational lessons (non-strategy, but affect outcomes)
