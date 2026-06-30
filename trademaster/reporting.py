@@ -57,6 +57,67 @@ def format_trade_closed(t: dict) -> str:
     return "\n".join(lines)
 
 
+def build_condor_outcome(c: dict, spot: float | None) -> dict:
+    """Resolve a condor's day-end outcome for the report.
+
+    Closed → its booked P&L. Open (held to expiry, not yet booked) → the SAME
+    payoff the reconciler books next morning, projected from the underlying's
+    expiry-day close. Pure: `spot` is that close (or None if unavailable). This is
+    read-only — it does NOT book the trade; the reconciler remains the source of
+    truth, so a worthless expiry shows up in the day-end report instead of vanishing.
+    """
+    from decimal import Decimal
+
+    from trademaster.reconciler import _condor_settlement_debit, _strike_from_occ
+
+    credit = float(c.get("credit") or 0.0)
+    qty = int(c.get("qty") or 0)
+    base = {"id": c.get("id"), "credit": credit, "qty": qty}
+
+    if c.get("closed_at") is not None:
+        return {**base, "realized": c.get("realized_pnl_usd"), "projected": False,
+                "status": f"closed ({c.get('exit_reason') or '?'})"}
+
+    legs = (c.get("short_put"), c.get("long_put"), c.get("short_call"), c.get("long_call"))
+    if spot is None or not all(legs):
+        return {**base, "realized": None, "projected": True,
+                "status": "open — mark unavailable"}
+
+    mlc = c.get("max_loss_per_contract")
+    sp, lp = _strike_from_occ(legs[0]), _strike_from_occ(legs[1])
+    sc, lc = _strike_from_occ(legs[2]), _strike_from_occ(legs[3])
+    debit = _condor_settlement_debit(
+        spot, short_put=sp, long_put=lp, short_call=sc, long_call=lc,
+        max_loss_per_contract=Decimal(str(mlc)) if mlc is not None else None)
+    realized = float((Decimal(str(credit)) - debit) * Decimal(qty))
+    if debit == 0:
+        status = (f"expired worthless — full credit (SPY {spot:.2f} inside "
+                  f"{float(sp):.0f}–{float(sc):.0f}); books next AM")
+    else:
+        status = f"expired breached @ SPY {spot:.2f} (projected); books next AM"
+    return {**base, "realized": realized, "projected": True, "status": status}
+
+
+def format_condor_summary(outcomes: list[dict], *, period: str) -> str:
+    """Iron-condor block for the daily #trades summary (empty string if none)."""
+    if not outcomes:
+        return ""
+    rows = [f"{'#':>3} {'CREDIT':>6} {'QTY':>3} {'P&L':>8} STATUS"]
+    net = 0.0
+    for o in outcomes:
+        r = o.get("realized")
+        pnl_str = f"{r:>+8.0f}" if r is not None else f"{'?':>8}"
+        if r is not None:
+            net += r
+        rows.append(f"{(o.get('id') or 0):>3} {o.get('credit', 0):>6.0f} "
+                    f"{o.get('qty', 0):>3} {pnl_str} {o.get('status', '')}")
+    table = "```\n" + "\n".join(rows) + "\n```"
+    note = ("\n_Projected = expired at the 4 PM close; the reconciler books it at "
+            "the next startup._") if any(o.get("projected") for o in outcomes) else ""
+    sign = "🟢" if net >= 0 else "🔴"
+    return f"🦅 **Iron Condor — {period}**\n{table}\n{sign} **net ${net:+,.0f}**{note}"
+
+
 def format_trades_summary(trades: list[dict], *, title: str, period: str) -> str:
     """Tabular daily/weekly summary for #trades. P&L includes scale-out partials."""
     if not trades:
