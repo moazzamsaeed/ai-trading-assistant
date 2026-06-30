@@ -268,7 +268,7 @@ async def run_iron_condor_strategist(
     *,
     target_short_abs_delta: Decimal = Decimal("0.16"),
     wing_width: Decimal = Decimal("5"),
-    qty: int = 1,
+    qty: int | None = None,
     now: datetime | None = None,
     session_factory: Callable[[], Session] | None = None,
     stock_fetcher: Callable[[str], object] = alpaca_client.get_latest_stock_quote,
@@ -288,6 +288,7 @@ async def run_iron_condor_strategist(
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
     expiry: date = now.date()
+    qty = qty if qty is not None else get_settings().condor_contracts  # capped ≤2 in config
 
     # 1. SPY quote
     spy: StockQuote = await stock_fetcher(UNDERLYING)
@@ -433,7 +434,7 @@ async def _prior_day_adx(
 
 async def run_deterministic_condor(
     *,
-    qty: int = 1,
+    qty: int | None = None,
     now: datetime | None = None,
     session_factory: Callable[[], Session] | None = None,
     stock_fetcher: Callable[[str], object] = alpaca_client.get_latest_stock_quote,
@@ -452,6 +453,7 @@ async def run_deterministic_condor(
     now = now or datetime.now(UTC)
     factory = session_factory or make_session_factory()
     expiry: date = now.date()
+    qty = qty if qty is not None else get_settings().condor_contracts  # capped ≤2 in config
 
     spy: StockQuote = await stock_fetcher(UNDERLYING)
     spy_mid = spy.mid if spy.mid > 0 else (spy.bid or spy.ask)

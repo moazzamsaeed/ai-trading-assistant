@@ -73,6 +73,32 @@ def test_negative_loss_limit_is_rejected(monkeypatch, tmp_path):
         cfg.get_settings()
 
 
+def test_condor_contracts_default_is_one(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    cfg = _fresh_settings(monkeypatch)
+    assert cfg.get_settings().condor_contracts == 1
+
+
+def test_condor_contracts_two_accepted(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    cfg = _fresh_settings(monkeypatch, CONDOR_CONTRACTS="2")
+    assert cfg.get_settings().condor_contracts == 2
+
+
+def test_condor_contracts_capped_at_two(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)  # 3 exceeds the hard cap → config refuses to load
+    cfg = _fresh_settings(monkeypatch, CONDOR_CONTRACTS="3")
+    with pytest.raises(ValidationError):
+        cfg.get_settings()
+
+
+def test_condor_contracts_zero_rejected(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    cfg = _fresh_settings(monkeypatch, CONDOR_CONTRACTS="0")
+    with pytest.raises(ValidationError):
+        cfg.get_settings()
+
+
 def test_require_live_keys_lists_missing(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     cfg = _fresh_settings(monkeypatch)
