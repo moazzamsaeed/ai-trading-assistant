@@ -1200,6 +1200,36 @@ def _log_near_misses(
     return forming
 
 
+def _ticker_sr_ctx(intraday_bars, daily_bars, now: datetime) -> dict:
+    """The ticker's OWN S/R levels for the deterministic engine's headroom gate —
+    prev-day high/low/close + MA5/MA10 (from its dailies) and ORB + session
+    high/low (from its intraday bars). Mirrors agents.equities.scanner._ticker_market_ctx
+    (replicated here to avoid an intraday↔scanner circular import). Fail-open:
+    missing data just gives the S/R gate fewer levels. Used for non-SPY tickers so
+    QQQ isn't gated against SPY's price levels; SPY keeps the shared market_ctx."""
+    today = to_et(now).date()
+    completed = [b for b in (daily_bars or []) if to_et(b.timestamp).date() < today]
+    multi_day: dict = {}
+    if completed:
+        prev = completed[-1]
+        multi_day["prev_high"] = float(prev.high)
+        multi_day["prev_low"] = float(prev.low)
+        multi_day["prev_close"] = float(prev.close)
+        closes = [float(b.close) for b in completed]
+        if len(closes) >= 5:
+            multi_day["ma5"] = sum(closes[-5:]) / 5.0
+        if len(closes) >= 10:
+            multi_day["ma10"] = sum(closes[-10:]) / 10.0
+    today_bars = [b for b in (intraday_bars or []) if to_et(b.timestamp).date() == today]
+    ctx: dict = {"multi_day": multi_day}
+    if today_bars:
+        ctx["orb_high"] = float(today_bars[0].high)
+        ctx["orb_low"] = float(today_bars[0].low)
+        ctx["session_high"] = max(float(b.high) for b in today_bars)
+        ctx["session_low"] = min(float(b.low) for b in today_bars)
+    return ctx
+
+
 async def run_directional_scan(
     *,
     watchlist: tuple[str, ...] | None = None,
@@ -1281,6 +1311,7 @@ async def run_directional_scan(
     no_bar_tickers: set[str] = set()
     no_indicators_tickers: set[str] = set()
     ticker_snaps: dict[str, dict] = {}
+    ticker_bars: dict[str, list] = {}  # kept for per-ticker S/R (non-SPY)
     for t in tickers:
         try:
             bars: list[Bar] = await bars_fetcher(
@@ -1325,6 +1356,7 @@ async def run_directional_scan(
             block += "\n⚠️ INDICATORS NOT BOOTSTRAPPED (ema50 or vol_ratio_20 is null) — MUST HOLD"
         ticker_blocks.append(block)
         ticker_snaps[t] = snap
+        ticker_bars[t] = bars
 
     prompt = PROMPT_TEMPLATE.format(
         now_iso=fmt_et(now, "%Y-%m-%d %H:%M ET"),
@@ -1344,9 +1376,20 @@ async def run_directional_scan(
     # otherwise the legacy LLM path. Everything downstream is identical.
     if get_settings().deterministic_engine:
         from agents.directional.signal_engine import decide as _engine_decide
-        decisions = [
-            _engine_decide(t, ticker_snaps.get(t, {}), market_ctx, now) for t in tickers
-        ]
+        decisions = []
+        for t in tickers:
+            # SPY uses the shared market_ctx (its S/R levels — unchanged). Any other
+            # ticker (e.g. QQQ) gets its OWN S/R levels so the headroom gate isn't
+            # comparing it against SPY's price levels. Fail-open on the daily fetch.
+            t_ctx = market_ctx
+            if t != "SPY":
+                try:
+                    t_daily = await alpaca_client.get_daily_bars(t, limit=12)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("directional_daily_failed", ticker=t, error=str(e))
+                    t_daily = []
+                t_ctx = {**market_ctx, **_ticker_sr_ctx(ticker_bars.get(t, []), t_daily, now)}
+            decisions.append(_engine_decide(t, ticker_snaps.get(t, {}), t_ctx, now))
         _model_label, _cost_label = "rules_engine", "0"
     else:
         response = await route_to_model(

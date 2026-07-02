@@ -85,10 +85,11 @@ class DirectionalExecutionResult:
 # ---------------------------------------------------------------------------
 
 
-# SPY has true daily 0DTE (Mon–Fri). QQQ and IWM only have 0DTE on Mon/Wed/Fri.
+# SPY and QQQ have true daily 0DTE (Mon–Fri) — QQQ daily confirmed 2026-07-01
+# (Thu/Tue expiries present in the live chain). IWM is still Mon/Wed/Fri only.
 # Using today's date on an off-day produces an OCC symbol that doesn't exist.
-_DAILY_OPTION_TICKERS = {"SPY"}
-_MWF_OPTION_TICKERS = {"QQQ", "IWM"}  # 0DTE only on Mon(0)/Wed(2)/Fri(4)
+_DAILY_OPTION_TICKERS = {"SPY", "QQQ"}
+_MWF_OPTION_TICKERS = {"IWM"}  # 0DTE only on Mon(0)/Wed(2)/Fri(4)
 
 
 def _next_friday(today: date) -> date:
