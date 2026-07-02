@@ -76,6 +76,135 @@ async def _underlying_close_on(d: date, symbol: str = "SPY") -> float | None:
     return None
 
 
+# Options settle at the 16:00 ET close. A same-day settlement run must not fire
+# before then (the 0DTE is still live intraday).
+_SETTLEMENT_TIME_ET = time(16, 0)
+
+
+async def _settlement_close_on(expiry: date, *, now: datetime) -> float | None:
+    """Underlying settlement close for `expiry`.
+
+    Right after the bell the DAILY bar isn't published yet, so prefer the last
+    intraday 5-min close when it lands on the expiry date (≈ the 16:00 settlement).
+    Fall back to the daily bar for a prior-day expiry or an evening/next-morning
+    run (where today's intraday bars belong to a different date)."""
+    try:
+        bars = await alpaca_client.get_recent_bars("SPY", timeframe_minutes=5, limit=80)
+        if bars and to_et(bars[-1].timestamp).date() == expiry:
+            return float(bars[-1].close)
+    except Exception as e:  # noqa: BLE001 — intraday is best-effort; daily is the fallback
+        log.warning("reconciler_intraday_close_failed", expiry=str(expiry), error=str(e))
+    return await _underlying_close_on(expiry)
+
+
+async def settle_expired_condors(
+    *,
+    now: datetime | None = None,
+    session_factory=None,
+) -> list[str]:
+    """Book intrinsic expiry settlement for every condor whose expiry has PASSED.
+
+    'Passed' means the expiry date is before today, OR it is today and the ET clock
+    is at/after the 16:00 settlement — so this settles same-day right after the bell
+    as well as next-morning. The exit monitor's MLEG close often doesn't book at
+    expiry (order rests / legs swept / no quotes), so without this a condor would
+    sit open until the next daemon start. Deterministic intrinsic payoff from the
+    underlying's expiry-day close; needs no quotes or order. Idempotent — an
+    already-closed row is skipped. Returns human-readable ✅/⚠️ lines."""
+    now = now or datetime.now(UTC)
+    now_et = to_et(now)
+    today = now_et.date()
+    past_settlement = now_et.time() >= _SETTLEMENT_TIME_ET
+    sf = session_factory or make_session_factory()
+    warnings: list[str] = []
+
+    with sf() as session:
+        db_condors = list(session.execute(
+            select(Trade).where(
+                Trade.strategy.in_(_CONDOR_STRATEGIES),
+                Trade.closed_at.is_(None),
+            )
+        ).scalars())
+
+    for trade in db_condors:
+        extra = trade.extra or {}
+        legs = {k: extra.get(k) for k in ("short_put", "long_put", "short_call", "long_call")}
+
+        expiry = trade.opened_at.date() if trade.opened_at is not None else None
+        exp_str = extra.get("expiry")
+        if exp_str:
+            try:
+                expiry = date.fromisoformat(exp_str)
+            except ValueError:
+                pass
+        if expiry is None:
+            continue
+        # Not yet expired: a future/multi-day expiry, or today before the 16:00 bell.
+        if expiry > today or (expiry == today and not past_settlement):
+            continue
+
+        if not all(legs.values()):
+            warnings.append(
+                f"⚠️ Reconciler: condor #{trade.id} expired {expiry} but is missing leg "
+                f"OCCs in extra — cannot settle, left open. Handle manually."
+            )
+            log.warning("reconciler_condor_missing_legs", trade_id=trade.id, extra=extra)
+            continue
+
+        spot = await _settlement_close_on(expiry, now=now)
+        if spot is None:
+            warnings.append(
+                f"⚠️ Reconciler: condor #{trade.id} expired {expiry} but no underlying "
+                f"close found for that date — left open. Handle manually."
+            )
+            continue
+
+        mlc = extra.get("max_loss_per_contract")
+        debit = _condor_settlement_debit(
+            spot,
+            short_put=_strike_from_occ(legs["short_put"]),
+            long_put=_strike_from_occ(legs["long_put"]),
+            short_call=_strike_from_occ(legs["short_call"]),
+            long_call=_strike_from_occ(legs["long_call"]),
+            max_loss_per_contract=Decimal(str(mlc)) if mlc is not None else None,
+        )
+
+        with sf() as session:
+            row = session.get(Trade, trade.id)
+            if row is None or row.closed_at is not None:
+                continue
+            credit = Decimal(str(row.entry_price))
+            qty = Decimal(str(row.qty))
+            realized = (credit - debit) * qty
+            row.exit_price = debit
+            row.realized_pnl_usd = realized
+            # Date the close to the 16:00 ET expiry, not "now", so weekly-review
+            # week attribution stays correct.
+            row.closed_at = datetime.combine(expiry, time(16, 0), tzinfo=ET).astimezone(UTC)
+            ex = dict(row.extra or {})
+            ex["exit_reason"] = "expired_settled"
+            ex["exit_reasoning"] = (
+                f"0DTE condor settled by reconciler from SPY {spot:.2f} close on "
+                f"{expiry} (intrinsic debit ${float(debit):.2f}/contract). The intraday "
+                f"MLEG close did not book (legs swept / no quotes at expiry)."
+            )
+            ex["settlement_spot"] = round(spot, 2)
+            row.extra = ex
+            session.commit()
+
+        warnings.append(
+            f"✅ Reconciler: condor #{trade.id} expired {expiry}, settled at SPY "
+            f"{spot:.2f} → realized ${float(realized):+.2f} (debit ${float(debit):.2f}/ct)."
+        )
+        log.info(
+            "reconciler_condor_settled",
+            trade_id=trade.id, expiry=str(expiry), spot=spot,
+            debit=str(debit), realized=str(realized),
+        )
+
+    return warnings
+
+
 async def reconcile_positions(session_factory=None) -> list[str]:
     """Reconcile DB open trades against live Alpaca positions.
 
@@ -148,98 +277,24 @@ async def reconcile_positions(session_factory=None) -> list[str]:
                 trade_id=trade.id, occ=occ, exit_price=str(exit_price),
             )
 
-    # Condor settlement: the exit monitor closes condors by submitting an MLEG
-    # buy_to_close, but near 0DTE expiry legs get swept early (or lose quotes), so
-    # that order can fail (APIError 42210000 "intent mismatch") or hit no_quotes —
-    # and the daemon's 16:15 stop-timer fires before the 16:00 settlement is booked.
-    # The directional reconciler above never sees condors, so a fully-won condor
-    # would otherwise sit open forever. Settle expired condors here from the
-    # underlying's expiry-day close: deterministic, needs no quotes or order.
+    # Condor settlement is handled by settle_expired_condors() (also run standalone
+    # right after the bell for same-day settlement). Collect the still-open condors'
+    # leg OCCs FIRST so Case 2 below doesn't flag expired-but-not-yet-cleared broker
+    # legs as "opened outside the bot".
     condor_leg_occs: set[str] = set()
     with sf() as session:
-        db_condors = list(session.execute(
+        for t in session.execute(
             select(Trade).where(
                 Trade.strategy.in_(_CONDOR_STRATEGIES),
                 Trade.closed_at.is_(None),
             )
-        ).scalars())
+        ).scalars():
+            e = t.extra or {}
+            for k in ("short_put", "long_put", "short_call", "long_call"):
+                if e.get(k):
+                    condor_leg_occs.add(e[k])
 
-    today_et = to_et(datetime.now(UTC)).date()
-    for trade in db_condors:
-        extra = trade.extra or {}
-        legs = {k: extra.get(k) for k in ("short_put", "long_put", "short_call", "long_call")}
-        for occ in legs.values():
-            if occ:
-                condor_leg_occs.add(occ)
-
-        expiry = trade.opened_at.date() if trade.opened_at is not None else None
-        exp_str = extra.get("expiry")
-        if exp_str:
-            try:
-                expiry = date.fromisoformat(exp_str)
-            except ValueError:
-                pass
-        if expiry is None or expiry >= today_et:
-            continue  # not yet expired — a legitimately open (multi-day) condor
-
-        if not all(legs.values()):
-            warnings.append(
-                f"⚠️ Reconciler: condor #{trade.id} expired {expiry} but is missing leg "
-                f"OCCs in extra — cannot settle, left open. Handle manually."
-            )
-            log.warning("reconciler_condor_missing_legs", trade_id=trade.id, extra=extra)
-            continue
-
-        spot = await _underlying_close_on(expiry)
-        if spot is None:
-            warnings.append(
-                f"⚠️ Reconciler: condor #{trade.id} expired {expiry} but no underlying "
-                f"close found for that date — left open. Handle manually."
-            )
-            continue
-
-        mlc = extra.get("max_loss_per_contract")
-        debit = _condor_settlement_debit(
-            spot,
-            short_put=_strike_from_occ(legs["short_put"]),
-            long_put=_strike_from_occ(legs["long_put"]),
-            short_call=_strike_from_occ(legs["short_call"]),
-            long_call=_strike_from_occ(legs["long_call"]),
-            max_loss_per_contract=Decimal(str(mlc)) if mlc is not None else None,
-        )
-
-        with sf() as session:
-            row = session.get(Trade, trade.id)
-            if row is None or row.closed_at is not None:
-                continue
-            credit = Decimal(str(row.entry_price))
-            qty = Decimal(str(row.qty))
-            realized = (credit - debit) * qty
-            row.exit_price = debit
-            row.realized_pnl_usd = realized
-            # Date the close to the 16:00 ET expiry, not "now" (next-morning startup),
-            # so weekly-review week attribution stays correct.
-            row.closed_at = datetime.combine(expiry, time(16, 0), tzinfo=ET).astimezone(UTC)
-            ex = dict(row.extra or {})
-            ex["exit_reason"] = "expired_settled"
-            ex["exit_reasoning"] = (
-                f"0DTE condor settled by reconciler from SPY {spot:.2f} close on "
-                f"{expiry} (intrinsic debit ${float(debit):.2f}/contract). The intraday "
-                f"MLEG close did not book (legs swept / no quotes at expiry)."
-            )
-            ex["settlement_spot"] = round(spot, 2)
-            row.extra = ex
-            session.commit()
-
-        warnings.append(
-            f"✅ Reconciler: condor #{trade.id} expired {expiry}, settled at SPY "
-            f"{spot:.2f} → realized ${float(realized):+.2f} (debit ${float(debit):.2f}/ct)."
-        )
-        log.info(
-            "reconciler_condor_settled",
-            trade_id=trade.id, expiry=str(expiry), spot=spot,
-            debit=str(debit), realized=str(realized),
-        )
+    warnings.extend(await settle_expired_condors(session_factory=sf))
 
     # Case 2: Alpaca open but not in DB → opened outside the bot
     for occ in live_occs:

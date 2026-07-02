@@ -104,8 +104,12 @@ def _patch_alpaca(monkeypatch, *, positions, spot_on_expiry, expiry: str):
         ts = datetime.fromisoformat(expiry).replace(hour=20, tzinfo=UTC)  # ~16:00 ET
         return [types.SimpleNamespace(timestamp=ts, close=Decimal(str(spot_on_expiry)))]
 
+    async def fake_recent_bars(symbol, *, timeframe_minutes=5, limit=30, warmup_days=0):
+        return []  # no same-day intraday bars → settlement falls back to the daily bar
+
     monkeypatch.setattr(alpaca_client, "get_positions", fake_positions)
     monkeypatch.setattr(alpaca_client, "get_daily_bars", fake_daily_bars)
+    monkeypatch.setattr(alpaca_client, "get_recent_bars", fake_recent_bars)
 
 
 @pytest.mark.asyncio
@@ -158,3 +162,83 @@ async def test_open_condor_not_yet_expired_left_alone(session_factory, monkeypat
     with session_factory() as s:
         row = s.get(Trade, tid)
     assert row.closed_at is None, "a not-yet-expired condor must stay open"
+
+
+# ----------------- same-day settlement (settle_expired_condors) -----------------
+
+
+def _intraday_bar(d: date, close: str, *, hh: int = 15, mm: int = 55):
+    ts = datetime.combine(d, time(hh, mm), tzinfo=ET).astimezone(UTC)
+    return types.SimpleNamespace(timestamp=ts, close=Decimal(close))
+
+
+@pytest.mark.asyncio
+async def test_same_day_condor_settles_after_bell(session_factory, monkeypatch):
+    """A condor expiring TODAY settles once the ET clock is past 16:00, using the
+    last intraday close (the daily bar isn't published yet right after the bell)."""
+    today = date(2026, 6, 25)
+    tid = _open_condor(session_factory, expiry=today.isoformat(), credit="80.00")
+    now = datetime.combine(today, time(16, 3), tzinfo=ET).astimezone(UTC)
+
+    async def recent(symbol, *, timeframe_minutes=5, limit=30, warmup_days=0):
+        return [_intraday_bar(today, "500")]  # between shorts (495/505) → worthless
+
+    async def daily_boom(*a, **k):
+        raise AssertionError("daily bar should not be needed — intraday close present")
+
+    monkeypatch.setattr(alpaca_client, "get_recent_bars", recent)
+    monkeypatch.setattr(alpaca_client, "get_daily_bars", daily_boom)
+
+    warnings = await reconciler.settle_expired_condors(now=now, session_factory=session_factory)
+
+    with session_factory() as s:
+        row = s.get(Trade, tid)
+    assert row.closed_at is not None
+    assert row.realized_pnl_usd == Decimal("80.00")   # full credit kept
+    assert row.exit_price == Decimal("0.00")
+    assert row.extra["settlement_spot"] == 500.0
+    assert row.closed_at.replace(tzinfo=UTC).astimezone(ET).hour == 16  # dated to expiry bell
+    assert any("settled" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_same_day_condor_not_settled_before_bell(session_factory, monkeypatch):
+    """Before 16:00 ET the 0DTE is still live — the gate must not settle it, and
+    must not even reach for a settlement price."""
+    today = date(2026, 6, 25)
+    tid = _open_condor(session_factory, expiry=today.isoformat(), credit="80.00")
+    now = datetime.combine(today, time(11, 0), tzinfo=ET).astimezone(UTC)
+
+    async def boom(*a, **k):
+        raise AssertionError("must not fetch a settlement price before the bell")
+
+    monkeypatch.setattr(alpaca_client, "get_recent_bars", boom)
+    monkeypatch.setattr(alpaca_client, "get_daily_bars", boom)
+
+    warnings = await reconciler.settle_expired_condors(now=now, session_factory=session_factory)
+
+    assert warnings == []
+    with session_factory() as s:
+        assert s.get(Trade, tid).closed_at is None
+
+
+@pytest.mark.asyncio
+async def test_settlement_close_prefers_intraday_then_daily(monkeypatch):
+    exp = date(2026, 6, 25)
+    now = datetime.combine(exp, time(16, 3), tzinfo=ET).astimezone(UTC)
+
+    # (a) intraday bar ON the expiry date → used directly as the settlement close.
+    async def recent_on_expiry(symbol, **k):
+        return [_intraday_bar(exp, "742.5")]
+    monkeypatch.setattr(alpaca_client, "get_recent_bars", recent_on_expiry)
+    assert await reconciler._settlement_close_on(exp, now=now) == 742.5
+
+    # (b) intraday bars belong to a LATER date → fall back to the daily bar.
+    async def recent_other_day(symbol, **k):
+        return [_intraday_bar(date(2026, 6, 26), "999")]
+    async def daily(symbol, *, limit=10):
+        ts = datetime.combine(exp, time(16, 0), tzinfo=ET).astimezone(UTC)
+        return [types.SimpleNamespace(timestamp=ts, close=Decimal("740.0"))]
+    monkeypatch.setattr(alpaca_client, "get_recent_bars", recent_other_day)
+    monkeypatch.setattr(alpaca_client, "get_daily_bars", daily)
+    assert await reconciler._settlement_close_on(exp, now=now) == 740.0
