@@ -15,6 +15,7 @@ Usage: uv run python -m scripts.backtest_engine [IV] [SPREAD_RT$] [HOLD_MIN] [CO
 from __future__ import annotations
 
 import math
+import os
 import sys
 from datetime import datetime, time as dtime, timezone
 from zoneinfo import ZoneInfo
@@ -27,6 +28,9 @@ from agents.directional.signal_engine import decide
 
 ET = ZoneInfo("America/New_York")
 TF = 15
+# Underlying via env var (keeps the positional IV/spread/... args non-breaking):
+#   SYMBOL=QQQ .venv/bin/python -m scripts.backtest_engine
+SYMBOL = os.environ.get("SYMBOL", "SPY").upper()
 IV = float(sys.argv[1]) if len(sys.argv) > 1 else 0.18
 SPREAD = float(sys.argv[2]) if len(sys.argv) > 2 else 0.04
 HOLD_MIN = int(sys.argv[3]) if len(sys.argv) > 3 else 60
@@ -97,10 +101,10 @@ def bs(S, K, T, call):
 
 
 def main():
-    req = StockBarsRequest(symbol_or_symbols="SPY", timeframe=TimeFrame(TF, TimeFrameUnit.Minute),
+    req = StockBarsRequest(symbol_or_symbols=SYMBOL, timeframe=TimeFrame(TF, TimeFrameUnit.Minute),
                            start=datetime(2023, 1, 1, tzinfo=timezone.utc),
                            end=datetime(2026, 6, 18, tzinfo=timezone.utc), feed=DataFeed.IEX)
-    raw = ac._stock_client().get_stock_bars(req).data.get("SPY", [])
+    raw = ac._stock_client().get_stock_bars(req).data.get(SYMBOL, [])
     bars = [b for b in raw if is_rth(b.timestamp)]
     close = [float(b.close) for b in bars]
     high = [float(b.high) for b in bars]
@@ -146,7 +150,7 @@ def main():
             continue
         # ---- look for entry via the SHIPPED engine ----
         snap = {"last_close": close[i], "vwap": vwap[i], "ema20": em[i], "adx": adx[i], "rsi9": 50}
-        d = decide("SPY", snap)
+        d = decide(SYMBOL, snap)
         if d.action in ("BUY_CALL", "BUY_PUT"):
             call = d.action == "BUY_CALL"
             T0 = tmin[i] / YEAR_MIN
@@ -164,7 +168,7 @@ def main():
               f"${net/len(rows):+6.1f}/contract  | @${BUDGET:.0f}/trade(~{contracts}x): "
               f"${net/len(rows)*contracts:+7.0f}/trade  total ${net*contracts:+.0f}")
 
-    print(f"SPY engine backtest — IV={IV:.0%}, hold {HOLD_MIN}m, spread ${SPREAD:.2f}, "
+    print(f"{SYMBOL} engine backtest — IV={IV:.0%}, hold {HOLD_MIN}m, spread ${SPREAD:.2f}, "
           f"cooldown {COOLDOWN_MIN}m, {day[0]}→{day[-1]}\n")
     report(trades, "ALL")
     report([t for t in trades if t[0] == "HIGH"], "HIGH conviction")

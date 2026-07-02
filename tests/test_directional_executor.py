@@ -95,15 +95,17 @@ def test_resolve_expiry_0dte():
     monday = date(2026, 5, 11)  # Monday
     tuesday = date(2026, 5, 12)
     wednesday = date(2026, 5, 13)
+    thursday = date(2026, 5, 14)
 
-    # SPY has true daily 0DTE — every weekday
+    # SPY and QQQ have true daily 0DTE — every weekday (QQQ daily confirmed 2026-07-01)
     assert _resolve_expiry("0DTE", monday, "SPY") == monday
     assert _resolve_expiry("0DTE", tuesday, "SPY") == tuesday
+    assert _resolve_expiry("0DTE", tuesday, "QQQ") == tuesday      # QQQ now daily
+    assert _resolve_expiry("0DTE", thursday, "QQQ") == thursday    # QQQ now daily
 
-    # QQQ/IWM only have 0DTE on Mon/Wed/Fri — Bug 8 regression
-    assert _resolve_expiry("0DTE", monday, "QQQ") == monday       # Mon: allowed
-    assert _resolve_expiry("0DTE", wednesday, "QQQ") == wednesday  # Wed: allowed
-    assert _resolve_expiry("0DTE", tuesday, "QQQ") == date(2026, 5, 15)   # Tue: redirect to Friday
+    # IWM still only has 0DTE on Mon/Wed/Fri — Bug 8 regression
+    assert _resolve_expiry("0DTE", monday, "IWM") == monday        # Mon: allowed
+    assert _resolve_expiry("0DTE", wednesday, "IWM") == wednesday  # Wed: allowed
     assert _resolve_expiry("0DTE", tuesday, "IWM") == date(2026, 5, 15)   # Tue: redirect to Friday
 
     # AMD only has weekly options
