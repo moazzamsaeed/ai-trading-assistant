@@ -57,7 +57,6 @@ def session_factory():
 @pytest.fixture(autouse=True)
 def _reset_state():
     reset_state_for_tests()
-    sch._last_research_post = None
     sch._last_trade_open.clear()
     sch._last_signal_posted.clear()
     yield
@@ -382,7 +381,6 @@ async def test_daily_loss_limit_pauses_when_threshold_hit(session_factory, monke
     await sch._directional_scan_job(
         signal_poster=_async_noop,
         trade_poster=_async_noop,
-        research_poster=_async_noop,
         log_poster=log_poster,
         clock_fetcher=never_called,
     )
@@ -434,7 +432,6 @@ async def test_daily_loss_limit_does_not_pause_below_threshold(session_factory, 
     await sch._directional_scan_job(
         signal_poster=_async_noop,
         trade_poster=_async_noop,
-        research_poster=_async_noop,
         log_poster=_async_noop,
         clock_fetcher=clock_fetcher,
     )
@@ -469,7 +466,6 @@ async def test_daily_loss_limit_includes_unrealized(session_factory, monkeypatch
     await sch._directional_scan_job(
         signal_poster=_async_noop,
         trade_poster=_async_noop,
-        research_poster=_async_noop,
         log_poster=_async_noop,
         clock_fetcher=never_called,
     )
@@ -537,27 +533,6 @@ async def test_signal_dedup_distinguishes_action_direction():
 
     # PUT key was never set → allowed
     assert sch._last_signal_posted.get(("SPY", "BUY_PUT")) is None
-
-
-# ---------------------------------------------------------------------------
-# 7. Research-post throttle — flooding fix
-# ---------------------------------------------------------------------------
-
-
-async def test_research_post_throttled_within_an_hour():
-    now = datetime.now(UTC)
-    sch._last_research_post = now - timedelta(minutes=30)
-
-    elapsed = (now - sch._last_research_post).total_seconds()
-    assert elapsed < sch._RESEARCH_POST_INTERVAL_SECONDS
-
-
-async def test_research_post_allowed_after_an_hour():
-    now = datetime.now(UTC)
-    sch._last_research_post = now - timedelta(minutes=61)
-
-    elapsed = (now - sch._last_research_post).total_seconds()
-    assert elapsed >= sch._RESEARCH_POST_INTERVAL_SECONDS
 
 
 # ---------------------------------------------------------------------------

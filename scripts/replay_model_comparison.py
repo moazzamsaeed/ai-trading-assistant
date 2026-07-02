@@ -56,7 +56,6 @@ ET = ZoneInfo("America/New_York")
 MODELS = [
     ("deepseek", "deepseek-v4-flash"),
     ("anthropic", "claude-sonnet-4-6"),
-    ("anthropic", "claude-opus-4-8"),
 ]
 
 # $/1M tokens (input, output) — used for the cost rollup independent of the repo
@@ -221,7 +220,7 @@ def make_persist_factory():
 
 
 async def run_one(T, provider, model, persist_factory):
-    router.MODEL_MAP[TaskType.INTRADAY_SCAN] = (provider, model)
+    router.MODEL_MAP[TaskType.DIRECTIONAL_ENTRY] = (provider, model)  # entry routes via this now
     intraday.get_directional_trade_context = make_trade_context(T)
     try:
         decisions, _msgs, _report = await run_directional_scan(
@@ -290,6 +289,7 @@ async def main():
     # Disable the INTRADAY_SCAN fallback so a model failure is visible, not
     # silently re-run on Haiku.
     router.FALLBACK_MAP.pop(TaskType.INTRADAY_SCAN, None)
+    router.FALLBACK_MAP.pop(TaskType.DIRECTIONAL_ENTRY, None)
 
     sh = tuple(int(x) for x in args.start.split(":"))
     eh = tuple(int(x) for x in args.end.split(":"))

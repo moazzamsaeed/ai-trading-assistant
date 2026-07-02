@@ -65,7 +65,6 @@ async def _run() -> None:
 
         stream = make_directional_trigger(
             main_loop=loop,
-            research_poster=bot.post_research,
             signal_poster=bot.post_signal,
             trade_poster=bot.post_trade,
             log_poster=bot.post_log,
@@ -118,7 +117,7 @@ async def _run_directional_once() -> None:
     configure_logging()
     get_settings().require_live_keys()
     async with TradeMasterBot() as bot:
-        await run_directional_once(bot.post_signal, bot.post_trade, bot.post_research, log_poster=bot.post_log)
+        await run_directional_once(bot.post_signal, bot.post_trade, log_poster=bot.post_log)
 
 
 def main() -> None:

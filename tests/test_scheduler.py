@@ -56,6 +56,85 @@ def test_make_scheduler_registers_premarket_job():
     assert str(job.trigger.timezone) == sch.PREMARKET_TZ
 
 
+def test_make_scheduler_registers_research_analysis_jobs():
+    """#research gets exactly two analysis posts: mid-day (12:30) and close (16:05)."""
+    scheduler = sch.make_scheduler(**_all_posters())
+
+    midday = scheduler.get_job("research_midday")
+    assert midday is not None
+    mfields = {f.name: str(f) for f in midday.trigger.fields}
+    assert mfields["day_of_week"] == "mon-fri"
+    assert mfields["hour"] == "12"
+    assert mfields["minute"] == "30"
+
+    close = scheduler.get_job("research_close")
+    assert close is not None
+    cfields = {f.name: str(f) for f in close.trigger.fields}
+    assert cfields["day_of_week"] == "mon-fri"
+    assert cfields["hour"] == "16"
+    assert cfields["minute"] == "5"
+
+
+async def test_market_analysis_job_posts_to_research(monkeypatch):
+    posted: list[str] = []
+
+    async def research(text: str) -> None:
+        posted.append(text)
+
+    async def fake_clock():
+        return _clock(is_open=True)
+
+    async def fake_analysis(*, mode="intraday"):
+        return f"report[{mode}]"
+
+    monkeypatch.setattr(
+        "agents.research.market_analysis.run_market_analysis", fake_analysis
+    )
+
+    await sch._market_analysis_job(
+        research_poster=research, clock_fetcher=fake_clock, mode="intraday"
+    )
+    assert posted == ["report[intraday]"]
+
+
+async def test_market_analysis_intraday_skips_when_market_closed(monkeypatch):
+    posted: list[str] = []
+
+    async def research(text: str) -> None:
+        posted.append(text)
+
+    async def closed_clock():
+        return _clock(is_open=False)
+
+    await sch._market_analysis_job(
+        research_poster=research, clock_fetcher=closed_clock, mode="intraday"
+    )
+    assert posted == [], "mid-day update must not post when the market is closed"
+
+
+async def test_market_analysis_close_posts_after_bell(monkeypatch):
+    """The close wrap runs after 16:00 (market closed) and still posts."""
+    posted: list[str] = []
+
+    async def research(text: str) -> None:
+        posted.append(text)
+
+    async def closed_clock():
+        return _clock(is_open=False)
+
+    async def fake_analysis(*, mode="intraday"):
+        return f"report[{mode}]"
+
+    monkeypatch.setattr(
+        "agents.research.market_analysis.run_market_analysis", fake_analysis
+    )
+
+    await sch._market_analysis_job(
+        research_poster=research, clock_fetcher=closed_clock, mode="close"
+    )
+    assert posted == ["report[close]"]
+
+
 async def test_run_premarket_once_invokes_poster(monkeypatch):
     posted: list[str] = []
 
@@ -708,15 +787,15 @@ async def test_weekly_loss_limit_halts_scan(monkeypatch):
     monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
 
     import datetime as _dmod
-    from trademaster.timeutils import today_et
-    today = today_et()
-    week_start = today - _dmod.timedelta(days=today.weekday())  # Monday this week
-    # Use Monday of this week so the loss is this week but never today
-    # (today could be any day Mon-Fri — Monday is always safe as "not today"
-    # unless today IS Monday, handled by falling back to Tuesday).
-    monday = week_start
-    tuesday = week_start + _dmod.timedelta(days=1)
-    seed_day = tuesday if monday == _dt.now(_UTC).date() else monday
+    import trademaster.db as _db
+    # Pin "today" to a fixed Wednesday so this test never depends on the real
+    # calendar. It used to fail when actually run on a Monday: Monday is the first
+    # day of the week, so there is no "prior day this week" to carry the loss — the
+    # seeded loss landed on today and the DAILY limit fired first (logging "daily",
+    # not "weekly"). A fixed mid-week date makes the scenario unambiguous.
+    monkeypatch.setattr(_db, "today_et", lambda: _dmod.date(2026, 7, 1))  # Wednesday
+    week_start = _dmod.date(2026, 7, 1) - _dmod.timedelta(days=2)  # Monday 2026-06-29
+    seed_day = week_start  # this week but before today (Wed) → only the WEEKLY limit applies
     closed_mid_week = _dt.combine(seed_day, _dmod.time(15, 0), tzinfo=_UTC)
 
     with sf() as session:
@@ -741,7 +820,7 @@ async def test_weekly_loss_limit_halts_scan(monkeypatch):
 
     await sch._directional_scan_job(
         signal_poster=_noop_poster, trade_poster=_noop_poster,
-        research_poster=_noop_poster, log_poster=log_capture,
+        log_poster=log_capture,
     )
     assert get_state().is_paused(), "weekly loss limit must pause trading"
     assert any("weekly" in m.lower() for m in logs)
@@ -780,7 +859,7 @@ async def test_max_trades_cap_blocks_when_set(monkeypatch):
 
     await sch._directional_scan_job(
         signal_poster=_noop_poster, trade_poster=_noop_poster,
-        research_poster=_noop_poster, log_poster=_noop_poster,
+        log_poster=_noop_poster,
     )
     assert not scan_called, "scan must be blocked once the count cap is reached"
 
@@ -805,7 +884,7 @@ async def test_max_trades_unlimited_skips_count_check(monkeypatch):
 
     await sch._directional_scan_job(
         signal_poster=_noop_poster, trade_poster=_noop_poster,
-        research_poster=_noop_poster, log_poster=_noop_poster,
+        log_poster=_noop_poster,
     )
     assert not consulted, "count cap must NOT be consulted when unlimited (0)"
 
@@ -832,7 +911,7 @@ async def test_event_blackout_not_consulted_when_disabled(monkeypatch):
 
     await sch._directional_scan_job(
         signal_poster=_noop_poster, trade_poster=_noop_poster,
-        research_poster=_noop_poster, log_poster=_noop_poster,
+        log_poster=_noop_poster,
     )
     assert not consulted, "blackout calendar must NOT be consulted when disabled"
 
@@ -862,7 +941,7 @@ async def test_event_blackout_blocks_when_enabled(monkeypatch):
 
     await sch._directional_scan_job(
         signal_poster=_noop_poster, trade_poster=_noop_poster,
-        research_poster=_noop_poster, log_poster=_noop_poster,
+        log_poster=_noop_poster,
     )
     assert consulted, "blackout calendar must be consulted when enabled"
     assert not scan_called, "scan must be blocked on a blackout day when enabled"
