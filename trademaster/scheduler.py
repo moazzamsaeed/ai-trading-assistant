@@ -652,6 +652,38 @@ async def _post_trade_closed(trade_poster: Poster, trade_id) -> None:
         log.warning("trade_closed_report_failed", trade_id=trade_id, error=str(e))
 
 
+# ----------------- same-day condor settlement -----------------
+
+
+async def _condor_settlement_job(
+    *,
+    trade_poster: Poster,
+    log_poster: Poster = _noop_poster,
+) -> None:
+    """Book intrinsic settlement for any 0DTE condor that expired today.
+
+    Runs just after the 16:00 bell (and before the daily summary) because the MLEG
+    close frequently doesn't fill at expiry — otherwise the position sits open until
+    the next daemon start, which on a Friday is a whole weekend/holiday away. Settled
+    P&L → #trades; anything it can't settle → #logs. The next-morning reconcile still
+    runs as a backstop, so a miss here is caught, not lost."""
+    if get_state().is_paused():
+        log.info("condor_settlement_skipped_paused")
+        return
+    try:
+        from trademaster.reconciler import settle_expired_condors
+        results = await settle_expired_condors()
+    except Exception as e:  # noqa: BLE001
+        log.error("condor_settlement_failed", error=str(e), error_type=type(e).__name__)
+        await log_poster(f"⚠️ Condor settlement failed: `{type(e).__name__}: {e}`")
+        return
+    for line in results:
+        if line.startswith("✅"):
+            await trade_poster(line)
+        else:
+            await log_poster(line)
+
+
 # ----------------- daily / weekly #trades summaries -----------------
 
 
@@ -1092,6 +1124,18 @@ def make_scheduler(
         id="trade_health_check",
         replace_existing=True,
         misfire_grace_time=3600,
+    )
+
+    # Same-day condor settlement — 16:03 ET Mon-Fri (after the 16:00 bell, BEFORE
+    # the daily summary at 16:05, so that report shows the real settled P&L instead
+    # of a projection). Books any 0DTE condor whose MLEG close didn't fill at expiry.
+    scheduler.add_job(
+        _condor_settlement_job,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=3, timezone=PREMARKET_TZ),
+        kwargs={"trade_poster": trade_poster, "log_poster": log_post},
+        id="condor_settlement",
+        replace_existing=True,
+        misfire_grace_time=600,
     )
 
     # Daily trade summary — 16:05 ET Mon-Fri (after the 16:00 close, before the

@@ -1107,3 +1107,48 @@ async def test_exit_job_posts_per_trade_error_to_logs(monkeypatch):
     assert sig == [] and trd == []
     assert logs == ["⚠️ Iron-condor close failed for trade #9"]
     sch._last_ic_exit_error_post.clear()
+
+
+async def test_condor_settlement_job_routes_settled_to_trades(monkeypatch):
+    """Same-day settlement job: ✅ settled lines → #trades, ⚠️ problems → #logs."""
+    trd: list[str] = []
+    logs: list[str] = []
+
+    async def tr(t):
+        trd.append(t)
+
+    async def lg(t):
+        logs.append(t)
+
+    async def fake_settle(**_kwargs):
+        return [
+            "✅ Reconciler: condor #7 expired 2026-06-25, settled at SPY 500.00 → realized $+80.00 (debit $0.00/ct).",
+            "⚠️ Reconciler: condor #8 expired 2026-06-25 but no underlying close found — left open.",
+        ]
+
+    monkeypatch.setattr(sch, "settle_expired_condors", fake_settle, raising=False)
+    import trademaster.reconciler as _rec
+    monkeypatch.setattr(_rec, "settle_expired_condors", fake_settle)
+
+    await sch._condor_settlement_job(trade_poster=tr, log_poster=lg)
+    assert len(trd) == 1 and trd[0].startswith("✅")
+    assert len(logs) == 1 and logs[0].startswith("⚠️")
+
+
+async def test_condor_settlement_job_failure_routes_to_logs(monkeypatch):
+    logs: list[str] = []
+
+    async def tr(_t):
+        raise AssertionError("nothing should reach #trades on failure")
+
+    async def lg(t):
+        logs.append(t)
+
+    async def boom(**_kwargs):
+        raise RuntimeError("db locked")
+
+    import trademaster.reconciler as _rec
+    monkeypatch.setattr(_rec, "settle_expired_condors", boom)
+
+    await sch._condor_settlement_job(trade_poster=tr, log_poster=lg)
+    assert len(logs) == 1 and "failed" in logs[0].lower()
