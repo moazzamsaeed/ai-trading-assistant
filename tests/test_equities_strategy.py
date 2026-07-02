@@ -195,3 +195,17 @@ def test_adx_rollover_holds():
     d = decide_equity("NVDA", bars, snap, ctx)
     assert d.action == "HOLD"
     assert "rolling over" in d.reasoning
+
+
+# ── room-gate fix (v2): breakouts route around the room/RSI gates ──────────────
+# (An ORB momentum mode was built + backtested here, then dropped as net-negative;
+#  see agents/equities/strategy.py. The room-gate fix + breakout route stay.)
+def test_breakout_not_blocked_by_room_v2():
+    # price at a NEW session high with volume + resistance only ~0.5 ATR above.
+    # v1 HELD ("no room"); v2 routes to the momentum breakout (room-exempt) → fires.
+    snap = _snap(price=104.0, vwap=102.5, ema20=102.0, adx=30, atr10=1.0, rsi9=60, vol=1.5)
+    ctx = _ctx(session_high=104.0, session_low=98.0, levels=[104.5])  # wall 0.5 ATR above
+    d = decide_equity("META", _bars([103.6, 104.0]), snap, ctx)  # now=None → ORB inert
+    assert d.action == "BUY_CALL"
+    assert d.analysis["setup"] == "breakout"
+    assert d.conviction == "MEDIUM"

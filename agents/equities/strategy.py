@@ -29,14 +29,14 @@ from trademaster.logging import get_logger
 
 log = get_logger(__name__)
 
-EQUITY_ENGINE_VERSION = "equity_trend_v1"
+EQUITY_ENGINE_VERSION = "equity_trend_v2"  # v2: breakout (room/RSI-exempt) vs pullback routing
 
 # --- thresholds (ATR-normalized; calibrate via backtest_equities_strategy.py) ---
 EQ_ADX_MIN = 25.0          # trend-strength floor (mirrors base; tuned independently)
 DIST_OVEREXT_ATR = 2.5     # > this many ATR from VWAP → too stretched, late → HOLD
-ROOM_MIN_ATR = 1.5         # need ≥ this ATR of clear room to the next opposing S/R
-RSI_EXH_HI = 72.0          # call: RSI above → overbought/exhausted → HOLD
-RSI_EXH_LO = 28.0          # put:  RSI below → oversold/exhausted → HOLD
+ROOM_MIN_ATR = 1.5         # need ≥ this ATR of clear room to the next opposing S/R (pullback only)
+RSI_EXH_HI = 72.0          # call: RSI above → overbought/exhausted → HOLD (pullback only)
+RSI_EXH_LO = 28.0          # put:  RSI below → oversold/exhausted → HOLD (pullback only)
 VOL_FLOOR = 0.80           # volume_ratio_20 below → volume fading → HOLD
 VOL_BREAKOUT = 1.30        # a new-extreme breakout needs volume_ratio ≥ this
 ADX_ROLLOVER_HI = 35.0     # only treat a FALLING ADX as exhaustion when ADX is already high
@@ -44,7 +44,12 @@ ADX_SLOPE_LAG = 3          # bars back to measure ADX slope
 PULLBACK_MIN_FRAC = 0.20   # retrace ≥ this fraction of the day's range from the extreme …
 PULLBACK_MAX_FRAC = 0.65   # … but ≤ this (deeper = the trend may be breaking, not resuming)
 BREAKOUT_EDGE_FRAC = 0.05  # within this fraction of the day's range of the extreme = "at it"
-ALLOW_BREAKOUT = True      # post volume-confirmed new-extreme breakouts as MEDIUM
+
+# NOTE: an opening-range-breakout (ORB) momentum mode was built and BACKTESTED here
+# (2026-07-02) and DROPPED — it was net-negative on all 9 tickers (43% hit, −0.13%
+# avg favorable move; the worst setup). Chasing early runs loses on the average day;
+# the two big-run days that motivated it were survivorship. See git history / the
+# backtest in scripts/backtest_equities_strategy.py. Breakout + pullback remain.
 
 
 def _macd_hist_slope(bars) -> float | None:
@@ -85,34 +90,27 @@ def _range_position(price: float, sh: float | None, sl: float | None, up: bool) 
     return (price - sl) / (sh - sl) if up else (sh - price) / (sh - sl)
 
 
-def _classify_setup(price, sh, sl, vol_ratio, resuming, up):
-    """pullback (best) / breakout (ok) / chase (skip).
-
-    pullback = retraced a meaningful slice of the day's range from the extreme and
-               is turning back in-trend → entering near the base of the next leg.
-    breakout = at/through the session extreme with volume confirmation.
-    chase    = mid-extension or stalled near the extreme with no fresh volume.
-    """
+def _is_pullback(price, sh, sl, resuming, up) -> bool:
+    """A retrace of PULLBACK_MIN..MAX of the day's range from the extreme that is
+    turning back in-trend → entering near the base of the next leg."""
     pos = _range_position(price, sh, sl, up)
     if pos is None:
-        return "chase"  # no range info → can't confirm room/freshness → conservative
+        return False
     retrace = 1.0 - pos  # how far back from the extreme
-    at_extreme = pos >= 1.0 - BREAKOUT_EDGE_FRAC
-    if at_extreme:
-        if ALLOW_BREAKOUT and vol_ratio is not None and vol_ratio >= VOL_BREAKOUT:
-            return "breakout"
-        return "chase"  # at the high but no volume → exhaustion, not continuation
-    if PULLBACK_MIN_FRAC <= retrace <= PULLBACK_MAX_FRAC and resuming:
-        return "pullback"
-    return "chase"
+    return PULLBACK_MIN_FRAC <= retrace <= PULLBACK_MAX_FRAC and bool(resuming)
 
 
 def decide_equity(ticker: str, bars, snap: dict, market_ctx: dict | None = None, now=None):
     """Indicator snapshot + bars → TickerDecision for the equities scanner.
 
-    Same TickerDecision contract as signal_engine.decide so the scanner/formatter
-    are unchanged. HOLD unless the setup has room, live momentum, and is a pullback
-    or a volume-confirmed breakout (never a mid-extension chase).
+    Two entry routes, gated differently because momentum and mean-reversion need
+    opposite conditions:
+      1. Breakout — price through the session extreme with volume confirmation.
+      2. Pullback — a retrace-and-resume in an established trend.
+    The breakout route SKIPS the room + RSI-exhaustion gates — a breakout has no
+    overhead room (blue sky) and runs hot on RSI by nature; applying those gates is
+    exactly why breakouts could never fire in v1. Pullbacks keep the full gates.
+    (`now` is accepted for signature parity with signal_engine.decide; unused here.)
     """
     from agents.directional.intraday import TickerDecision
 
@@ -146,54 +144,56 @@ def decide_equity(ticker: str, bars, snap: dict, market_ctx: dict | None = None,
     if dist_atr > DIST_OVEREXT_ATR:
         return hold(f"overextended ({dist_atr:.1f} ATR from VWAP > {DIST_OVEREXT_ATR}) — late")
 
-    # GATE 1 — room to the next opposing S/R, in ATR units (hard gate).
+    sh = (market_ctx or {}).get("session_high")
+    sl = (market_ctx or {}).get("session_low")
+    adx_slope = _adx_slope(bars, adx)
+    hist_slope = _macd_hist_slope(bars)
+    rolling_over = adx_slope is not None and adx >= ADX_ROLLOVER_HI and adx_slope < 0
+
+    def signal(setup: str, conviction: str, extra_note: str = ""):
+        strike = round(price)
+        rsi_str = f"{rsi:.0f}" if rsi is not None else "n/a"
+        reason = (
+            f"{EQUITY_ENGINE_VERSION}: {'UP' if up else 'DOWN'}-trend {setup} "
+            f"(ADX {adx:.1f}, {dist_atr:.1f} ATR from VWAP, RSI {rsi_str}{extra_note}) "
+            f"→ {action}/{conviction}"
+        )
+        analysis = {
+            "spy_price": price,  # key reused by format_equities_signal (it's the ticker price)
+            "session_high": _f(sh), "session_low": _f(sl),
+            "dist_atr": round(dist_atr, 2), "setup": setup,
+            "adx": round(adx, 1), "rsi9": round(rsi, 1) if rsi is not None else None,
+        }
+        return TickerDecision(ticker, action, float(strike), "0DTE", conviction, reason, analysis)
+
+    # ── ROUTE 1: volume-confirmed breakout of the session extreme — skips room+RSI ──
+    pos = _range_position(price, sh, sl, up)
+    at_extreme = pos is not None and pos >= 1.0 - BREAKOUT_EDGE_FRAC
+    if at_extreme and vol_ratio is not None and vol_ratio >= VOL_BREAKOUT:
+        if rolling_over:
+            return hold(f"breakout but trend exhausting (ADX {adx:.1f} rolling over)")
+        if hist_slope is not None and ((up and hist_slope < 0) or (down and hist_slope > 0)):
+            return hold("breakout but momentum decelerating (MACD histogram contracting)")
+        return signal("breakout", "MEDIUM", f", new extreme vol {vol_ratio:.1f}×")
+
+    # ── ROUTE 2: pullback (mean-reversion in trend) — FULL gates apply ──────────
     hr_pct, lvl = _headroom(price, action, _collect_levels(market_ctx))
-    room_atr = None
     if hr_pct is not None:
         room_atr = (hr_pct / 100.0 * price) / atr
         if room_atr < ROOM_MIN_ATR:
             kind = "resistance" if up else "support"
             return hold(f"no room — {kind} ${lvl:.2f} only {room_atr:.1f} ATR ahead "
                         f"(< {ROOM_MIN_ATR})")
-
-    # GATE 2 — not exhausted / momentum still building.
     if up and rsi is not None and rsi > RSI_EXH_HI:
         return hold(f"RSI exhausted ({rsi:.0f} > {RSI_EXH_HI}) — reversal risk")
     if down and rsi is not None and rsi < RSI_EXH_LO:
         return hold(f"RSI exhausted ({rsi:.0f} < {RSI_EXH_LO}) — reversal risk")
-    # ADX rolling over (only meaningful once ADX is already high) — checked before
-    # the MACD slope so a clearly-exhausting strong trend reports the trend reason.
-    adx_slope = _adx_slope(bars, adx)
-    if adx_slope is not None and adx >= ADX_ROLLOVER_HI and adx_slope < 0:
+    if rolling_over:
         return hold(f"trend exhausting (ADX {adx:.1f} rolling over, Δ{adx_slope:+.1f})")
-    hist_slope = _macd_hist_slope(bars)
     if hist_slope is not None and ((up and hist_slope < 0) or (down and hist_slope > 0)):
         return hold("momentum decelerating (MACD histogram contracting)")
     if vol_ratio is not None and vol_ratio < VOL_FLOOR:
         return hold(f"volume fading (vol_ratio {vol_ratio:.2f} < {VOL_FLOOR})")
-
-    # GATE 4 — setup classification → conviction (subsumes the maturity check).
-    sh = (market_ctx or {}).get("session_high")
-    sl = (market_ctx or {}).get("session_low")
-    setup = _classify_setup(price, sh, sl, vol_ratio, _resuming(bars, up), up)
-    if setup == "chase":
-        return hold("mid-extension chase — wait for a pullback or a fresh breakout")
-    conviction = "HIGH" if setup == "pullback" else "MEDIUM"
-
-    strike = round(price)
-    room_str = f"{room_atr:.1f} ATR room" if room_atr is not None else "clean breakout (no level ahead)"
-    rsi_str = f"{rsi:.0f}" if rsi is not None else "n/a"
-    reason = (
-        f"{EQUITY_ENGINE_VERSION}: {'UP' if up else 'DOWN'}-trend {setup} "
-        f"(ADX {adx:.1f}, {dist_atr:.1f} ATR from VWAP, {room_str}, "
-        f"RSI {rsi_str}) → {action}/{conviction}"
-    )
-    analysis = {
-        "spy_price": price,  # key reused by format_equities_signal (it's the ticker price)
-        "session_high": _f(sh), "session_low": _f(sl),
-        "dist_atr": round(dist_atr, 2),
-        "room_atr": round(room_atr, 2) if room_atr is not None else None,
-        "setup": setup, "adx": round(adx, 1),
-        "rsi9": round(rsi, 1) if rsi is not None else None,
-    }
-    return TickerDecision(ticker, action, float(strike), "0DTE", conviction, reason, analysis)
+    if _is_pullback(price, sh, sl, _resuming(bars, up), up):
+        return signal("pullback", "HIGH")
+    return hold("mid-extension chase — wait for a pullback, breakout, or ORB")
