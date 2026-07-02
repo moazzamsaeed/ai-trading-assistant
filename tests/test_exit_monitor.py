@@ -419,3 +419,67 @@ async def test_exit_monitor_cancels_stale_order_on_qty_held(session_factory):
     assert cancelled == ["stale-123"]  # the stale resting order was cancelled
     assert results[0]["status"] == "submit_error_qty_held"
     assert results[0]["error_sig"].endswith(":qty_held")
+
+
+# ----------------- marketable force-close -----------------
+
+
+async def test_force_close_submits_marketable_limit(session_factory):
+    """Force-close caps the submitted limit at the wing width (intrinsic max cost
+    to close a defined-risk spread) so the order always crosses and can't rest
+    unfilled — the failure that stranded condor #97 to a full expiry loss."""
+    _ic_trade(session_factory)  # wing_width 5
+    chain = _chain_at_debit(Decimal("1.00"))  # fair exit debit ~ $100/ct
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    captured: dict = {}
+
+    async def submitter(**kw):
+        captured.update(kw)
+        return OrderResult(
+            order_id="c1", status="new", filled_avg_price=None,
+            filled_qty=Decimal("0"), submitted_at=datetime.now(UTC), raw_status="new",
+        )
+
+    async def waiter(_id, *, timeout_s):
+        return _fake_fill("1.00")  # fills at the true (cheap) price, not the cap
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, force_close=True,
+    )
+    assert "force" in results[0]["reason"]
+    # wing 5 × 100 = $500/ct, well above the ~$100 fair debit → marketable cap used.
+    assert captured["limit_debit_per_contract"] == Decimal("500.00")
+
+
+async def test_stop_loss_keeps_conservative_limit(session_factory):
+    """A non-force (stop) exit keeps the computed exit debit — the marketable cap
+    is reserved for force-close so a transient mid-session spike isn't paid up to
+    the full wing width."""
+    _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("2.60"))  # $260/ct → breaches the 1.5x stop
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    captured: dict = {}
+
+    async def submitter(**kw):
+        captured.update(kw)
+        return OrderResult(
+            order_id="c1", status="new", filled_avg_price=None,
+            filled_qty=Decimal("0"), submitted_at=datetime.now(UTC), raw_status="new",
+        )
+
+    async def waiter(_id, *, timeout_s):
+        return _fake_fill("2.65")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, force_close=False,
+    )
+    assert results[0]["reason"] == "stop_loss_1.5x"
+    assert captured["limit_debit_per_contract"] == Decimal("260.00")

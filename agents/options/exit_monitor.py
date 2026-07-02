@@ -373,9 +373,22 @@ async def _process_one_condor_exit(
             "exit_debit": str(exit_debit),
         }
 
+    # Force-close must actually get us out before expiry — an ITM short leg left
+    # open is assigned/exercised. A limit at the fair exit debit can rest unfilled
+    # if the tape moved since the chain snapshot (this stranded condor #97 on
+    # 2026-07-02: SPY broke the short put, the close order never filled, and it rode
+    # to a full expiry loss). On force-close, submit a cap-marketable limit at the
+    # wing width — the intrinsic max cost to close a defined-risk spread — so the
+    # order always crosses while never paying more than the max loss we already
+    # accepted. The actual fill (final.filled_avg_price) still drives realized P&L.
+    submit_debit = exit_debit
+    if force_close:
+        wing = Decimal(str(extra.get("wing_width") or "5"))
+        submit_debit = max(exit_debit, (wing * Decimal("100")).quantize(Decimal("0.01")))
+
     order = await submitter(
         qty=int(Decimal(str(trade.qty))),
-        limit_debit_per_contract=exit_debit,
+        limit_debit_per_contract=submit_debit,
         short_put=legs[0],
         long_put=legs[1],
         short_call=legs[2],
