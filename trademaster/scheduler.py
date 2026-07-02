@@ -76,6 +76,25 @@ _SAME_ACTION_COOLDOWN_SECONDS = 1800
 _last_signal_posted: dict[tuple[str, str], datetime] = {}
 _SIGNAL_DEDUP_SECONDS = 1800
 
+# Throttle repeated iron-condor exit-error posts to #logs. A persistent broker
+# condition (a stale resting order holding the legs, a 0DTE force-close intent
+# mismatch) fails on every 5-min sweep; without this it posts an identical ⚠️
+# each cycle. Every failure is still written to the journal — only the Discord
+# post is deduped, keyed by a stable per-condition signature.
+_last_ic_exit_error_post: dict[str, datetime] = {}
+_IC_EXIT_ERROR_REPOST_SECONDS = 1800  # re-alert the same condition ≤ once / 30 min
+
+
+def _should_post_ic_exit_error(sig: str, now: datetime) -> bool:
+    """True if an iron-condor exit error with this signature hasn't been posted to
+    #logs within the throttle window (records the post time as a side effect)."""
+    last = _last_ic_exit_error_post.get(sig)
+    if last is None or (now - last).total_seconds() >= _IC_EXIT_ERROR_REPOST_SECONDS:
+        _last_ic_exit_error_post[sig] = now
+        return True
+    return False
+
+
 log = get_logger(__name__)
 
 PREMARKET_TZ = "America/New_York"
@@ -797,16 +816,26 @@ async def _iron_condor_exit_job(
             error=str(e),
             error_type=type(e).__name__,
         )
-        await log_poster(f"⚠️ Exit monitor failed: `{type(e).__name__}: {e}`")
+        # Throttle: an unexpected sweep-level failure repeats every 5 min until
+        # resolved — journal it every time, but only re-post to #logs periodically.
+        if _should_post_ic_exit_error(f"job:{type(e).__name__}", datetime.now(UTC)):
+            await log_poster(f"⚠️ Exit monitor failed: `{type(e).__name__}: {e}`")
         return
 
     for r in results:
         signal_text = r.get("signal_text")
         trade_text = r.get("trade_text")
+        error_text = r.get("error_text")
         if signal_text:
             await signal_poster(signal_text)
         if trade_text:
             await trade_poster(trade_text)
+        # Per-trade errors (stuck order, unfilled close, intent mismatch) go to
+        # #logs, deduped by signature so a persistent condition alerts once.
+        if error_text and _should_post_ic_exit_error(
+            r.get("error_sig") or error_text, datetime.now(UTC)
+        ):
+            await log_poster(error_text)
 
 
 # ----------------- end-of-day trade health check -----------------
