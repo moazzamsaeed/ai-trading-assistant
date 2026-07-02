@@ -4,7 +4,7 @@ Equity events follow US market hours (RTH 9:30-16:00 ET).
 Crypto events run 24/7 with their own cadence.
 
 Channel routing (passed as named posters by the orchestrator):
-- research_poster → #research (pre-market briefing)
+- research_poster → #research (pre-market briefing + mid-day & closing analysis)
 - signal_poster  → #signals  (broker-ready manual alerts: intraday scans,
                               iron-condor manual entry/exit signals)
 - trade_poster   → #trades   (automated bot activity: order fills, exits,
@@ -56,15 +56,6 @@ from trademaster.watchlist import load_tickers
 
 # Prevents concurrent directional scans (stream + scheduler can both trigger).
 _scan_in_progress: bool = False
-
-# Throttle #research posts to at most once per hour across all scan triggers.
-# Trade execution is unaffected — signals are still acted on immediately.
-_last_research_post: datetime | None = None
-_RESEARCH_POST_INTERVAL_SECONDS = 3600
-# Event-driven research posts (significant news) bypass the hourly cadence but
-# are deduped at 15 min so a news cluster doesn't spam #research.
-_last_event_research_post: datetime | None = None
-_EVENT_RESEARCH_DEDUP_SECONDS = 900
 
 # Per-ticker 15-min cooldown: short re-entry gap for SPY 0DTE where
 # missing a 60-min window means missing the entire move.
@@ -119,6 +110,49 @@ async def _premarket_job(
     await research_poster(text)
 
 
+# ----------------- market analysis (#research) -----------------
+
+
+async def _market_analysis_job(
+    *,
+    research_poster: Poster,
+    log_poster: Poster = _noop_poster,
+    mode: str = "intraday",
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+) -> None:
+    """Post a single market-analysis update to #research.
+
+    `mode="intraday"` is the once-a-day mid-day update (skipped if the market
+    is closed); `mode="close"` is the end-of-day wrap with tomorrow's outlook.
+    """
+    if get_state().is_paused():
+        log.info("market_analysis_skipped_paused", mode=mode)
+        return
+
+    try:
+        clock = await clock_fetcher()
+    except Exception as e:  # noqa: BLE001
+        log.warning("market_analysis_clock_failed", error=str(e), mode=mode)
+        return
+
+    # The mid-day update only makes sense while the market is open; the close
+    # wrap runs after the bell (market closed) so it isn't gated on is_open.
+    if mode == "intraday" and not clock.is_open:
+        log.info("market_analysis_skipped_closed", mode=mode)
+        return
+
+    try:
+        from agents.research.market_analysis import run_market_analysis
+        report = await run_market_analysis(mode=mode)
+    except Exception as e:  # noqa: BLE001
+        log.error("market_analysis_job_failed", error=str(e),
+                  error_type=type(e).__name__, mode=mode)
+        await log_poster(f"⚠️ Market analysis ({mode}) failed: `{type(e).__name__}: {e}`")
+        return
+
+    await research_poster(report)
+
+
 # ----------------- intraday scan -----------------
 
 
@@ -162,18 +196,14 @@ async def _directional_scan_job(
     *,
     signal_poster: Poster,
     trade_poster: Poster,
-    research_poster: Poster,
     log_poster: Poster = _noop_poster,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
-    post_report_on_hold: bool = True,
-    event_reason: str | None = None,
 ) -> None:
     """Sweep watchlist for directional signals.
 
-    - Always posts BUY signals to #signals and executes via Alpaca.
-    - `post_report_on_hold`: when False (stream-triggered), only posts to
-      #research if there's at least one BUY signal. When True (30-min
-      fallback), always posts the full per-ticker summary.
+    Posts BUY signals to #signals and executes via Alpaca. Market-analysis
+    narrative for #research is posted separately by `_market_analysis_job`
+    (mid-day + close), not from this scan.
     """
     if get_state().is_paused():
         log.info("directional_scan_skipped_paused")
@@ -287,7 +317,7 @@ async def _directional_scan_job(
         return
     _scan_in_progress = True
     try:
-        decisions, messages, scan_report = await run_directional_scan()
+        decisions, _messages, _scan_report = await run_directional_scan()
     except Exception as e:  # noqa: BLE001
         log.error(
             "directional_scan_failed",
@@ -300,39 +330,6 @@ async def _directional_scan_job(
         return
     finally:
         _scan_in_progress = False
-
-    # #research: a rich LLM market-analysis update, hourly — OR sooner if fired
-    # by a significant news event (deduped at 15 min). Replaces the terse
-    # per-ticker scan dump. Falls back to scan_report if the synthesis fails.
-    global _last_research_post, _last_event_research_post
-    now = datetime.now(UTC)
-    hourly_due = (
-        (now - _last_research_post).total_seconds() >= _RESEARCH_POST_INTERVAL_SECONDS
-        if _last_research_post else True
-    ) and post_report_on_hold
-    is_news_event = bool(event_reason) and "news" in event_reason.lower()
-    event_due = is_news_event and (
-        not _last_event_research_post
-        or (now - _last_event_research_post).total_seconds() >= _EVENT_RESEARCH_DEDUP_SECONDS
-    )
-    if hourly_due or event_due:
-        try:
-            from agents.research.market_analysis import run_market_analysis
-            report = await run_market_analysis(
-                now=now, trigger=event_reason if event_due else None
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("market_analysis_failed", error=str(e))
-            report = scan_report
-        # Append the deterministic engine's actual decision so #research shows the
-        # LLM commentary AND what the rules decided (they can diverge now).
-        if get_settings().deterministic_engine:
-            from agents.directional.intraday import format_engine_research_line
-            report = f"{report}\n{format_engine_research_line(decisions)}"
-        await research_poster(report)
-        _last_research_post = now
-        if event_due:
-            _last_event_research_post = now
 
     # Pre-emptive "setup forming" alerts (Option A): for HOLD decisions that are
     # strong near-misses, post an anticipatory watch alert to #signals BEFORE any
@@ -640,16 +637,61 @@ async def _post_trade_closed(trade_poster: Poster, trade_id) -> None:
 
 
 async def _daily_summary_job(*, trade_poster: Poster, log_poster: Poster = _noop_poster) -> None:
-    """End-of-day tabular breakdown of the day's closed trades → #trades."""
+    """End-of-day breakdown → #trades: the day's closed directional trades PLUS any
+    0DTE iron condor traded today. A condor held to expiry isn't booked until the
+    next-morning reconcile, so we project its expiry outcome (read-only) instead of
+    omitting it — the report reflects reality even when the credit lands tomorrow."""
     try:
-        from trademaster.db import day_bounds_utc, get_closed_directional_trades
-        from trademaster.reporting import format_trades_summary
+        from datetime import date as _date
+
+        from trademaster.db import (
+            day_bounds_utc, get_closed_directional_trades, get_condor_trades,
+        )
+        from trademaster.reconciler import _underlying_close_on
+        from trademaster.reporting import (
+            build_condor_outcome, format_condor_summary, format_trades_summary,
+        )
+        from trademaster.timeutils import to_et
         start, end = day_bounds_utc()
-        trades = get_closed_directional_trades(make_session_factory(), start=start, end=end)
-        if not trades:
+        sf = make_session_factory()
+        trades = get_closed_directional_trades(sf, start=start, end=end)
+
+        async def _settlement_spot(expiry_d):
+            # The report runs ~16:05, when today's DAILY bar isn't published yet, so
+            # use the last intraday close as the ~4pm settlement. Fall back to the
+            # daily bar (for a rare prior-day expiry, or an evening re-run).
+            try:
+                bars = await alpaca_client.get_recent_bars(
+                    "SPY", timeframe_minutes=5, limit=80)
+                if bars and to_et(bars[-1].timestamp).date() == expiry_d:
+                    return float(bars[-1].close)
+            except Exception:  # noqa: BLE001 — projection is best-effort
+                pass
+            return await _underlying_close_on(expiry_d)
+
+        outcomes = []
+        for c in get_condor_trades(sf, start=start, end=end):
+            spot = None
+            if c.get("closed_at") is None:  # held to expiry → project from the close
+                exp = c.get("expiry")
+                try:
+                    d = (_date.fromisoformat(exp) if exp
+                         else (c["opened_at"].date() if c.get("opened_at") else None))
+                except (ValueError, TypeError):
+                    d = None
+                if d is not None:
+                    spot = await _settlement_spot(d)
+            outcomes.append(build_condor_outcome(c, spot))
+
+        parts = []
+        if trades:
+            parts.append(format_trades_summary(
+                trades, title="Daily Trade Summary", period=today_et().isoformat()))
+        if outcomes:
+            parts.append(format_condor_summary(outcomes, period=today_et().isoformat()))
+        if not parts:
             return  # silent on no-trade days
-        await trade_poster(format_trades_summary(
-            trades, title="Daily Trade Summary", period=today_et().isoformat()))
+        await trade_poster("\n\n".join(parts))
     except Exception as e:  # noqa: BLE001
         log.warning("daily_summary_failed", error=str(e))
         await log_poster(f"⚠️ Daily summary failed: `{type(e).__name__}: {e}`")
@@ -921,12 +963,39 @@ def make_scheduler(
         kwargs={
             "signal_poster": signal_poster,
             "trade_poster": trade_poster,
-            "research_poster": research_poster,
             "log_poster": log_post,
         },
         id="directional_scan",
         replace_existing=True,
         misfire_grace_time=300,
+    )
+
+    # #research market analysis — exactly two LLM updates a day (plus the 8 AM
+    # pre-market briefing above). One mid-day read of the tape at 12:30 ET and
+    # one closing wrap with tomorrow's outlook at 16:05 ET (after the bell).
+    scheduler.add_job(
+        _market_analysis_job,
+        CronTrigger(day_of_week="mon-fri", hour=12, minute=30, timezone=PREMARKET_TZ),
+        kwargs={
+            "research_poster": research_poster,
+            "log_poster": log_post,
+            "mode": "intraday",
+        },
+        id="research_midday",
+        replace_existing=True,
+        misfire_grace_time=900,
+    )
+    scheduler.add_job(
+        _market_analysis_job,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=PREMARKET_TZ),
+        kwargs={
+            "research_poster": research_poster,
+            "log_poster": log_post,
+            "mode": "close",
+        },
+        id="research_close",
+        replace_existing=True,
+        misfire_grace_time=900,
     )
 
     # Directional exit monitor — every MINUTE during RTH (9:00–15:59 ET).
@@ -1128,7 +1197,6 @@ def make_scheduler(
 def make_directional_trigger(
     *,
     main_loop: "asyncio.AbstractEventLoop",
-    research_poster: Poster,
     signal_poster: Poster,
     trade_poster: Poster,
     log_poster: Poster | None = None,
@@ -1149,10 +1217,7 @@ def make_directional_trigger(
         await _directional_scan_job(
             signal_poster=signal_poster,
             trade_poster=trade_poster,
-            research_poster=research_poster,
             log_poster=log_post,
-            post_report_on_hold=False,  # silent if all HOLD — only post on BUY signals
-            event_reason=reason,  # significant news → fire a #research update
         )
 
     return DirectionalStreamTrigger(
@@ -1191,7 +1256,6 @@ async def run_intraday_once(
 async def run_directional_once(
     signal_poster: Poster,
     trade_poster: Poster,
-    research_poster: Poster,
     *,
     log_poster: Poster | None = None,
     clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
@@ -1200,7 +1264,6 @@ async def run_directional_once(
     await _directional_scan_job(
         signal_poster=signal_poster,
         trade_poster=trade_poster,
-        research_poster=research_poster,
         log_poster=log_poster or _noop_poster,
         clock_fetcher=clock_fetcher,
     )

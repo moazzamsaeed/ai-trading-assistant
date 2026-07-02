@@ -1,4 +1,4 @@
-"""Tests for the hourly #research market-analysis synthesis."""
+"""Tests for the #research market-analysis synthesis (mid-day + close)."""
 
 from __future__ import annotations
 
@@ -56,21 +56,24 @@ async def test_run_market_analysis_produces_report(monkeypatch, session_factory)
     assert "Trend & Regime" in out
 
 
-async def test_run_market_analysis_event_tagged(monkeypatch, session_factory):
+async def test_run_market_analysis_close_mode(monkeypatch, session_factory):
     async def fake_bars(t, *, timeframe_minutes, limit, warmup_days=0):
         return [] if t == "VIX" else _bars()
 
-    async def fake_route(_task_type, _prompt, **_k):
-        return LLMResponse(text="update", provider="deepseek", model="deepseek-v4-flash",
+    captured: dict[str, str] = {}
+
+    async def fake_route(_task_type, prompt, **_k):
+        captured["prompt"] = prompt
+        return LLMResponse(text="wrap", provider="deepseek", model="deepseek-v4-flash",
                            input_tokens=1, output_tokens=1, cost_usd=Decimal("0"), duration_ms=1)
 
     monkeypatch.setattr(ma, "route_to_model", fake_route)
     out = await ma.run_market_analysis(
-        now=datetime(2026, 6, 5, 19, 0, tzinfo=UTC), bars_fetcher=fake_bars,
+        now=datetime(2026, 6, 5, 20, 5, tzinfo=UTC), mode="close", bars_fetcher=fake_bars,
         news_fetcher=lambda *a, **k: _noop(), session_factory=session_factory,
-        trigger="news:tariffs",
     )
-    assert "news-triggered" in out
+    assert "Tomorrow's Outlook" in out
+    assert "Tomorrow's Bias" in captured["prompt"]
 
 
 async def _noop():
