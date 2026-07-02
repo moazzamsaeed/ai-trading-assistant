@@ -372,3 +372,30 @@ async def test_strategist_open_rejected_by_risk_no_alert(monkeypatch, session_fa
         assert row.action == "open"
         assert row.accepted is False
         assert row.rejection_reason is not None
+
+
+async def test_condor_qty_defaults_to_config(monkeypatch, session_factory):
+    """With qty unset, the condor strategist sizes from settings.condor_contracts."""
+    monkeypatch.setattr(strategist.get_settings(), "condor_contracts", 2)
+
+    async def route(_task_type, _prompt, **_k):
+        return _llm_response('{"decision": "OPEN", "confidence": 0.7, "reasoning": "x"}')
+
+    captured = {}
+
+    async def fake_executor(plan, **_kwargs):
+        captured["qty"] = plan.qty
+        from agents.options.executor import ExecutionResult
+        return ExecutionResult(executed=True, order=None, trade_id=7, reason="filled")
+
+    monkeypatch.setattr(strategist, "route_to_model", route)
+    fetch_account = await _account_fetcher(_account("10000"))
+
+    await strategist.run_iron_condor_strategist(
+        session_factory=session_factory,
+        stock_fetcher=_stock,
+        chain_fetcher=_chain,
+        account_fetcher=fetch_account,
+        executor=fake_executor,  # no qty → resolves from config (=2)
+    )
+    assert captured.get("qty") == 2

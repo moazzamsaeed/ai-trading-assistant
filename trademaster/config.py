@@ -152,6 +152,14 @@ class Settings(BaseSettings):
     # for the remainder of the week when hit.
     weekly_loss_limit_pct: float = Field(default=0.25, gt=0, le=1.0)
 
+    # Iron-condor position size (contracts per entry). Defined-risk, so P&L and
+    # drawdown scale LINEARLY with this. HARD-CAPPED at 2: the sizing backtest
+    # (scripts/backtest_condor_sizing.py, 2023→2026) showed 2 contracts never
+    # breached the daily/weekly loss limits (worst week −$1,080 vs the $2,500
+    # limit), while 3 starts to approach them. Default 1 (conservative); raise to
+    # 2 once the live edge is confirmed and a ~20% account drawdown is acceptable.
+    condor_contracts: int = Field(default=1, ge=1, le=2)
+
     # Tiered daily trade caps. **0 = UNLIMITED** (no per-day count cap) — set as
     # the default 2026-06-07: with capital at $25k and risk bounded by the daily
     # loss limit (15%), per-trade cap (10%), 30% exposure cap, and the per-ticker
