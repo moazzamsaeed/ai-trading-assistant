@@ -93,6 +93,9 @@ def _accumulate(stats, engine, decision, favor):
         return
     stats[(engine, decision.conviction)].append(favor)
     stats[(engine, "ALL")].append(favor)
+    setup = (decision.analysis or {}).get("setup")
+    if setup:  # per-setup breakdown (orb_breakout / breakout / pullback)
+        stats[(engine, f"~{setup}")].append(favor)
 
 
 def _run_symbol(symbol: str, stats: dict) -> None:
@@ -118,7 +121,7 @@ def _run_symbol(symbol: str, stats: dict) -> None:
                 continue  # indicators not bootstrapped yet
             snap = indicators.snapshot(window, session_start_et=session_open)
             ctx = _market_ctx(prev_bars, daily_closes, day_bars[: bi + 1])
-            new_d = decide_equity(symbol, window, snap, ctx)
+            new_d = decide_equity(symbol, window, snap, ctx, now=day_bars[bi].timestamp)
             old_d = old_decide(symbol, snap, ctx)
             _accumulate(stats, "NEW", new_d, _favorable(day_bars, bi, new_d.action))
             _accumulate(stats, "OLD", old_d, _favorable(day_bars, bi, old_d.action))
@@ -131,15 +134,22 @@ def _run_symbol(symbol: str, stats: dict) -> None:
 def _print_block(label, stats, *, indent=False):
     pad = "    " if indent else ""
     print(f"{label}")
+
+    def _row(engine, key, disp):
+        fs = stats.get((engine, key))
+        if not fs:
+            return
+        n = len(fs)
+        hit = sum(1 for f in fs if f > 0) / n * 100
+        avg = sum(fs) / n * 100
+        print(f"{pad}{engine:<3} {disp:<14} n={n:>5}  hit={hit:5.1f}%  avg favorable={avg:+.4f}%")
+
     for engine in ("OLD", "NEW"):
         for conv in ("ALL", "HIGH", "MEDIUM"):
-            fs = stats.get((engine, conv))
-            if not fs:
-                continue
-            n = len(fs)
-            hit = sum(1 for f in fs if f > 0) / n * 100
-            avg = sum(fs) / n * 100
-            print(f"{pad}{engine:<3} {conv:<6} n={n:>5}  hit={hit:5.1f}%  avg favorable={avg:+.4f}%")
+            _row(engine, conv, conv)
+        # per-setup breakdown for NEW (orb_breakout / breakout / pullback)
+        for setup in ("~orb_breakout", "~breakout", "~pullback"):
+            _row(engine, setup, setup[1:])
 
 
 def main():
