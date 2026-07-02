@@ -823,12 +823,20 @@ async def get_daily_bars(
         # (esp. outside market hours), which silently breaks ADX / prev-close /
         # MA features. Anchor an explicit lookback window: ~2× the requested
         # sessions in calendar days (+10 buffer for weekends/holidays).
-        start = datetime.now(UTC) - timedelta(days=limit * 2 + 10)
+        window_days = limit * 2 + 10
+        start = datetime.now(UTC) - timedelta(days=window_days)
+        # Alpaca returns bars OLDEST-first from `start` and truncates at the API
+        # `limit`. Passing `limit` here would keep the OLDEST `limit` sessions of
+        # the window, not the newest — observed live: limit=10 returned 3-week-
+        # stale bars (newest 06-16), which silently broke the settlement
+        # reconciler (`_underlying_close_on` never found the expiry date, so
+        # expired 0DTE condors never settled). Over-fetch the whole window and
+        # slice the tail instead. `window_days` >= sessions-in-window always.
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=TimeFrame(1, TimeFrameUnit.Day),
             start=start,
-            limit=limit,
+            limit=window_days + 5,
             feed=DataFeed.IEX,
         )
         resp = _stock_client().get_stock_bars(req)
@@ -838,7 +846,7 @@ async def get_daily_bars(
             raw_bars = resp.data.get(symbol, []) if isinstance(resp.data, dict) else resp.data
         else:
             raw_bars = []
-        return [_to_bar(b) for b in raw_bars]
+        return [_to_bar(b) for b in raw_bars][-limit:]
 
     return await asyncio.to_thread(_fetch)
 
