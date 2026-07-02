@@ -1036,3 +1036,74 @@ async def test_health_check_launch_failure_routes_to_logs(monkeypatch):
     assert len(posted) == 1
     assert "failed to run" in posted[0].lower()
     assert "no python" in posted[0]
+
+
+async def test_exit_job_throttles_repeated_error(monkeypatch):
+    """A persistent per-trade exit error posts to #logs once per throttle window,
+    not on every 5-min sweep (the stuck-order spam this replaces)."""
+    sch._last_ic_exit_error_post.clear()
+    logs: list[str] = []
+
+    async def s(_t):
+        pass
+
+    async def tr(_t):
+        pass
+
+    async def lg(t):
+        logs.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def fake_monitor(**_kwargs):
+        return [{
+            "trade_id": 7,
+            "status": "submit_error_qty_held",
+            "error_sig": "7:qty_held",
+            "error_text": "⚠️ blocked by resting order",
+        }]
+
+    monkeypatch.setattr(sch, "run_exit_monitor", fake_monitor)
+    for _ in range(3):
+        await sch._iron_condor_exit_job(
+            signal_poster=s, trade_poster=tr, log_poster=lg, clock_fetcher=clock_open
+        )
+    assert logs == ["⚠️ blocked by resting order"]  # 3 sweeps → 1 post
+    sch._last_ic_exit_error_post.clear()
+
+
+async def test_exit_job_posts_per_trade_error_to_logs(monkeypatch):
+    """A per-trade error result routes its ⚠️ text to #logs (not #signals/#trades)."""
+    sch._last_ic_exit_error_post.clear()
+    sig: list[str] = []
+    trd: list[str] = []
+    logs: list[str] = []
+
+    async def s(t):
+        sig.append(t)
+
+    async def tr(t):
+        trd.append(t)
+
+    async def lg(t):
+        logs.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def fake_monitor(**_kwargs):
+        return [{
+            "trade_id": 9,
+            "status": "submit_error",
+            "error_sig": "9:APIError",
+            "error_text": "⚠️ Iron-condor close failed for trade #9",
+        }]
+
+    monkeypatch.setattr(sch, "run_exit_monitor", fake_monitor)
+    await sch._iron_condor_exit_job(
+        signal_poster=s, trade_poster=tr, log_poster=lg, clock_fetcher=clock_open
+    )
+    assert sig == [] and trd == []
+    assert logs == ["⚠️ Iron-condor close failed for trade #9"]
+    sch._last_ic_exit_error_post.clear()

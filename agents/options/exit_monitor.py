@@ -17,6 +17,7 @@ and closed_at.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, time
 from decimal import Decimal
@@ -188,6 +189,7 @@ async def run_exit_monitor(
     chain_fetcher: Callable[..., object] = alpaca_client.get_options_chain,
     submitter: Callable[..., object] = alpaca_client.submit_iron_condor_close,
     waiter: Callable[..., object] = alpaca_client.wait_for_order,
+    canceller: Callable[..., object] = alpaca_client.cancel_order,
     force_close: bool | None = None,
     fill_timeout_s: float = 60.0,
 ) -> list[dict]:
@@ -211,115 +213,227 @@ async def run_exit_monitor(
         return results
 
     for trade in trades:
-        extra = trade.extra or {}
-        legs = (
-            extra.get("short_put"),
-            extra.get("long_put"),
-            extra.get("short_call"),
-            extra.get("long_call"),
-        )
-        if not all(legs):
-            log.warning("exit_monitor_missing_legs", trade_id=trade.id, extra=extra)
-            results.append({"trade_id": trade.id, "status": "missing_legs"})
-            continue
-
-        chain = await chain_fetcher(
-            "SPY", expiry=trade.opened_at.date()
-            if trade.opened_at is not None
-            else now.date(),
-        )
-        exit_debit = _compute_exit_debit_per_contract(
-            chain=chain,
-            short_put_occ=legs[0],
-            long_put_occ=legs[1],
-            short_call_occ=legs[2],
-            long_call_occ=legs[3],
-        )
-        if exit_debit is None:
-            log.warning("exit_monitor_no_quotes", trade_id=trade.id)
-            results.append({"trade_id": trade.id, "status": "no_quotes"})
-            continue
-
-        credit = Decimal(str(trade.entry_price))
-        should_exit, reason = _decide_exit(
-            credit_received=credit,
-            exit_debit=exit_debit,
-            force=force_close,
-        )
-        if not should_exit:
-            results.append(
-                {
-                    "trade_id": trade.id,
-                    "status": "hold",
-                    "credit": str(credit),
-                    "exit_debit": str(exit_debit),
-                }
+        try:
+            result = await _process_one_condor_exit(
+                trade,
+                now=now,
+                factory=factory,
+                chain_fetcher=chain_fetcher,
+                submitter=submitter,
+                waiter=waiter,
+                force_close=force_close,
+                fill_timeout_s=fill_timeout_s,
             )
-            continue
-
-        order = await submitter(
-            qty=int(Decimal(str(trade.qty))),
-            limit_debit_per_contract=exit_debit,
-            short_put=legs[0],
-            long_put=legs[1],
-            short_call=legs[2],
-            long_call=legs[3],
-        )
-        final = await waiter(order.order_id, timeout_s=fill_timeout_s)
-        log.info(
-            "exit_monitor_close_terminal",
-            trade_id=trade.id,
-            reason=reason,
-            order_id=final.order_id,
-            status=final.status,
-        )
-
-        actual_debit = exit_debit
-        if final.filled_avg_price is not None:
-            # Closing an IC is a net DEBIT (buying back the spread). Alpaca
-            # returns a positive per-share price for debit fills; take abs as
-            # a safety net in case the sign convention varies.
-            actual_debit = abs(final.filled_avg_price * Decimal("100")).quantize(
-                Decimal("0.01")
-            )
-
-        if final.status == "filled":
-            with factory() as session:
-                row = session.get(Trade, trade.id)
-                if row is not None:
-                    _close_trade_row(
-                        session,
-                        row,
-                        exit_debit_per_contract=actual_debit,
-                        order=final,
-                        reason=reason,
-                    )
-            signal_text = _format_exit_signal(trade, exit_debit, reason)
-            trade_text = _format_exit_telemetry(
-                trade, exit_debit=actual_debit, reason=reason
-            )
-            results.append(
-                {
-                    "trade_id": trade.id,
-                    "status": "closed",
-                    "reason": reason,
-                    "exit_debit": str(actual_debit),
-                    "realized_pnl_per_contract": str(credit - actual_debit),
-                    "signal_text": signal_text,
-                    "trade_text": trade_text,
-                }
-            )
-        else:
-            results.append(
-                {
-                    "trade_id": trade.id,
-                    "status": f"close_order_{final.status}",
-                    "reason": reason,
-                    "trade_text": (
-                        f"⚠️ Iron-condor close failed — trade #{trade.id} · "
-                        f"reason `{reason}` · order status `{final.status}`"
-                    ),
-                }
-            )
+        except Exception as e:  # noqa: BLE001 — one stuck trade must not abort the sweep
+            result = await _handle_condor_exit_error(trade, e, canceller=canceller)
+        results.append(result)
 
     return results
+
+
+def _parse_broker_error(err: object) -> tuple[str | None, list[str]]:
+    """Best-effort extraction of (code, related_order_ids) from an Alpaca APIError.
+
+    Alpaca embeds a JSON object in the exception text, e.g.
+    `{"available":"0","code":40310000,...,"related_orders":["<id>"]}`. Returns
+    (None, []) when nothing parseable is found."""
+    s = str(err)
+    brace = s.find("{")
+    if brace == -1:
+        return None, []
+    try:
+        data = json.loads(s[brace:])
+    except (ValueError, json.JSONDecodeError):
+        return None, []
+    if not isinstance(data, dict):
+        return None, []
+    code = data.get("code")
+    related = data.get("related_orders")
+    related_ids = [str(o) for o in related] if isinstance(related, list) else []
+    return (str(code) if code is not None else None), related_ids
+
+
+async def _handle_condor_exit_error(
+    trade, err: Exception, *, canceller: Callable[..., object]
+) -> dict:
+    """Turn a broker exception into an isolated, retry-safe result dict.
+
+    The dominant real failure is `insufficient qty available` (code 40310000): a
+    stale resting close order from a previous sweep still holds the legs' quantity,
+    so every re-submit fails. Cancel that order so the next sweep can submit cleanly
+    (cancel-replace). Other errors — e.g. the 0DTE force-close `position intent
+    mismatch` — are surfaced once (throttled downstream) and left for the next sweep
+    or the morning reconciler to settle by expiry."""
+    err_str = str(err)
+    code, related = _parse_broker_error(err)
+    qty_held = (
+        code == "40310000"
+        or "insufficient qty" in err_str
+        or "held_for_orders" in err_str
+    )
+
+    if qty_held:
+        for oid in related:
+            try:
+                await canceller(oid)
+                log.warning(
+                    "exit_monitor_cancelled_stale_order",
+                    trade_id=trade.id, order_id=oid,
+                )
+            except Exception as ce:  # noqa: BLE001 — cancel is best-effort
+                log.warning(
+                    "exit_monitor_cancel_failed",
+                    trade_id=trade.id, order_id=oid, error=str(ce),
+                )
+        log.error(
+            "exit_monitor_trade_failed",
+            trade_id=trade.id, error=err_str,
+            error_type=type(err).__name__, cancelled=list(related),
+        )
+        cancelled = ", ".join(related) if related else "none found"
+        return {
+            "trade_id": trade.id,
+            "status": "submit_error_qty_held",
+            "error_sig": f"{trade.id}:qty_held",
+            "error_text": (
+                f"⚠️ Iron-condor close for trade #{trade.id} blocked — its quantity is "
+                f"held by a resting order (cancelled: {cancelled}). Will retry next sweep."
+            ),
+        }
+
+    log.error(
+        "exit_monitor_trade_failed",
+        trade_id=trade.id, error=err_str, error_type=type(err).__name__,
+    )
+    return {
+        "trade_id": trade.id,
+        "status": "submit_error",
+        "error_sig": f"{trade.id}:{code or type(err).__name__}",
+        "error_text": (
+            f"⚠️ Iron-condor close failed for trade #{trade.id}: "
+            f"`{type(err).__name__}: {err}`"
+        ),
+    }
+
+
+async def _process_one_condor_exit(
+    trade,
+    *,
+    now: datetime,
+    factory: Callable[[], Session],
+    chain_fetcher: Callable[..., object],
+    submitter: Callable[..., object],
+    waiter: Callable[..., object],
+    force_close: bool,
+    fill_timeout_s: float,
+) -> dict:
+    """Evaluate one open iron-condor trade and close it if a threshold fired.
+
+    Returns exactly one result dict. Raises only on unexpected broker/IO errors;
+    the caller isolates those (see `_handle_condor_exit_error`) so a single stuck
+    trade cannot abort the whole sweep."""
+    extra = trade.extra or {}
+    legs = (
+        extra.get("short_put"),
+        extra.get("long_put"),
+        extra.get("short_call"),
+        extra.get("long_call"),
+    )
+    if not all(legs):
+        log.warning("exit_monitor_missing_legs", trade_id=trade.id, extra=extra)
+        return {"trade_id": trade.id, "status": "missing_legs"}
+
+    chain = await chain_fetcher(
+        "SPY", expiry=trade.opened_at.date()
+        if trade.opened_at is not None
+        else now.date(),
+    )
+    exit_debit = _compute_exit_debit_per_contract(
+        chain=chain,
+        short_put_occ=legs[0],
+        long_put_occ=legs[1],
+        short_call_occ=legs[2],
+        long_call_occ=legs[3],
+    )
+    if exit_debit is None:
+        log.warning("exit_monitor_no_quotes", trade_id=trade.id)
+        return {"trade_id": trade.id, "status": "no_quotes"}
+
+    credit = Decimal(str(trade.entry_price))
+    should_exit, reason = _decide_exit(
+        credit_received=credit,
+        exit_debit=exit_debit,
+        force=force_close,
+    )
+    if not should_exit:
+        return {
+            "trade_id": trade.id,
+            "status": "hold",
+            "credit": str(credit),
+            "exit_debit": str(exit_debit),
+        }
+
+    order = await submitter(
+        qty=int(Decimal(str(trade.qty))),
+        limit_debit_per_contract=exit_debit,
+        short_put=legs[0],
+        long_put=legs[1],
+        short_call=legs[2],
+        long_call=legs[3],
+    )
+    final = await waiter(order.order_id, timeout_s=fill_timeout_s)
+    log.info(
+        "exit_monitor_close_terminal",
+        trade_id=trade.id,
+        reason=reason,
+        order_id=final.order_id,
+        status=final.status,
+    )
+
+    actual_debit = exit_debit
+    if final.filled_avg_price is not None:
+        # Closing an IC is a net DEBIT (buying back the spread). Alpaca returns a
+        # positive per-share price for debit fills; take abs as a safety net in
+        # case the sign convention varies.
+        actual_debit = abs(final.filled_avg_price * Decimal("100")).quantize(
+            Decimal("0.01")
+        )
+
+    if final.status == "filled":
+        with factory() as session:
+            row = session.get(Trade, trade.id)
+            if row is not None:
+                _close_trade_row(
+                    session,
+                    row,
+                    exit_debit_per_contract=actual_debit,
+                    order=final,
+                    reason=reason,
+                )
+        signal_text = _format_exit_signal(trade, exit_debit, reason)
+        trade_text = _format_exit_telemetry(
+            trade, exit_debit=actual_debit, reason=reason
+        )
+        return {
+            "trade_id": trade.id,
+            "status": "closed",
+            "reason": reason,
+            "exit_debit": str(actual_debit),
+            "realized_pnl_per_contract": str(credit - actual_debit),
+            "signal_text": signal_text,
+            "trade_text": trade_text,
+        }
+
+    # Submitted but reached a terminal non-filled status (canceled/rejected) — an
+    # ops error, not routine telemetry. Route to #logs (throttled) so a repeatedly
+    # unfilled close doesn't spam every sweep.
+    return {
+        "trade_id": trade.id,
+        "status": f"close_order_{final.status}",
+        "reason": reason,
+        "error_sig": f"{trade.id}:close_{final.status}",
+        "error_text": (
+            f"⚠️ Iron-condor close failed — trade #{trade.id} · "
+            f"reason `{reason}` · order status `{final.status}`"
+        ),
+    }

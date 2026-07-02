@@ -337,3 +337,85 @@ async def test_force_close_auto_after_1550_et():
     # 15:55 ET → 19:55 UTC (EDT) / 20:55 (EST). We assert the time-only check.
     assert time(15, 55) >= em.FORCE_CLOSE_AFTER
     assert time(15, 49) < em.FORCE_CLOSE_AFTER
+
+
+# ----------------- error isolation / stuck-order handling -----------------
+
+
+async def test_exit_monitor_isolates_one_trade_error(session_factory):
+    """A broker exception on one trade must not abort the sweep — the second trade
+    is still attempted and both surface as result dicts (run_exit_monitor never
+    raises), leaving both positions open to retry."""
+    id1 = _ic_trade(session_factory)
+    id2 = _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("1.00"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    calls = {"n": 0}
+
+    async def submitter(**_k):
+        calls["n"] += 1
+        raise RuntimeError("boom from broker")
+
+    async def waiter(*_a, **_k):
+        return _fake_fill("1.00")
+
+    async def canceller(_oid):
+        return None
+
+    results = await run_exit_monitor(
+        session_factory=session_factory,
+        chain_fetcher=chain_fetcher,
+        submitter=submitter,
+        waiter=waiter,
+        canceller=canceller,
+        force_close=True,
+    )
+    assert calls["n"] == 2  # both trades attempted despite the first failing
+    assert len(results) == 2
+    assert {r["status"] for r in results} == {"submit_error"}
+    assert all(r["error_text"].startswith("⚠️") for r in results)
+    with session_factory() as s:
+        assert s.get(Trade, id1).closed_at is None
+        assert s.get(Trade, id2).closed_at is None
+
+
+async def test_exit_monitor_cancels_stale_order_on_qty_held(session_factory):
+    """`insufficient qty available` (code 40310000) means a resting order still
+    holds the legs. The monitor cancels that related order (cancel-replace) and
+    returns a retry-safe status rather than looping on the same rejection."""
+    _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("1.00"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_k):
+        raise RuntimeError(
+            '{"available":"0","code":40310000,"existing_qty":"2",'
+            '"held_for_orders":"2","message":"insufficient qty available for order '
+            '(requested: 2, available: 0)","related_orders":["stale-123"],'
+            '"symbol":"SPY260511P00495000"}'
+        )
+
+    async def waiter(*_a, **_k):
+        return _fake_fill("1.00")
+
+    cancelled: list[str] = []
+
+    async def canceller(oid):
+        cancelled.append(oid)
+
+    results = await run_exit_monitor(
+        session_factory=session_factory,
+        chain_fetcher=chain_fetcher,
+        submitter=submitter,
+        waiter=waiter,
+        canceller=canceller,
+        force_close=True,
+    )
+    assert cancelled == ["stale-123"]  # the stale resting order was cancelled
+    assert results[0]["status"] == "submit_error_qty_held"
+    assert results[0]["error_sig"].endswith(":qty_held")
