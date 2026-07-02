@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -403,6 +403,62 @@ async def test_monitor_zdte_early_cut_without_llm(session_factory):
     results = await run_directional_exit_monitor(
         session_factory=session_factory, now=_MORNING_NOW, quote_fetcher=loss_quote,
         bars_fetcher=below_vwap_bars, submitter=fake_sell, waiter=fake_wait,
+        llm_caller=hold_llm, force_close=False,
+    )
+    assert results[0]["status"] == "closed"
+    assert results[0]["reason"] == "zdte_early_cut"
+
+
+async def test_zdte_early_cut_uses_session_anchored_vwap(session_factory):
+    """Regression: the exit monitor must scope VWAP to today's RTH bars only.
+
+    The 60×5-min fetch spans ~5h, so early in the session most bars are the prior
+    session. A cross-session VWAP gets pulled toward yesterday's prices and hides
+    a real intraday VWAP break — suppressing the 0DTE early-cut that fires on the
+    break alone. Here yesterday traded ~480 while today prints 495 against a
+    same-session VWAP of 498: price is BELOW today's VWAP (a break for a call) but
+    ABOVE the blended cross-session VWAP (~482). Only the session-anchored value
+    triggers the cut, so this fails if snapshot() is called without session_start_et."""
+    _open_trade(session_factory, entry_premium=2.00)  # BUY_CALL, occ expired → 0DTE
+
+    async def loss_quote(_occ):
+        return _quote(bid=1.46)  # −27%: past the −25% cut, above the −30% floor
+
+    from integrations.alpaca_client import Bar
+
+    def _bar(ts, close, vwap):
+        return Bar(
+            timestamp=ts, open=Decimal(str(close)), high=Decimal(str(close + 0.2)),
+            low=Decimal(str(close - 0.2)), close=Decimal(str(close)), volume=8000,
+            vwap=Decimal(str(vwap)),
+        )
+
+    async def two_session_bars(*_a, **_k):
+        # _MORNING_NOW is 2026-06-23 10:00 ET → session opens 09:30 ET.
+        bars = [
+            # Prior session (2026-06-22) — must be EXCLUDED from VWAP. High volume so
+            # that if wrongly included it would drag the blended VWAP down to ~482.
+            _bar(datetime(2026, 6, 22, 17, 0, tzinfo=UTC) + timedelta(minutes=5 * i), 480.0, 480.0)
+            for i in range(55)
+        ] + [
+            # Today (from 09:35 ET = 13:35 UTC): price 495 under a session VWAP of 498.
+            _bar(datetime(2026, 6, 23, 13, 35, tzinfo=UTC) + timedelta(minutes=5 * i), 495.0, 498.0)
+            for i in range(5)
+        ]
+        return bars
+
+    async def fake_sell(**_k):
+        return _filled(price=1.46)
+
+    async def fake_wait(order_id, **_k):
+        return _filled(price=1.46)
+
+    async def hold_llm(*_a, **_k):
+        return _fake_llm("HOLD", "must not be reached — the anchored VWAP break cuts first")
+
+    results = await run_directional_exit_monitor(
+        session_factory=session_factory, now=_MORNING_NOW, quote_fetcher=loss_quote,
+        bars_fetcher=two_session_bars, submitter=fake_sell, waiter=fake_wait,
         llm_caller=hold_llm, force_close=False,
     )
     assert results[0]["status"] == "closed"

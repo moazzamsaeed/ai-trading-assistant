@@ -916,7 +916,14 @@ async def run_directional_exit_monitor(
             snap: dict = {}
             try:
                 bars = await bars_fetcher(ticker, timeframe_minutes=5, limit=60)
-                snap = indicators.snapshot(bars)
+                # Anchor VWAP to today's RTH bars only. The 60×5-min fetch spans
+                # ~5h, so early in the session most bars are the prior session —
+                # an un-anchored VWAP is cross-session (mathematically wrong) and
+                # would corrupt the price-vs-VWAP reversal exits, most critically
+                # the 0DTE early-cut, which fires on the VWAP break alone.
+                session_open_et = et_now.replace(
+                    hour=9, minute=30, second=0, microsecond=0)
+                snap = indicators.snapshot(bars, session_start_et=session_open_et)
             except Exception as e:  # noqa: BLE001
                 log.warning("exit_monitor_bars_failed", trade_id=trade.id, error=str(e))
 

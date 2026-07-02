@@ -45,6 +45,13 @@ BARS_TIMEFRAME_MIN = 5
 BARS_LIMIT = 60  # EMA50 needs ≥50 bars; 60 gives comfortable headroom
 NEWS_LOOKBACK_MIN = 30
 
+# VWAP-distance thresholds for SPY regime classification (fraction of VWAP).
+# Price this far above/below same-session VWAP → directional regime, else NEUTRAL.
+# The 15-min band is tighter: a smaller separation on the slower timeframe already
+# signals a durable lean, so it confirms a trend sooner than the 5-min band.
+VWAP_REGIME_BAND = 0.005       # ±0.5% on 5-min bars → BULL / BEAR
+VWAP_REGIME_BAND_15MIN = 0.003  # ±0.3% on 15-min bars → multi-timeframe bias
+
 
 @dataclass(frozen=True)
 class TickerDecision:
@@ -918,9 +925,9 @@ async def _build_market_context(
             "session_high": 0, "session_low": 0, "price_path": "", "key_levels": "",
         }
 
-    if spy_price > spy_vwap * 1.005:
+    if spy_price > spy_vwap * (1 + VWAP_REGIME_BAND):
         spy_regime = "BULL"
-    elif spy_price < spy_vwap * 0.995:
+    elif spy_price < spy_vwap * (1 - VWAP_REGIME_BAND):
         spy_regime = "BEAR"
     else:
         spy_regime = "NEUTRAL"
@@ -934,9 +941,9 @@ async def _build_market_context(
             p15 = float(snap15.get("last_close") or 0)
             v15 = float(snap15.get("vwap") or p15)
             e20_15 = float(snap15.get("ema20") or 0)
-            if p15 > v15 * 1.003 and e20_15 > 0 and p15 > e20_15:
+            if p15 > v15 * (1 + VWAP_REGIME_BAND_15MIN) and e20_15 > 0 and p15 > e20_15:
                 spy_15min_bias = "BULL"
-            elif p15 < v15 * 0.997 and e20_15 > 0 and p15 < e20_15:
+            elif p15 < v15 * (1 - VWAP_REGIME_BAND_15MIN) and e20_15 > 0 and p15 < e20_15:
                 spy_15min_bias = "BEAR"
     except Exception:  # noqa: BLE001
         pass
