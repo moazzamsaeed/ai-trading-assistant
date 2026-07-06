@@ -1126,9 +1126,13 @@ async def test_condor_settlement_job_routes_settled_to_trades(monkeypatch):
             "⚠️ Reconciler: condor #8 expired 2026-06-25 but no underlying close found — left open.",
         ]
 
+    async def no_residue():
+        return []
+
     monkeypatch.setattr(sch, "settle_expired_condors", fake_settle, raising=False)
     import trademaster.reconciler as _rec
     monkeypatch.setattr(_rec, "settle_expired_condors", fake_settle)
+    monkeypatch.setattr(_rec, "liquidate_assignment_residue", no_residue)
 
     await sch._condor_settlement_job(trade_poster=tr, log_poster=lg)
     assert len(trd) == 1 and trd[0].startswith("✅")

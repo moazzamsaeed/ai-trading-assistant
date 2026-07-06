@@ -671,8 +671,14 @@ async def _condor_settlement_job(
         log.info("condor_settlement_skipped_paused")
         return
     try:
-        from trademaster.reconciler import settle_expired_condors
+        from trademaster.reconciler import (
+            liquidate_assignment_residue,
+            settle_expired_condors,
+        )
         results = await settle_expired_condors()
+        # An ITM short leg assigns into an equity position that booking P&L doesn't
+        # clear; flatten it now so it can't tie up buying power into the next session.
+        results += await liquidate_assignment_residue()
     except Exception as e:  # noqa: BLE001
         log.error("condor_settlement_failed", error=str(e), error_type=type(e).__name__)
         await log_poster(f"⚠️ Condor settlement failed: `{type(e).__name__}: {e}`")
