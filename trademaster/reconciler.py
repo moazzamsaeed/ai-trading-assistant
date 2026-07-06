@@ -205,6 +205,51 @@ async def settle_expired_condors(
     return warnings
 
 
+async def liquidate_assignment_residue() -> list[str]:
+    """Flatten any equity position left behind by an option assignment.
+
+    The bot only ever holds options (directional longs + condor legs); it never
+    intends to hold stock. So any *equity* position at the broker is residue from
+    an ITM short leg being assigned — e.g. a condor short put finishing ITM assigns
+    100 shares/contract of the underlying, which lands overnight and ties up ALL
+    buying power (a 2-lot 747 put → 200 SPY ≈ $150k, cash goes negative, both
+    directional AND condor orders start failing with `options_buying_power: 0`).
+
+    Booking the condor's P&L in the DB does NOT clear this broker position, so we
+    sweep it here: sell every non-option position at market and report what went.
+    Idempotent — a clean account yields no orders. Runs at startup (catches the
+    weekend/overnight assignment) and right after the same-day settlement job."""
+    try:
+        positions = await alpaca_client.get_positions()
+    except Exception as e:  # noqa: BLE001
+        log.warning("assignment_sweep_fetch_failed", error=str(e))
+        return [f"⚠️ Reconciler: could not fetch positions for assignment sweep ({e})"]
+
+    equity = [p for p in positions if "option" not in str(getattr(p, "asset_class", "")).lower()]
+    warnings: list[str] = []
+    for p in equity:
+        try:
+            oid = await alpaca_client.close_position(p.symbol)
+            warnings.append(
+                f"✅ Reconciler: flattened assignment residue — sold {p.qty} {p.symbol} "
+                f"(mv ${float(p.market_value):,.0f}, upl ${float(p.unrealized_pl):+.0f}) "
+                f"at market. This position was assigned from an ITM short option leg "
+                f"and was tying up buying power (order {oid})."
+            )
+            log.warning(
+                "assignment_residue_liquidated",
+                symbol=p.symbol, qty=str(p.qty),
+                market_value=str(p.market_value), order_id=oid,
+            )
+        except Exception as e:  # noqa: BLE001
+            warnings.append(
+                f"⚠️ Reconciler: found assignment residue {p.qty} {p.symbol} but "
+                f"the close order FAILED ({e}) — buying power still tied up, flatten manually."
+            )
+            log.error("assignment_residue_liquidate_failed", symbol=p.symbol, error=str(e))
+    return warnings
+
+
 async def reconcile_positions(session_factory=None) -> list[str]:
     """Reconcile DB open trades against live Alpaca positions.
 
@@ -295,6 +340,12 @@ async def reconcile_positions(session_factory=None) -> list[str]:
                     condor_leg_occs.add(e[k])
 
     warnings.extend(await settle_expired_condors(session_factory=sf))
+
+    # An ITM short leg that got assigned leaves an equity position (100 sh/contract
+    # of the underlying) that the DB settlement above does NOT clear — it lands
+    # overnight and consumes all buying power. Sweep it here so a weekend assignment
+    # is flattened on Monday's startup before the day's scans try to trade.
+    warnings.extend(await liquidate_assignment_residue())
 
     # Case 2: Alpaca open but not in DB → opened outside the bot
     for occ in live_occs:

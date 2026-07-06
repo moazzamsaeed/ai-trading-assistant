@@ -222,6 +222,74 @@ async def test_same_day_condor_not_settled_before_bell(session_factory, monkeypa
         assert s.get(Trade, tid).closed_at is None
 
 
+# ----------------- assignment residue sweep -----------------
+
+
+def _equity_pos(symbol="SPY", qty="200", mv="150130", upl="814"):
+    return types.SimpleNamespace(
+        symbol=symbol, qty=Decimal(qty), market_value=Decimal(mv),
+        unrealized_pl=Decimal(upl), asset_class="us_equity",
+    )
+
+
+def _option_pos(symbol="SPY260511P00495000"):
+    return types.SimpleNamespace(
+        symbol=symbol, qty=Decimal("-1"), market_value=Decimal("-120"),
+        unrealized_pl=Decimal("0"), asset_class="us_option",
+    )
+
+
+@pytest.mark.asyncio
+async def test_assignment_residue_liquidated(monkeypatch):
+    """An assigned equity position (the exact 200-SPY buying-power trap) is flattened."""
+    closed: list[str] = []
+
+    async def fake_positions():
+        return [_equity_pos(), _option_pos()]  # equity + an option leg
+
+    async def fake_close(symbol):
+        closed.append(symbol)
+        return "ord_123"
+
+    monkeypatch.setattr(alpaca_client, "get_positions", fake_positions)
+    monkeypatch.setattr(alpaca_client, "close_position", fake_close)
+
+    warnings = await reconciler.liquidate_assignment_residue()
+
+    assert closed == ["SPY"], "only the equity residue is sold, the option leg is left alone"
+    assert any("flattened assignment residue" in w and "200 SPY" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_assignment_sweep_noop_on_clean_account(monkeypatch):
+    async def fake_positions():
+        return [_option_pos()]  # only options → nothing to sweep
+
+    async def boom(symbol):
+        raise AssertionError("must not close an option position as assignment residue")
+
+    monkeypatch.setattr(alpaca_client, "get_positions", fake_positions)
+    monkeypatch.setattr(alpaca_client, "close_position", boom)
+
+    assert await reconciler.liquidate_assignment_residue() == []
+
+
+@pytest.mark.asyncio
+async def test_assignment_sweep_reports_close_failure(monkeypatch):
+    async def fake_positions():
+        return [_equity_pos()]
+
+    async def failing_close(symbol):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(alpaca_client, "get_positions", fake_positions)
+    monkeypatch.setattr(alpaca_client, "close_position", failing_close)
+
+    warnings = await reconciler.liquidate_assignment_residue()
+    assert len(warnings) == 1 and warnings[0].startswith("⚠️")
+    assert "flatten manually" in warnings[0]
+
+
 @pytest.mark.asyncio
 async def test_settlement_close_prefers_intraday_then_daily(monkeypatch):
     exp = date(2026, 6, 25)

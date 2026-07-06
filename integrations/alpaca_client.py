@@ -219,6 +219,23 @@ async def close_all_positions(cancel_orders: bool = True) -> int:
     return await asyncio.to_thread(_do)
 
 
+async def close_position(symbol: str) -> str:
+    """Liquidate a single position (whole quantity) at market. Returns the order id.
+
+    Used to flatten equity shares left behind by an option assignment — the account
+    is never meant to hold stock, so a residual underlying position ties up buying
+    power until it's sold.
+    """
+
+    def _do() -> str:
+        order = _trading_client().close_position(symbol)
+        oid = str(getattr(order, "id", ""))
+        log.warning("alpaca_close_position", symbol=symbol, order_id=oid)
+        return oid
+
+    return await asyncio.to_thread(_do)
+
+
 def _to_article(raw) -> NewsArticle:
     """Normalize an alpaca-py news object to our dataclass."""
     return NewsArticle(
