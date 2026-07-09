@@ -23,7 +23,7 @@ Bump ENGINE_VERSION on any rule change so persisted decisions stay auditable.
 """
 from __future__ import annotations
 
-ENGINE_VERSION = "trend_follow_v2"   # v2: S/R-aware (don't buy into the level just ahead)
+ENGINE_VERSION = "trend_follow_v3"   # v3: QQQ calls-only + strong-trend gate (v2: S/R-aware)
 
 # Thresholds — calibrated from the conviction stratification on SPY 15-min,
 # 2023→2026 (scripts/backtest_trend_0dte.py). Kept as module constants for now;
@@ -87,6 +87,22 @@ def forming_signal(ticker: str, snap: dict) -> dict | None:
         return None
     return {"would_be_action": action, "engine": True, "note": note,
             "adx": round(adx, 1), "dist": round(dist, 2)}
+
+
+def _qqq_call_adx_min(ticker: str) -> float | None:
+    """Min ADX for a QQQ call, or None if `ticker` isn't QQQ-restricted.
+
+    QQQ is calls-only + strong-trend-gated: same signal as SPY but ~2-3x the 0DTE
+    spread, so only its high-beta strong-trend calls clear cost (puts mean-revert
+    at high ADX). See Settings.qqq_calls_only. Off → unrestricted (returns None)."""
+    try:
+        from trademaster.config import get_settings
+        s = get_settings()
+        if ticker.upper() == "QQQ" and s.qqq_calls_only:
+            return float(s.qqq_call_adx_min)
+    except Exception:  # noqa: BLE001 — never let a config read break the decision
+        pass
+    return None
 
 
 def _puts_only() -> bool:
@@ -156,7 +172,12 @@ def decide(ticker: str, snap: dict, market_ctx: dict | None = None, now=None):
         return hold(f"no trend (price {price:.2f} vs vwap {vwap:.2f} / ema {ema:.2f})")
     if adx < ADX_MIN:
         return hold(f"weak trend (ADX {adx:.1f} < {ADX_MIN:.0f})")
-    if adx >= ADX_OVEREXT or dist > DIST_OVEREXT:
+    # SPY reverts at extreme ADX, but QQQ CALLs keep trending there (backtest), so
+    # a QQQ up-signal is exempt from the ADX-overextension HOLD (dist-overext still
+    # applies to everyone).
+    qqq_call_adx_min = _qqq_call_adx_min(ticker)
+    adx_overext = adx >= ADX_OVEREXT and not (qqq_call_adx_min is not None and up)
+    if adx_overext or dist > DIST_OVEREXT:
         return hold(f"overextended (ADX {adx:.1f}, dist {dist:.2f}%) — reverts")
     if dist < DIST_MIN:
         return hold(f"too close to VWAP (dist {dist:.2f}% < {DIST_MIN:.2f}%) — no edge")
@@ -164,6 +185,14 @@ def decide(ticker: str, snap: dict, market_ctx: dict | None = None, now=None):
     action = "BUY_CALL" if up else "BUY_PUT"
     if up and _puts_only():
         return hold("puts-only mode: skipping long-call signal (robust side is puts)")
+    # QQQ restriction: calls only (puts mean-revert at high ADX), and only strong
+    # trends clear its wider spread. See Settings.qqq_calls_only / _qqq_call_adx_min.
+    if qqq_call_adx_min is not None:
+        if action == "BUY_PUT":
+            return hold("QQQ restricted to calls only — puts mean-revert at high ADX")
+        if adx < qqq_call_adx_min:
+            return hold(f"QQQ call needs strong trend (ADX {adx:.1f} < "
+                        f"{qqq_call_adx_min:.0f}) to clear its wider spread")
     sweet = ADX_SWEET_LO <= adx < ADX_SWEET_HI and DIST_MIN <= dist <= DIST_SWEET_HI
     conviction = "HIGH" if sweet else "MEDIUM"
 
