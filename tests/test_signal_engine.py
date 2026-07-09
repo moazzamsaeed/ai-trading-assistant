@@ -60,6 +60,39 @@ def test_too_close_to_vwap_holds():
     assert d.action == "HOLD"
 
 
+# ----------------- QQQ restriction (calls-only + strong-trend gate) -----------------
+
+
+def test_qqq_put_is_blocked():
+    # Same downtrend snapshot that gives SPY a HIGH put → QQQ must HOLD (puts revert).
+    d = decide("QQQ", _snap(500.0, 501.3, 501.5, 35.0))
+    assert decide("SPY", _snap(500.0, 501.3, 501.5, 35.0)).action == "BUY_PUT"
+    assert d.action == "HOLD"
+    assert "calls only" in d.reasoning
+
+
+def test_qqq_call_below_adx_min_holds():
+    # Uptrend but ADX 35 < 40 gate → QQQ holds (doesn't clear its wider spread)…
+    d = decide("QQQ", _snap(500.0, 498.7, 498.5, 35.0))
+    assert d.action == "HOLD"
+    # …while the identical SPY signal fires (SPY's spread is tight enough).
+    assert decide("SPY", _snap(500.0, 498.7, 498.5, 35.0)).action == "BUY_CALL"
+
+
+def test_qqq_strong_trend_call_fires():
+    # Uptrend, ADX 42 ≥ 40 → QQQ call allowed (MEDIUM: outside SPY's 30-40 sweet band).
+    d = decide("QQQ", _snap(500.0, 498.9, 498.7, 42.0))
+    assert d.action == "BUY_CALL"
+    assert d.conviction == "MEDIUM"
+
+
+def test_qqq_call_exempt_from_overextension_hold():
+    # ADX 60 holds for SPY (reverts) but a QQQ call keeps trending → still fires.
+    assert decide("SPY", _snap(500.0, 498.5, 498.3, 60.0)).action == "HOLD"
+    d = decide("QQQ", _snap(500.0, 498.5, 498.3, 60.0))
+    assert d.action == "BUY_CALL"
+
+
 def test_no_trend_holds():
     # price above VWAP but below EMA (conflicting) → no clean trend → HOLD
     d = decide("SPY", _snap(745.0, 744.0, 746.0, 35.0))

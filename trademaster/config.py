@@ -42,6 +42,20 @@ class Settings(BaseSettings):
     # companion change — conviction did not predict edge, so don't up-size HIGH.
     directional_puts_only: bool = False
 
+    # QQQ directional restriction. QQQ shares SPY's signal quality (same engine,
+    # ~identical hit-rate/edge) but pays ~2-3x the 0DTE option spread, so on the
+    # SHARED directional capital cap it's dilutive — each QQQ trade displaces a
+    # cheaper SPY trade. Backtest 2023-2026 (scripts/backtest_trend_0dte.py):
+    #   * QQQ PUTS mean-revert wholesale at high ADX — a losing regime, NOT an
+    #     entry-timing artifact (verified: extended-vs-flat entries lose equally)
+    #     → blocked entirely.
+    #   * QQQ CALLS are the one slice where its higher beta beats its spread, and
+    #     they KEEP working at extreme ADX (59.5% hit / +0.051% move at ADX>=50)
+    #     where SPY reverts → allowed, gated to ADX>=qqq_call_adx_min, and exempt
+    #     from the SPY overextension HOLD.
+    qqq_calls_only: bool = True
+    qqq_call_adx_min: float = 40.0
+
     # Isolated, alert-only equities signal scanner (separate stock watchlist +
     # Discord channel; no execution, no shared capital/risk with SPY strategies).
     enable_equities_scanner: bool = False
