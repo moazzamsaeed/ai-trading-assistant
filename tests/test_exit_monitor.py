@@ -421,6 +421,115 @@ async def test_exit_monitor_cancels_stale_order_on_qty_held(session_factory):
     assert results[0]["error_sig"].endswith(":qty_held")
 
 
+async def test_exit_monitor_position_shortfall_not_reported_as_held(session_factory):
+    """Live #124 (2026-07-20): 40310000 with `held_for_orders:0` and available <
+    requested is a POSITION SHORTFALL, not a held quantity. The old code cancelled
+    nothing yet reported 'held by a resting order (cancelled: none found)'. It must
+    now classify this distinctly, not call the canceller, and say the reconciler
+    will settle."""
+    _ic_trade(session_factory, qty=2)
+    chain = _chain_at_debit(Decimal("1.00"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_k):
+        raise RuntimeError(
+            '{"available":"1","code":40310000,"existing_qty":"1",'
+            '"held_for_orders":"0","message":"insufficient qty available for order '
+            '(requested: 2, available: 1)","symbol":"SPY260720P00741000"}'
+        )
+
+    async def waiter(*_a, **_k):
+        return _fake_fill("1.00")
+
+    cancelled: list[str] = []
+
+    async def canceller(oid):
+        cancelled.append(oid)
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, canceller=canceller, force_close=True,
+    )
+    assert cancelled == []  # nothing is held → canceller must NOT be called
+    assert results[0]["status"] == "submit_error_qty_short"
+    assert results[0]["error_sig"].endswith(":qty_short")
+    assert "held by a resting order" not in results[0]["error_text"]
+    assert "settle at expiry" in results[0]["error_text"]
+
+
+async def test_exit_monitor_intent_mismatch_reported_calmly(session_factory):
+    """Live #125 (2026-07-21): a first-touch 42210000 `position intent mismatch` at
+    the 15:50 force-close. No order rests; the reconciler settles at expiry. It must
+    be classified separately and surfaced as info (ℹ️), not a ⚠️ close failure."""
+    _ic_trade(session_factory, qty=2)
+    chain = _chain_at_debit(Decimal("1.00"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_k):
+        raise RuntimeError(
+            '{"code":42210000,"message":"position intent mismatch, '
+            'inferred: buy_to_open, specified: buy_to_close"}'
+        )
+
+    async def waiter(*_a, **_k):
+        return _fake_fill("1.00")
+
+    cancelled: list[str] = []
+
+    async def canceller(oid):
+        cancelled.append(oid)
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, canceller=canceller, force_close=True,
+    )
+    assert cancelled == []
+    assert results[0]["status"] == "submit_error_intent_mismatch"
+    assert results[0]["error_sig"].endswith(":intent_mismatch")
+    assert "settle at expiry" in results[0]["error_text"]
+
+
+async def test_exit_monitor_cancels_unfilled_close_order(session_factory):
+    """Live #126 (2026-07-22): the marketable force-close order sat `new` past the
+    fill timeout and was abandoned live, holding the legs' quantity until the DAY
+    TIF expired it. The monitor must now cancel any close order that doesn't reach
+    a dead status, so the position is clean for the reconciler / next sweep."""
+    _ic_trade(session_factory, qty=2)
+    chain = _chain_at_debit(Decimal("1.00"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_k):
+        return OrderResult(
+            order_id="stuck-new-1", status="new", filled_avg_price=None,
+            filled_qty=Decimal("0"), submitted_at=datetime.now(UTC), raw_status="new",
+        )
+
+    async def waiter(_id, *, timeout_s):
+        # never fills — returns the still-live `new` order after the wait
+        return OrderResult(
+            order_id="stuck-new-1", status="new", filled_avg_price=None,
+            filled_qty=Decimal("0"), submitted_at=datetime.now(UTC), raw_status="new",
+        )
+
+    cancelled: list[str] = []
+
+    async def canceller(oid):
+        cancelled.append(oid)
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, canceller=canceller, force_close=True,
+    )
+    assert cancelled == ["stuck-new-1"]  # the abandoned `new` order was cancelled
+    assert results[0]["status"] == "close_order_new"
+
+
 # ----------------- marketable force-close -----------------
 
 
