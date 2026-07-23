@@ -92,7 +92,9 @@ async def complete(
         raise ProviderError(f"anthropic exhausted retries: {e}") from e
 
     duration_ms = int((time.perf_counter() - started) * 1000)
-    text = msg.content[0].text if msg.content else ""
+    # First TEXT block, not content[0]: models with always-on thinking (Fable 5)
+    # lead with a ThinkingBlock, which has no .text.
+    text = next((b.text for b in msg.content if b.type == "text"), "")
     return LLMResponse(
         text=text,
         provider=PROVIDER,

@@ -19,8 +19,10 @@ from trademaster.llm.types import AuthError, ProviderError, RateLimitError
 
 
 def _anthropic_response(text: str = "ok", in_t: int = 100, out_t: int = 50):
+    # Real API content blocks always carry .type; the client selects the first
+    # "text" block (models with always-on thinking lead with a thinking block).
     return SimpleNamespace(
-        content=[SimpleNamespace(text=text)],
+        content=[SimpleNamespace(type="text", text=text)],
         usage=SimpleNamespace(input_tokens=in_t, output_tokens=out_t),
     )
 
@@ -40,6 +42,25 @@ async def test_anthropic_success(monkeypatch):
     assert resp.input_tokens == 10
     assert resp.output_tokens == 5
     assert resp.cost_usd > 0
+
+
+async def test_anthropic_thinking_block_first(monkeypatch):
+    """Fable-5-style responses lead with a thinking block; client must skip it."""
+    resp_obj = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="thinking", thinking=""),
+            SimpleNamespace(type="text", text="answer"),
+        ],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+    )
+    mock = SimpleNamespace(
+        messages=SimpleNamespace(create=AsyncMock(return_value=resp_obj))
+    )
+    monkeypatch.setattr(anthropic_client, "_client", lambda *a, **k: mock)
+
+    resp = await anthropic_client.complete("hello")
+
+    assert resp.text == "answer"
 
 
 async def test_anthropic_retries_then_succeeds(monkeypatch):
