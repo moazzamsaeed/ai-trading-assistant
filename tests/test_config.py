@@ -85,9 +85,12 @@ def test_condor_contracts_two_accepted(monkeypatch, tmp_path):
     assert cfg.get_settings().condor_contracts == 2
 
 
-def test_condor_contracts_capped_at_two(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)  # 3 exceeds the hard cap → config refuses to load
-    cfg = _fresh_settings(monkeypatch, CONDOR_CONTRACTS="3")
+def test_condor_contracts_capped(monkeypatch, tmp_path):
+    # Cap raised 2→12 on 2026-07-28 for the $50k condor-only test (backtest-validated
+    # to 0 loss-limit breaches at 10ct/$50k). 10 must load; 13 must be refused.
+    monkeypatch.chdir(tmp_path)
+    assert _fresh_settings(monkeypatch, CONDOR_CONTRACTS="10").get_settings().condor_contracts == 10
+    cfg = _fresh_settings(monkeypatch, CONDOR_CONTRACTS="13")  # exceeds the hard cap
     with pytest.raises(ValidationError):
         cfg.get_settings()
 

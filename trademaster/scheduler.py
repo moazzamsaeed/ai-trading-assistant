@@ -1019,23 +1019,26 @@ def make_scheduler(
     # Real-time triggers come from the WebSocket stream (alpaca_stream.py).
     # This fallback catches slow-building setups and guards against stream gaps.
     # SPY 0DTE timing is critical — 15 min ensures no setup is missed between surges.
-    scheduler.add_job(
-        _directional_scan_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="9-15",
-            minute="0,15,30,45",
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={
-            "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
-            "log_poster": log_post,
-        },
-        id="directional_scan",
-        replace_existing=True,
-        misfire_grace_time=300,
-    )
+    # Suppressed entirely when the directional engine is disabled (condor-only mode);
+    # the directional EXIT job below is always registered so open positions still close.
+    if get_settings().enable_directional:
+        scheduler.add_job(
+            _directional_scan_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-15",
+                minute="0,15,30,45",
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={
+                "signal_poster": signal_poster,
+                "trade_poster": trade_poster,
+                "log_poster": log_post,
+            },
+            id="directional_scan",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
 
     # #research market analysis — exactly two LLM updates a day (plus the 8 AM
     # pre-market briefing above). One mid-day read of the tape at 12:30 ET and

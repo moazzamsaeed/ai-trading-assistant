@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     account_type: Literal["cash"] = "cash"
 
     enable_iron_condor: bool = False
+    # Master switch for the directional (SPY/QQQ 0DTE trend) engine. When False,
+    # NO new directional entries are taken — both the 15-min fallback scan job and
+    # the real-time WebSocket trigger are suppressed. The directional EXIT monitor
+    # still runs so any open position is managed to the close. Set False to run a
+    # condor-only regime (e.g. the 2026-07-28 $50k condor-only test).
+    enable_directional: bool = True
     directional_mode: Literal["aggressive", "selective"] = "selective"
     # Platform-first: when True BOTH the directional ENTRY decision
     # (signal_engine.decide) AND the EXIT confirm (exit_monitor._rules_exit_confirm)
@@ -167,12 +173,16 @@ class Settings(BaseSettings):
     weekly_loss_limit_pct: float = Field(default=0.25, gt=0, le=1.0)
 
     # Iron-condor position size (contracts per entry). Defined-risk, so P&L and
-    # drawdown scale LINEARLY with this. HARD-CAPPED at 2: the sizing backtest
-    # (scripts/backtest_condor_sizing.py, 2023→2026) showed 2 contracts never
-    # breached the daily/weekly loss limits (worst week −$1,080 vs the $2,500
-    # limit), while 3 starts to approach them. Default 1 (conservative); raise to
-    # 2 once the live edge is confirmed and a ~20% account drawdown is acceptable.
-    condor_contracts: int = Field(default=1, ge=1, le=2)
+    # drawdown scale LINEARLY with this (defined-risk P&L is linear in contracts,
+    # so the edge — win%, Sharpe, DSR — is size-invariant). The cap exists only to
+    # keep the doubled drawdown inside the daily/weekly loss limits at the CURRENT
+    # capital. Re-validated 2026-07-28 at $50k (scripts/backtest_condor_sizing.py
+    # 50000 2,5,10,12): 10 contracts' worst week −$5,398 vs the $12,500 weekly limit
+    # → 0 historical breaches over 2023→2026 (12ct also clean). Cap raised 2→12 for
+    # the $50k condor-only test; set to 10 in .env for ~9.4%/trade risk (the same
+    # relative sizing the 2ct-on-$10k test ran at). If capital drops, re-run the
+    # backtest before keeping a high count — this cap is calibrated to $50k.
+    condor_contracts: int = Field(default=1, ge=1, le=12)
 
     # Tiered daily trade caps. **0 = UNLIMITED** (no per-day count cap) — set as
     # the default 2026-06-07: with capital at $25k and risk bounded by the daily
