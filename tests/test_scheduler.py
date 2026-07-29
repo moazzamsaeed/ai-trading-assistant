@@ -889,6 +889,48 @@ async def test_max_trades_unlimited_skips_count_check(monkeypatch):
     assert not consulted, "count cap must NOT be consulted when unlimited (0)"
 
 
+async def test_signals_only_posts_signal_without_executing(monkeypatch):
+    """directional_signals_only: a HIGH BUY decision must post a broker-ready
+    signal to #signals but must NOT call execute_directional_signal (no order,
+    no trade booked)."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(sch.get_settings(), "directional_signals_only", True)
+    monkeypatch.setattr(sch.get_settings(), "directional_mode", "selective")
+
+    async def fake_capital(*_a, **_k): return _D("50000")
+    async def fake_unrealized(): return _D("0")
+    monkeypatch.setattr(sch, "get_effective_capital", fake_capital)
+    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
+
+    async def fake_scan(**_):
+        return ([_TD("SPY", "BUY_CALL", 500.0, "0DTE", "HIGH", "strong breakout")], [], "")
+    monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
+
+    executed = []
+    async def fake_execute(*_a, **_k):
+        executed.append(1)
+        raise AssertionError("must NOT execute in signals-only mode")
+    monkeypatch.setattr(sch, "execute_directional_signal", fake_execute)
+
+    posted: list[str] = []
+    async def signals(t): posted.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(is_open=True)
+
+    await sch._directional_scan_job(
+        signal_poster=signals, trade_poster=_noop_poster,
+        log_poster=_noop_poster, clock_fetcher=clock_open,
+    )
+    assert not executed, "execute_directional_signal must not be called"
+    assert any("BUY a CALL" in m and "SPY" in m for m in posted), posted
+    # and no trade row was booked
+    with sf() as s:
+        assert s.query(_Trade).count() == 0
+
+
 async def test_event_blackout_not_consulted_when_disabled(monkeypatch):
     """Default (enable_event_blackout=False): the blackout calendar is not even
     checked — the LLM trades event days (NFP/CPI/FOMC) during paper validation."""

@@ -30,6 +30,7 @@ from agents.directional.exit_monitor import (
     run_trailing_stop_tick,
 )
 from agents.directional.intraday import (
+    format_directional_signal,
     format_entry_combined,
     format_setup_forming,
     is_fresh_leg,
@@ -500,6 +501,23 @@ async def _directional_scan_job(
                 deployed=float(deployed),
                 cap=float(max_exposure),
             )
+            continue
+
+        # Study mode: post the broker-ready signal but place NO order. Reached only
+        # after every quality/throttle gate above has passed (freshness, ADX,
+        # cooldowns) — so the signal fires exactly when the engine WOULD have
+        # traded. Update the cooldown trackers as if a trade opened, so repeat
+        # scans don't re-post the same signal. The exposure cap never binds here
+        # (nothing is ever deployed), which is why this sits after it.
+        if settings.directional_signals_only:
+            _last_trade_open[decision.ticker] = datetime.now(UTC)
+            _last_trade_open_by_action[action_key] = datetime.now(UTC)
+            log.info(
+                "directional_signal_only_posted",
+                ticker=decision.ticker, action=decision.action,
+                conviction=decision.conviction, strike=str(decision.strike),
+            )
+            await signal_poster(format_directional_signal(decision, today=today, mode=mode))
             continue
 
         # The pre-emptive "setup forming" alert was already posted earlier (when

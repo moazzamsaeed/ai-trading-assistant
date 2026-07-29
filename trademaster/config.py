@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # still runs so any open position is managed to the close. Set False to run a
     # condor-only regime (e.g. the 2026-07-28 $50k condor-only test).
     enable_directional: bool = True
+    # Study mode: when True the directional engine still scans and posts its
+    # broker-ready signals to #signals, but places NO orders and books NO trades
+    # (execute_directional_signal is skipped). Lets us watch what the engine WOULD
+    # do — and record its live signal quality — without risking capital, while the
+    # "why is directional −EV" question is open. Requires enable_directional=True.
+    directional_signals_only: bool = False
     directional_mode: Literal["aggressive", "selective"] = "selective"
     # Platform-first: when True BOTH the directional ENTRY decision
     # (signal_engine.decide) AND the EXIT confirm (exit_monitor._rules_exit_confirm)
