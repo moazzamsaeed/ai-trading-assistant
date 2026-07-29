@@ -24,6 +24,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from agents.directional.executor import execute_directional_signal
+from agents.directional.shadow import record_shadow_signal, score_shadow_signals, shadow_summary
 from agents.directional.exit_monitor import (
     format_scale_out,
     run_directional_exit_monitor,
@@ -517,6 +518,13 @@ async def _directional_scan_job(
                 ticker=decision.ticker, action=decision.action,
                 conviction=decision.conviction, strike=str(decision.strike),
             )
+            # Record a shadow trade so score_shadow_signals can track this
+            # signal's hypothetical P&L (forward read on signal quality; no
+            # capital risked). Best-effort — never blocks the signal post.
+            try:
+                await record_shadow_signal(decision, mode=mode, today=today)
+            except Exception as e:  # noqa: BLE001
+                log.warning("shadow_record_failed", ticker=decision.ticker, error=str(e))
             await signal_poster(format_directional_signal(decision, today=today, mode=mode))
             continue
 
@@ -618,6 +626,40 @@ async def _directional_exit_job(
             await _post_trade_closed(trade_poster, r.get("trade_id"))
         elif r.get("error_text"):
             await log_poster(r["error_text"])
+
+
+async def _shadow_score_job(
+    *,
+    log_poster: Poster = _noop_poster,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+    force: bool = False,
+) -> None:
+    """Score open directional shadow trades (signals-only P&L tracker).
+
+    Marks each open shadow to market and closes on PT/stop/force-close — no
+    orders, no capital. On the end-of-day force pass, posts the win-rate/P&L
+    summary by conviction so we can see whether HIGH-conviction signals clear
+    the ~43% break-even bar. Only registered when directional_signals_only=True.
+    """
+    if not force:
+        try:
+            clock = await clock_fetcher()
+        except Exception as e:  # noqa: BLE001
+            log.warning("shadow_score_clock_failed", error=str(e))
+            return
+        if not clock.is_open:
+            return
+    try:
+        results = await score_shadow_signals(force_close=force or None)
+    except Exception as e:  # noqa: BLE001
+        log.error("shadow_score_failed", error=str(e), error_type=type(e).__name__)
+        return
+    closed = [r for r in results if r.get("status") == "closed"]
+    # On the end-of-day force pass, once everything is settled, post the summary.
+    if force and closed:
+        summary = shadow_summary()
+        if summary:
+            await log_poster(summary)
 
 
 async def _trailing_stop_tick_job(
@@ -1057,6 +1099,33 @@ def make_scheduler(
             replace_existing=True,
             misfire_grace_time=300,
         )
+
+        # Shadow P&L scorer (signals-only study mode only). Marks open shadow
+        # trades to market every 5 min (10:00–15:45 ET), then a 15:55 force pass
+        # closes any survivors and posts the win-rate/P&L-by-conviction summary.
+        if get_settings().directional_signals_only:
+            scheduler.add_job(
+                _shadow_score_job,
+                CronTrigger(
+                    day_of_week="mon-fri", hour="10-15",
+                    minute="0,5,10,15,20,25,30,35,40,45",
+                    timezone=PREMARKET_TZ,
+                ),
+                kwargs={"log_poster": log_post},
+                id="shadow_score",
+                replace_existing=True,
+                misfire_grace_time=120,
+            )
+            scheduler.add_job(
+                _shadow_score_job,
+                CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=55, timezone=PREMARKET_TZ
+                ),
+                kwargs={"log_poster": log_post, "force": True},
+                id="shadow_score_force",
+                replace_existing=True,
+                misfire_grace_time=120,
+            )
 
     # #research market analysis — exactly two LLM updates a day (plus the 8 AM
     # pre-market briefing above). One mid-day read of the tape at 12:30 ET and
