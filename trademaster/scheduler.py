@@ -47,7 +47,12 @@ from agents.research.premarket import run_premarket_briefing
 from decimal import Decimal
 
 from integrations import alpaca_client
-from trademaster.capital import directional_deployed_usd, get_effective_capital
+from trademaster.capital import (
+    _DIRECTIONAL_STRATEGIES,
+    directional_deployed_usd,
+    directional_unrealized_pnl,
+    get_effective_capital,
+)
 from trademaster.config import get_settings
 from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, get_today_trade_count_by_conviction, get_today_directional_streak, get_today_failed_breakouts, make_session_factory
 from trademaster.event_calendar import is_blackout_day
@@ -226,41 +231,43 @@ async def _directional_scan_job(
     narrative for #research is posted separately by `_market_analysis_job`
     (mid-day + close), not from this scan.
     """
-    if get_state().is_paused():
+    if get_state().is_directional_paused():
         log.info("directional_scan_skipped_paused")
         return
 
-    # Daily loss limit: halt if realized + unrealized P&L exceeds 15% of capital.
-    # Capital tracks the actual account size (paper: base + cumulative realized;
-    # live: Alpaca equity), so the limit shrinks with prior losses and grows
-    # with gains automatically.
+    # Daily loss limit: halt DIRECTIONAL if its realized + unrealized P&L exceeds
+    # 15% of its OWN $10k pool (directional_capital_usd + directional-only
+    # realized). Kept separate from the iron condor's $50k — a directional halt
+    # pauses only directional (pause_directional), never the condor.
     settings = get_settings()
-    capital = await get_effective_capital(make_session_factory())
+    capital = await get_effective_capital(
+        make_session_factory(), strategy_group="directional"
+    )
 
     # Capital floor: with 0 capital there's nothing to deploy and dividing
     # by it for the limit gives 0, which would tautologically trip "loss <= 0".
-    # Halt outright instead of erroring.
+    # Halt directional outright instead of erroring.
     if capital <= Decimal("0"):
-        get_state().pause(hours=24)
+        get_state().pause_directional(hours=24)
         await log_poster(
-            "🛑 Effective capital is $0 (cumulative losses exceed base). "
-            "Trading halted until tomorrow."
+            "🛑 Directional capital is $0 (cumulative losses exceed the $10k pool). "
+            "Directional halted until tomorrow (condor unaffected)."
         )
         log.warning("scan_skipped_capital_zero")
         return
 
-    # ---- Daily loss limit ----
+    # ---- Daily loss limit (directional pool only) ----
     limit_usd = capital * Decimal(str(settings.daily_loss_limit_pct))
-    realized = get_today_realized_pnl(make_session_factory())
-    unrealized = await alpaca_client.get_unrealized_pnl()
+    realized = get_today_realized_pnl(make_session_factory(), strategies=_DIRECTIONAL_STRATEGIES)
+    unrealized = await directional_unrealized_pnl(make_session_factory())
     total_pnl = realized + unrealized
     if total_pnl <= -limit_usd:
-        get_state().pause(hours=24)
+        get_state().pause_directional(hours=24)
         pct = float(-total_pnl / capital * 100)
         await log_poster(
-            f"🛑 Daily loss limit hit: **${float(total_pnl):.0f}** loss "
-            f"({pct:.0f}% of ${float(capital):.0f} capital). "
-            f"Trading halted until tomorrow. "
+            f"🛑 Directional daily loss limit hit: **${float(total_pnl):.0f}** loss "
+            f"({pct:.0f}% of ${float(capital):.0f} directional pool). "
+            f"Directional halted until tomorrow (condor unaffected). "
             f"Realized: ${float(realized):.0f} | Unrealized: ${float(unrealized):.0f}"
         )
         log.warning(
@@ -273,18 +280,18 @@ async def _directional_scan_job(
         )
         return
 
-    # ---- Weekly loss limit ----
+    # ---- Weekly loss limit (directional pool only) ----
     weekly_limit_usd = capital * Decimal(str(settings.weekly_loss_limit_pct))
-    weekly_realized = get_this_week_realized_pnl(make_session_factory())
+    weekly_realized = get_this_week_realized_pnl(make_session_factory(), strategies=_DIRECTIONAL_STRATEGIES)
     weekly_total = weekly_realized + unrealized
     if weekly_total <= -weekly_limit_usd:
         days_until_monday = (7 - today_et().weekday()) % 7 or 7
-        get_state().pause(hours=days_until_monday * 24)
+        get_state().pause_directional(hours=days_until_monday * 24)
         pct = float(-weekly_total / capital * 100)
         await log_poster(
-            f"🛑 Weekly loss limit hit: **${float(weekly_total):.0f}** loss "
-            f"({pct:.0f}% of ${float(capital):.0f} capital). "
-            f"Trading halted until Monday."
+            f"🛑 Directional weekly loss limit hit: **${float(weekly_total):.0f}** loss "
+            f"({pct:.0f}% of ${float(capital):.0f} directional pool). "
+            f"Directional halted until Monday (condor unaffected)."
         )
         log.warning(
             "weekly_loss_limit_hit",

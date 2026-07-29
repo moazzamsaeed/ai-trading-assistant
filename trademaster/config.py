@@ -165,6 +165,15 @@ class Settings(BaseSettings):
     # baseline_reset_at). In live mode, effective = account.equity directly.
     trading_capital_usd: Decimal = Field(default=Decimal("5000"), gt=0)
 
+    # Isolated directional capital pool (2026-07-29). The directional engine's
+    # sizing (exposure + per-trade caps) and its loss limits run off THIS pool —
+    # directional_capital_usd + directional-only realized P&L — kept fully
+    # separate from the iron condor's trading_capital_usd. Set $10k directional /
+    # $50k condor to test the two strategies side-by-side without shared risk.
+    # Paper-mode only (a single live account can't be split). See
+    # capital.get_effective_capital(strategy_group="directional").
+    directional_capital_usd: Decimal = Field(default=Decimal("10000"), gt=0)
+
     # Baseline reset: if set, the dynamic-capital calc ignores all trades
     # closed before this UTC timestamp. Use to start fresh after major
     # strategy changes without losing the audit history. Set via .env:

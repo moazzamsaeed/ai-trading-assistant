@@ -21,6 +21,23 @@ from integrations.alpaca_client import OptionQuote, OrderResult
 from trademaster.db import Base, Trade, make_engine, make_session_factory
 
 
+@pytest.fixture(autouse=True)
+def _pin_directional_capital(monkeypatch):
+    """These sizing tests verify the sizing MATH given a fixed pool. Directional
+    now sizes off get_effective_capital(strategy_group="directional"); pin that to
+    the $5k the tests document ($5k → $500 cap → 2 contracts). Mocking the capital
+    function directly is robust against the config-reload pollution from
+    test_config (importlib.reload swaps config.get_settings but leaves capital.py's
+    imported reference stale, so a config-attr pin wouldn't reach the executor)."""
+    from decimal import Decimal
+    import trademaster.capital as _cap
+
+    async def _fixed_capital(*_a, **_k):
+        return Decimal("5000")
+
+    monkeypatch.setattr(_cap, "get_effective_capital", _fixed_capital)
+
+
 @pytest.fixture
 def session_factory():
     engine = make_engine("sqlite:///:memory:")

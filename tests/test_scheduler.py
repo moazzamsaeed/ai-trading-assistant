@@ -808,9 +808,9 @@ async def test_weekly_loss_limit_halts_scan(monkeypatch):
         ))
         session.commit()
 
-    async def fake_unrealized(): return _D("0")
+    async def fake_unrealized(*_a, **_k): return _D("0")
     async def fake_capital(*_a, **_k): return _D("5000")  # weekly limit = $1,250; loss=$2,000 > limit
-    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "directional_unrealized_pnl", fake_unrealized)
     monkeypatch.setattr(sch, "get_effective_capital", fake_capital)
     monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
 
@@ -822,7 +822,7 @@ async def test_weekly_loss_limit_halts_scan(monkeypatch):
         signal_poster=_noop_poster, trade_poster=_noop_poster,
         log_poster=log_capture,
     )
-    assert get_state().is_paused(), "weekly loss limit must pause trading"
+    assert get_state().is_directional_paused(), "weekly loss limit must pause directional"
     assert any("weekly" in m.lower() for m in logs)
 
 

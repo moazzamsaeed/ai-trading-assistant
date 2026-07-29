@@ -174,7 +174,7 @@ def init_db(engine=None) -> None:
     Base.metadata.create_all(engine)
 
 
-def _sum_scale_out_partials(session, *, start=None, end=None) -> Decimal:
+def _sum_scale_out_partials(session, *, start=None, end=None, strategies=None) -> Decimal:
     """Sum extra.partial_realized_pnl_usd (scale-out gains) over trades whose
     opened_at falls in [start, end).
 
@@ -191,6 +191,8 @@ def _sum_scale_out_partials(session, *, start=None, end=None) -> Decimal:
         stmt = stmt.where(Trade.opened_at >= start)
     if end is not None:
         stmt = stmt.where(Trade.opened_at < end)
+    if strategies is not None:
+        stmt = stmt.where(Trade.strategy.in_(strategies))
     total = Decimal("0")
     for extra in session.execute(stmt).scalars():
         if not extra:
@@ -202,8 +204,12 @@ def _sum_scale_out_partials(session, *, start=None, end=None) -> Decimal:
     return total
 
 
-def get_cumulative_realized_pnl(session_factory) -> Decimal:
+def get_cumulative_realized_pnl(session_factory, *, strategies=None) -> Decimal:
     """Sum of realized_pnl_usd (final legs) + scale-out partials across trades.
+
+    `strategies`, when given, restricts the sum to those strategy names — used to
+    keep the directional and iron-condor capital pools separate (and to exclude
+    shadow rows). None sums every strategy (legacy behaviour).
 
     Used by the paper-mode capital model: effective capital tracks the
     starting base plus all realized gains/losses since the (optional)
@@ -223,12 +229,14 @@ def get_cumulative_realized_pnl(session_factory) -> Decimal:
         )
         if reset_at is not None:
             stmt = stmt.where(Trade.closed_at >= reset_at)
+        if strategies is not None:
+            stmt = stmt.where(Trade.strategy.in_(strategies))
         result = session.execute(stmt).scalar()
-        partials = _sum_scale_out_partials(session, start=reset_at)
+        partials = _sum_scale_out_partials(session, start=reset_at, strategies=strategies)
     return Decimal(str(result or 0)) + partials
 
 
-def get_today_realized_pnl(session_factory) -> Decimal:
+def get_today_realized_pnl(session_factory, *, strategies=None) -> Decimal:
     """Realized P&L today (ET day): final-leg closes + scale-out partials.
 
     Uses ET-aware day boundaries so trades near midnight ET are counted
@@ -247,16 +255,21 @@ def get_today_realized_pnl(session_factory) -> Decimal:
     effective_start = max(day_start, reset_at) if reset_at is not None else day_start
 
     with session_factory() as session:
-        result = session.execute(
+        stmt = (
             select(func.coalesce(func.sum(func.cast(Trade.realized_pnl_usd, Numeric)), 0))
             .where(Trade.closed_at >= effective_start)
             .where(Trade.closed_at < day_end)
-        ).scalar()
-        partials = _sum_scale_out_partials(session, start=effective_start, end=day_end)
+        )
+        if strategies is not None:
+            stmt = stmt.where(Trade.strategy.in_(strategies))
+        result = session.execute(stmt).scalar()
+        partials = _sum_scale_out_partials(
+            session, start=effective_start, end=day_end, strategies=strategies
+        )
     return Decimal(str(result or 0)) + partials
 
 
-def get_this_week_realized_pnl(session_factory) -> Decimal:
+def get_this_week_realized_pnl(session_factory, *, strategies=None) -> Decimal:
     """Realized P&L this week (Mon–Sun ET): final-leg closes + scale-out partials.
 
     Resets Monday 00:00 ET. Used for the weekly loss limit gate.
@@ -269,12 +282,17 @@ def get_this_week_realized_pnl(session_factory) -> Decimal:
     effective_start = max(week_start, reset_at) if reset_at is not None else week_start
 
     with session_factory() as session:
-        result = session.execute(
+        stmt = (
             select(func.coalesce(func.sum(func.cast(Trade.realized_pnl_usd, Numeric)), 0))
             .where(Trade.closed_at >= effective_start)
             .where(Trade.closed_at < week_end)
-        ).scalar()
-        partials = _sum_scale_out_partials(session, start=effective_start, end=week_end)
+        )
+        if strategies is not None:
+            stmt = stmt.where(Trade.strategy.in_(strategies))
+        result = session.execute(stmt).scalar()
+        partials = _sum_scale_out_partials(
+            session, start=effective_start, end=week_end, strategies=strategies
+        )
     return Decimal(str(result or 0)) + partials
 
 

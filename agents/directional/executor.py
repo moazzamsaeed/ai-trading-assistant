@@ -374,7 +374,8 @@ async def execute_directional_signal(
     # no per-trade fraction. The scheduler's exposure cap is the only limit.
     # Effective capital drives both the budget fallback and the per-trade cap.
     from trademaster.capital import get_effective_capital
-    effective_capital = await get_effective_capital(factory)
+    # Directional sizes off its OWN isolated $10k pool, separate from the condor.
+    effective_capital = await get_effective_capital(factory, strategy_group="directional")
     if capital_usd is None:
         capital_usd = effective_capital
     if capital_usd <= Decimal("0"):
