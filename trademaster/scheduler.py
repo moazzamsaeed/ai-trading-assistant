@@ -381,9 +381,16 @@ async def _directional_scan_job(
     max_exposure = capital * Decimal(str(settings.max_total_exposure_pct))
 
     conviction_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    # high_conviction_only forces HIGH-only regardless of aggressive/selective mode
+    # (the loss analysis showed MEDIUM is −$6,558 while HIGH is the only profitable
+    # bucket — project_directional_loss_analysis). It filters conviction only; exit
+    # aggressiveness still follows `mode`.
+    allowed_conviction = (
+        {"HIGH"} if (mode == "selective" or settings.high_conviction_only)
+        else {"MEDIUM", "HIGH"}
+    )
     to_execute = sorted(
-        [d for d in decisions if d.action != "HOLD"
-         and d.conviction in ({"HIGH"} if mode == "selective" else {"MEDIUM", "HIGH"})],
+        [d for d in decisions if d.action != "HOLD" and d.conviction in allowed_conviction],
         key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
     )[:3]
 
@@ -1016,8 +1023,13 @@ async def _equities_scan_job(
         return
     write_signals_snapshot(decisions)  # current-state file for the Mission Control dashboard
     posted = 0
+    high_only = get_settings().high_conviction_only
     for d in decisions:
         if not actionable_changed(d):
+            continue
+        if high_only and d.conviction != "HIGH":
+            log.info("equities_signal_skipped_low_conviction",
+                     ticker=d.ticker, conviction=d.conviction)
             continue
         price = (d.analysis or {}).get("spy_price")  # key name is legacy; holds the ticker price
         try:

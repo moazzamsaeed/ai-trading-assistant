@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # do — and record its live signal quality — without risking capital, while the
     # "why is directional −EV" question is open. Requires enable_directional=True.
     directional_signals_only: bool = False
+    # Drop MEDIUM: post/act on HIGH-conviction signals only, for BOTH the
+    # directional engine and the equities scanner. Independent of directional_mode
+    # (filters conviction, not exit aggressiveness). Set 2026-07-29 after the loss
+    # analysis showed MEDIUM was −$6,558 and HIGH the only profitable bucket.
+    high_conviction_only: bool = False
     directional_mode: Literal["aggressive", "selective"] = "selective"
     # Platform-first: when True BOTH the directional ENTRY decision
     # (signal_engine.decide) AND the EXIT confirm (exit_monitor._rules_exit_confirm)

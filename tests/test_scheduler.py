@@ -897,12 +897,17 @@ async def test_signals_only_posts_signal_without_executing(monkeypatch):
     monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
     monkeypatch.setattr(sch.get_settings(), "directional_signals_only", True)
     monkeypatch.setattr(sch.get_settings(), "directional_mode", "selective")
+    # Widen the entry-time window so the test is independent of wall-clock hour.
+    monkeypatch.setattr(sch.get_settings(), "no_entry_before_et", "00:00")
+    monkeypatch.setattr(sch.get_settings(), "no_entry_after_et", "23:59")
 
     async def fake_capital(*_a, **_k): return _D("50000")
     async def fake_unrealized(): return _D("0")
     monkeypatch.setattr(sch, "get_effective_capital", fake_capital)
     monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
     monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
+    async def _no_shadow(*_a, **_k): return None
+    monkeypatch.setattr(sch, "record_shadow_signal", _no_shadow)
 
     async def fake_scan(**_):
         return ([_TD("SPY", "BUY_CALL", 500.0, "0DTE", "HIGH", "strong breakout")], [], "")
@@ -929,6 +934,75 @@ async def test_signals_only_posts_signal_without_executing(monkeypatch):
     # and no trade row was booked
     with sf() as s:
         assert s.query(_Trade).count() == 0
+
+
+async def test_high_conviction_only_filters_medium_directional(monkeypatch):
+    """high_conviction_only: even in aggressive mode, a MEDIUM decision must NOT
+    be signalled — only HIGH gets through."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(sch.get_settings(), "directional_signals_only", True)
+    monkeypatch.setattr(sch.get_settings(), "directional_mode", "aggressive")
+    monkeypatch.setattr(sch.get_settings(), "high_conviction_only", True)
+    monkeypatch.setattr(sch.get_settings(), "no_entry_before_et", "00:00")
+    monkeypatch.setattr(sch.get_settings(), "no_entry_after_et", "23:59")
+    # Module-level cooldown/dedup state leaks across tests — clear it so a prior
+    # test's SPY entry doesn't put SPY in the 15-min cooldown and block this one.
+    sch._last_trade_open.clear()
+    sch._last_trade_open_by_action.clear()
+    sch._last_signal_posted.clear()
+
+    async def fake_capital(*_a, **_k): return _D("50000")
+    async def fake_unrealized(): return _D("0")
+    monkeypatch.setattr(sch, "get_effective_capital", fake_capital)
+    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
+    async def no_shadow(*_a, **_k): return None
+    monkeypatch.setattr(sch, "record_shadow_signal", no_shadow)
+
+    async def fake_scan(**_):
+        return ([
+            _TD("SPY", "BUY_CALL", 500.0, "0DTE", "HIGH", "strong breakout"),
+            _TD("QQQ", "BUY_PUT", 480.0, "0DTE", "MEDIUM", "mild momentum"),
+        ], [], "")
+    monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
+
+    posted: list[str] = []
+    async def signals(t): posted.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(is_open=True)
+
+    await sch._directional_scan_job(
+        signal_poster=signals, trade_poster=_noop_poster,
+        log_poster=_noop_poster, clock_fetcher=clock_open,
+    )
+    joined = "\n".join(posted)
+    assert "SPY" in joined and "BUY a CALL" in joined, "HIGH SPY signal must post"
+    assert "QQQ" not in joined, "MEDIUM QQQ signal must be filtered out"
+
+
+async def test_high_conviction_only_filters_medium_equities(monkeypatch):
+    """high_conviction_only: the equities scanner must only post HIGH signals."""
+    monkeypatch.setattr(sch.get_settings(), "high_conviction_only", True)
+
+    from agents.equities import scanner as _scn
+    async def fake_scan(*_a, **_k):
+        return [
+            _TD("AAPL", "BUY_CALL", 200.0, "0DTE", "HIGH", "pullback"),
+            _TD("NVDA", "BUY_CALL", 900.0, "0DTE", "MEDIUM", "breakout"),
+        ]
+    monkeypatch.setattr(_scn, "run_equities_scan", fake_scan)
+    monkeypatch.setattr(_scn, "actionable_changed", lambda d: True)
+    monkeypatch.setattr(_scn, "format_equities_signal", lambda d, **_k: f"{d.ticker}/{d.conviction}")
+    monkeypatch.setattr(_scn, "write_signals_snapshot", lambda *_a, **_k: None)
+
+    posted: list[str] = []
+    async def stock_poster(t): posted.append(t)
+
+    await sch._equities_scan_job(stock_signal_poster=stock_poster, log_poster=_noop_poster)
+    assert any("AAPL" in m for m in posted), "HIGH AAPL signal must post"
+    assert not any("NVDA" in m for m in posted), "MEDIUM NVDA signal must be filtered"
 
 
 async def test_event_blackout_not_consulted_when_disabled(monkeypatch):
