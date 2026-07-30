@@ -63,6 +63,17 @@ def _reset_state():
     reset_state_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _pin_directional_capital(monkeypatch):
+    """The directional loss limit now runs off its own directional_capital_usd
+    pool (default $10k). Pin to $5k so these tests' -15%=$750-on-$5k math holds."""
+    from decimal import Decimal as _Dec
+    from trademaster.config import get_settings
+    monkeypatch.setenv("DIRECTIONAL_CAPITAL_USD", "5000")  # survives a cache_clear
+    get_settings.cache_clear()
+    monkeypatch.setattr(get_settings(), "directional_capital_usd", _Dec("5000"))
+
+
 def _decision(ticker="SPY", action="BUY_CALL", strike=500.0, conviction="HIGH"):
     return TickerDecision(
         ticker=ticker, action=action, strike=strike, expiry="0DTE",
@@ -358,9 +369,9 @@ async def test_daily_loss_limit_pauses_when_threshold_hit(session_factory, monke
         when=datetime(2026, 5, 13, 18, 0, tzinfo=UTC),
     )
 
-    # No unrealized P&L
-    async def fake_unrealized(): return Decimal("0")
-    monkeypatch.setattr(alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    # No unrealized P&L (directional-scoped now)
+    async def fake_unrealized(*_a, **_k): return Decimal("0")
+    monkeypatch.setattr(sch, "directional_unrealized_pnl", fake_unrealized)
 
     # Freeze "now" so today_et returns May 13
     from trademaster import timeutils
@@ -385,7 +396,7 @@ async def test_daily_loss_limit_pauses_when_threshold_hit(session_factory, monke
         clock_fetcher=never_called,
     )
 
-    assert get_state().is_paused()
+    assert get_state().is_directional_paused()
     assert log_messages, "Expected a loss-limit alert posted to #logs"
     assert "loss limit" in log_messages[0].lower()
 
@@ -449,8 +460,8 @@ async def test_daily_loss_limit_includes_unrealized(session_factory, monkeypatch
         when=datetime(2026, 5, 13, 18, 0, tzinfo=UTC),
     )
 
-    async def fake_unrealized(): return Decimal("-400")
-    monkeypatch.setattr(alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    async def fake_unrealized(*_a, **_k): return Decimal("-400")
+    monkeypatch.setattr(sch, "directional_unrealized_pnl", fake_unrealized)
 
     from trademaster import timeutils
     fake_utc = datetime(2026, 5, 13, 18, 30, tzinfo=UTC)
@@ -470,7 +481,7 @@ async def test_daily_loss_limit_includes_unrealized(session_factory, monkeypatch
         clock_fetcher=never_called,
     )
 
-    assert get_state().is_paused()
+    assert get_state().is_directional_paused()
 
 
 # ---------------------------------------------------------------------------

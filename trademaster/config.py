@@ -27,6 +27,23 @@ class Settings(BaseSettings):
     account_type: Literal["cash"] = "cash"
 
     enable_iron_condor: bool = False
+    # Master switch for the directional (SPY/QQQ 0DTE trend) engine. When False,
+    # NO new directional entries are taken — both the 15-min fallback scan job and
+    # the real-time WebSocket trigger are suppressed. The directional EXIT monitor
+    # still runs so any open position is managed to the close. Set False to run a
+    # condor-only regime (e.g. the 2026-07-28 $50k condor-only test).
+    enable_directional: bool = True
+    # Study mode: when True the directional engine still scans and posts its
+    # broker-ready signals to #signals, but places NO orders and books NO trades
+    # (execute_directional_signal is skipped). Lets us watch what the engine WOULD
+    # do — and record its live signal quality — without risking capital, while the
+    # "why is directional −EV" question is open. Requires enable_directional=True.
+    directional_signals_only: bool = False
+    # Drop MEDIUM: post/act on HIGH-conviction signals only, for BOTH the
+    # directional engine and the equities scanner. Independent of directional_mode
+    # (filters conviction, not exit aggressiveness). Set 2026-07-29 after the loss
+    # analysis showed MEDIUM was −$6,558 and HIGH the only profitable bucket.
+    high_conviction_only: bool = False
     directional_mode: Literal["aggressive", "selective"] = "selective"
     # Platform-first: when True BOTH the directional ENTRY decision
     # (signal_engine.decide) AND the EXIT confirm (exit_monitor._rules_exit_confirm)
@@ -148,6 +165,15 @@ class Settings(BaseSettings):
     # baseline_reset_at). In live mode, effective = account.equity directly.
     trading_capital_usd: Decimal = Field(default=Decimal("5000"), gt=0)
 
+    # Isolated directional capital pool (2026-07-29). The directional engine's
+    # sizing (exposure + per-trade caps) and its loss limits run off THIS pool —
+    # directional_capital_usd + directional-only realized P&L — kept fully
+    # separate from the iron condor's trading_capital_usd. Set $10k directional /
+    # $50k condor to test the two strategies side-by-side without shared risk.
+    # Paper-mode only (a single live account can't be split). See
+    # capital.get_effective_capital(strategy_group="directional").
+    directional_capital_usd: Decimal = Field(default=Decimal("10000"), gt=0)
+
     # Baseline reset: if set, the dynamic-capital calc ignores all trades
     # closed before this UTC timestamp. Use to start fresh after major
     # strategy changes without losing the audit history. Set via .env:
@@ -167,12 +193,24 @@ class Settings(BaseSettings):
     weekly_loss_limit_pct: float = Field(default=0.25, gt=0, le=1.0)
 
     # Iron-condor position size (contracts per entry). Defined-risk, so P&L and
-    # drawdown scale LINEARLY with this. HARD-CAPPED at 2: the sizing backtest
-    # (scripts/backtest_condor_sizing.py, 2023→2026) showed 2 contracts never
-    # breached the daily/weekly loss limits (worst week −$1,080 vs the $2,500
-    # limit), while 3 starts to approach them. Default 1 (conservative); raise to
-    # 2 once the live edge is confirmed and a ~20% account drawdown is acceptable.
-    condor_contracts: int = Field(default=1, ge=1, le=2)
+    # drawdown scale LINEARLY with this (defined-risk P&L is linear in contracts,
+    # so the edge — win%, Sharpe, DSR — is size-invariant). The cap exists only to
+    # keep the drawdown sane vs the pool at the CURRENT capital. Re-validated at
+    # $50k (scripts/backtest_condor_sizing.py 50000 10,20): 10ct worst week −$5,398,
+    # 20ct −$10,796 (both < the $12,500 weekly limit); 20ct's worst SINGLE trade
+    # −$7,684 = 15.4% of $50k breached the 15% daily line ONCE in 3.5y, 10ct never.
+    # Cap raised 12→20 (07-29) then 20→60 (07-30) as the user scaled per-trade risk
+    # 9.1%→18.2%→50% of $50k (~55ct ≈ $25k committed). At this size the condor has a
+    # WEEKLY loss-halt (condor_weekly_loss_limit_pct) as the circuit-breaker — a
+    # single max-loss day (~$25k) still can't be capped (defined risk is on before
+    # the halt checks), but the halt stops the rest of the week after a bad day.
+    condor_contracts: int = Field(default=1, ge=1, le=60)
+
+    # Condor WEEKLY loss-halt as a fraction of the condor pool (trading_capital_usd).
+    # 0 = disabled (default). Checked before the daily 10:00 entry: if this week's
+    # realized condor P&L ≤ −(pct × pool), the condor is paused (condor-only) until
+    # Monday — directional keeps trading. Set 0.125 (= $6,250 on $50k) 2026-07-30.
+    condor_weekly_loss_limit_pct: Decimal = Field(default=Decimal("0"), ge=0)
 
     # Tiered daily trade caps. **0 = UNLIMITED** (no per-day count cap) — set as
     # the default 2026-06-07: with capital at $25k and risk bounded by the daily

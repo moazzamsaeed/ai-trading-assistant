@@ -460,6 +460,94 @@ async def test_iron_condor_job_skipped_when_paused(monkeypatch):
     assert trade_posted == []
 
 
+async def test_condor_weekly_loss_halt_pauses_condor_only(monkeypatch):
+    """When this week's condor realized P&L breaches condor_weekly_loss_limit_pct
+    of the pool, the condor entry pauses the CONDOR (not directional) and the
+    strategist never runs."""
+    import datetime as _dmod
+    import trademaster.db as _db
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(_db, "today_et", lambda: _dmod.date(2026, 7, 1))  # Wednesday
+    monkeypatch.setattr(sch, "today_et", lambda: _dmod.date(2026, 7, 1))
+    monkeypatch.setattr(sch.get_settings(), "trading_capital_usd", _D("50000"))
+    monkeypatch.setattr(sch.get_settings(), "condor_weekly_loss_limit_pct", _D("0.125"))
+    monkeypatch.setattr(sch.get_settings(), "deterministic_engine", False)
+
+    # Seed a −$7,000 condor loss earlier this week (Mon) → over the $6,250 limit
+    seed_when = _dt.combine(_dmod.date(2026, 6, 29), _dmod.time(15, 0), tzinfo=_UTC)
+    with sf() as s:
+        s.add(_Trade(
+            symbol="SPY_IC", asset_class="option", side="sell", strategy="spy_0dte_ic",
+            qty=_D("55"), entry_price=_D("46"), exit_price=_D("500"),
+            realized_pnl_usd=_D("-7000"),
+            opened_at=seed_when - _dmod.timedelta(hours=1), closed_at=seed_when,
+        ))
+        s.commit()
+
+    async def boom_strat(**_kwargs):
+        raise AssertionError("strategist must not run after the condor loss-halt")
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", boom_strat)
+    monkeypatch.setattr(sch, "run_deterministic_condor", boom_strat)
+
+    logs: list[str] = []
+    async def log_capture(t): logs.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(is_open=True)
+
+    await sch._iron_condor_entry_job(
+        signal_poster=_noop_poster, trade_poster=_noop_poster,
+        log_poster=log_capture, clock_fetcher=clock_open,
+    )
+    assert get_state().is_condor_paused(), "condor must be paused after weekly loss halt"
+    assert not get_state().is_directional_paused(), "directional must NOT be paused"
+    assert any("weekly loss" in m.lower() for m in logs), logs
+
+
+async def test_condor_eod_logs_posts_pnl_and_buffer(monkeypatch):
+    """The EOD condor line reports today + week-to-date + buffer to the weekly halt."""
+    import datetime as _dmod
+    import trademaster.db as _db
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(_db, "today_et", lambda: _dmod.date(2026, 7, 1))  # Wed
+    monkeypatch.setattr(sch.get_settings(), "trading_capital_usd", _D("50000"))
+    monkeypatch.setattr(sch.get_settings(), "condor_weekly_loss_limit_pct", _D("0.125"))
+
+    # −$2,000 condor loss today (Wed) → week-to-date −$2,000, buffer = 6250 − 2000
+    when = _dt.combine(_dmod.date(2026, 7, 1), _dmod.time(15, 0), tzinfo=_UTC)
+    with sf() as s:
+        s.add(_Trade(
+            symbol="SPY_IC", asset_class="option", side="sell", strategy="spy_0dte_ic",
+            qty=_D("55"), entry_price=_D("46"), exit_price=_D("82"),
+            realized_pnl_usd=_D("-2000"),
+            opened_at=when - _dmod.timedelta(hours=1), closed_at=when,
+        ))
+        s.commit()
+
+    logs: list[str] = []
+    async def log_capture(t): logs.append(t)
+
+    await sch._condor_eod_logs_job(log_poster=log_capture)
+    assert len(logs) == 1, logs
+    msg = logs[0]
+    assert "Condor EOD" in msg
+    assert "-2,000" in msg or "-2000" in msg  # today + week
+    assert "4,250" in msg  # buffer = 6250 - 2000
+    assert "6,250" in msg  # the weekly halt limit
+
+
+async def test_condor_eod_logs_silent_when_no_activity(monkeypatch):
+    """No condor trades this week → no #logs line (avoid pure-noise heartbeats)."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    logs: list[str] = []
+    async def log_capture(t): logs.append(t)
+    await sch._condor_eod_logs_job(log_poster=log_capture)
+    assert logs == []
+
+
 async def test_iron_condor_job_skipped_when_market_closed(monkeypatch):
     sig: list[str] = []
     trd: list[str] = []
@@ -808,9 +896,9 @@ async def test_weekly_loss_limit_halts_scan(monkeypatch):
         ))
         session.commit()
 
-    async def fake_unrealized(): return _D("0")
+    async def fake_unrealized(*_a, **_k): return _D("0")
     async def fake_capital(*_a, **_k): return _D("5000")  # weekly limit = $1,250; loss=$2,000 > limit
-    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "directional_unrealized_pnl", fake_unrealized)
     monkeypatch.setattr(sch, "get_effective_capital", fake_capital)
     monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
 
@@ -822,7 +910,7 @@ async def test_weekly_loss_limit_halts_scan(monkeypatch):
         signal_poster=_noop_poster, trade_poster=_noop_poster,
         log_poster=log_capture,
     )
-    assert get_state().is_paused(), "weekly loss limit must pause trading"
+    assert get_state().is_directional_paused(), "weekly loss limit must pause directional"
     assert any("weekly" in m.lower() for m in logs)
 
 
@@ -887,6 +975,122 @@ async def test_max_trades_unlimited_skips_count_check(monkeypatch):
         log_poster=_noop_poster,
     )
     assert not consulted, "count cap must NOT be consulted when unlimited (0)"
+
+
+async def test_signals_only_posts_signal_without_executing(monkeypatch):
+    """directional_signals_only: a HIGH BUY decision must post a broker-ready
+    signal to #signals but must NOT call execute_directional_signal (no order,
+    no trade booked)."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(sch.get_settings(), "directional_signals_only", True)
+    monkeypatch.setattr(sch.get_settings(), "directional_mode", "selective")
+    # Widen the entry-time window so the test is independent of wall-clock hour.
+    monkeypatch.setattr(sch.get_settings(), "no_entry_before_et", "00:00")
+    monkeypatch.setattr(sch.get_settings(), "no_entry_after_et", "23:59")
+
+    async def fake_capital(*_a, **_k): return _D("50000")
+    async def fake_unrealized(): return _D("0")
+    monkeypatch.setattr(sch, "get_effective_capital", fake_capital)
+    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
+    async def _no_shadow(*_a, **_k): return None
+    monkeypatch.setattr(sch, "record_shadow_signal", _no_shadow)
+
+    async def fake_scan(**_):
+        return ([_TD("SPY", "BUY_CALL", 500.0, "0DTE", "HIGH", "strong breakout")], [], "")
+    monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
+
+    executed = []
+    async def fake_execute(*_a, **_k):
+        executed.append(1)
+        raise AssertionError("must NOT execute in signals-only mode")
+    monkeypatch.setattr(sch, "execute_directional_signal", fake_execute)
+
+    posted: list[str] = []
+    async def signals(t): posted.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(is_open=True)
+
+    await sch._directional_scan_job(
+        signal_poster=signals, trade_poster=_noop_poster,
+        log_poster=_noop_poster, clock_fetcher=clock_open,
+    )
+    assert not executed, "execute_directional_signal must not be called"
+    assert any("BUY a CALL" in m and "SPY" in m for m in posted), posted
+    # and no trade row was booked
+    with sf() as s:
+        assert s.query(_Trade).count() == 0
+
+
+async def test_high_conviction_only_filters_medium_directional(monkeypatch):
+    """high_conviction_only: even in aggressive mode, a MEDIUM decision must NOT
+    be signalled — only HIGH gets through."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(sch.get_settings(), "directional_signals_only", True)
+    monkeypatch.setattr(sch.get_settings(), "directional_mode", "aggressive")
+    monkeypatch.setattr(sch.get_settings(), "high_conviction_only", True)
+    monkeypatch.setattr(sch.get_settings(), "no_entry_before_et", "00:00")
+    monkeypatch.setattr(sch.get_settings(), "no_entry_after_et", "23:59")
+    # Module-level cooldown/dedup state leaks across tests — clear it so a prior
+    # test's SPY entry doesn't put SPY in the 15-min cooldown and block this one.
+    sch._last_trade_open.clear()
+    sch._last_trade_open_by_action.clear()
+    sch._last_signal_posted.clear()
+
+    async def fake_capital(*_a, **_k): return _D("50000")
+    async def fake_unrealized(): return _D("0")
+    monkeypatch.setattr(sch, "get_effective_capital", fake_capital)
+    monkeypatch.setattr(sch.alpaca_client, "get_unrealized_pnl", fake_unrealized)
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)
+    async def no_shadow(*_a, **_k): return None
+    monkeypatch.setattr(sch, "record_shadow_signal", no_shadow)
+
+    async def fake_scan(**_):
+        return ([
+            _TD("SPY", "BUY_CALL", 500.0, "0DTE", "HIGH", "strong breakout"),
+            _TD("QQQ", "BUY_PUT", 480.0, "0DTE", "MEDIUM", "mild momentum"),
+        ], [], "")
+    monkeypatch.setattr(sch, "run_directional_scan", fake_scan)
+
+    posted: list[str] = []
+    async def signals(t): posted.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(is_open=True)
+
+    await sch._directional_scan_job(
+        signal_poster=signals, trade_poster=_noop_poster,
+        log_poster=_noop_poster, clock_fetcher=clock_open,
+    )
+    joined = "\n".join(posted)
+    assert "SPY" in joined and "BUY a CALL" in joined, "HIGH SPY signal must post"
+    assert "QQQ" not in joined, "MEDIUM QQQ signal must be filtered out"
+
+
+async def test_high_conviction_only_filters_medium_equities(monkeypatch):
+    """high_conviction_only: the equities scanner must only post HIGH signals."""
+    monkeypatch.setattr(sch.get_settings(), "high_conviction_only", True)
+
+    from agents.equities import scanner as _scn
+    async def fake_scan(*_a, **_k):
+        return [
+            _TD("AAPL", "BUY_CALL", 200.0, "0DTE", "HIGH", "pullback"),
+            _TD("NVDA", "BUY_CALL", 900.0, "0DTE", "MEDIUM", "breakout"),
+        ]
+    monkeypatch.setattr(_scn, "run_equities_scan", fake_scan)
+    monkeypatch.setattr(_scn, "actionable_changed", lambda d: True)
+    monkeypatch.setattr(_scn, "format_equities_signal", lambda d, **_k: f"{d.ticker}/{d.conviction}")
+    monkeypatch.setattr(_scn, "write_signals_snapshot", lambda *_a, **_k: None)
+
+    posted: list[str] = []
+    async def stock_poster(t): posted.append(t)
+
+    await sch._equities_scan_job(stock_signal_poster=stock_poster, log_poster=_noop_poster)
+    assert any("AAPL" in m for m in posted), "HIGH AAPL signal must post"
+    assert not any("NVDA" in m for m in posted), "MEDIUM NVDA signal must be filtered"
 
 
 async def test_event_blackout_not_consulted_when_disabled(monkeypatch):

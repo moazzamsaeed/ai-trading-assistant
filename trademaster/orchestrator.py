@@ -63,13 +63,20 @@ async def _run() -> None:
 
         loop = asyncio.get_running_loop()
 
-        stream = make_directional_trigger(
-            main_loop=loop,
-            signal_poster=bot.post_signal,
-            trade_poster=bot.post_trade,
-            log_poster=bot.post_log,
-        )
-        stream.start()
+        # Real-time directional entry trigger — suppressed in condor-only mode so
+        # no new directional positions open (the 15-min scan job is gated the same
+        # way in make_scheduler). Directional exits still run via the scheduler.
+        stream = None
+        if settings.enable_directional:
+            stream = make_directional_trigger(
+                main_loop=loop,
+                signal_poster=bot.post_signal,
+                trade_poster=bot.post_trade,
+                log_poster=bot.post_log,
+            )
+            stream.start()
+        else:
+            log.info("directional_engine_disabled")
 
         log.info("trademaster_started", trading_mode=settings.trading_mode)
 
@@ -85,7 +92,8 @@ async def _run() -> None:
         try:
             await stop.wait()
         finally:
-            stream.stop()
+            if stream is not None:
+                stream.stop()
             scheduler.shutdown(wait=False)
             log.info("trademaster_stopped")
 

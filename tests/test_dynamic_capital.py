@@ -23,6 +23,16 @@ from trademaster.config import get_settings
 from trademaster.db import Base, Trade, get_cumulative_realized_pnl, make_engine, make_session_factory
 
 
+@pytest.fixture(autouse=True)
+def _pin_directional_capital(monkeypatch):
+    """Directional sizing now runs off directional_capital_usd (default $10k).
+    Pin it to $5k to match these tests' documented base ($5k → $1k loss → $4k)."""
+    from decimal import Decimal
+    monkeypatch.setenv("DIRECTIONAL_CAPITAL_USD", "5000")  # survives a cache_clear
+    get_settings.cache_clear()
+    monkeypatch.setattr(get_settings(), "directional_capital_usd", Decimal("5000"))
+
+
 @pytest.fixture
 def session_factory():
     engine = make_engine("sqlite:///:memory:")
@@ -144,6 +154,47 @@ async def test_baseline_reset_excludes_pre_reset_trades(session_factory, monkeyp
 
     capital = await get_effective_capital(session_factory)
     assert capital == Decimal("4950.00"), f"Expected 5000 + (-50) = 4950, got {capital}"
+
+
+async def test_capital_pools_are_isolated(session_factory, monkeypatch):
+    """The directional pool = directional_capital_usd + DIRECTIONAL-only realized;
+    the shared/condor pool = trading_capital_usd + ALL realized. A condor win must
+    not inflate the directional pool, and a shadow row must be excluded from both
+    the directional pool and never counted as directional."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "trading_mode", "paper")
+    monkeypatch.setattr(settings, "trading_capital_usd", Decimal("50000"))
+    monkeypatch.setattr(settings, "directional_capital_usd", Decimal("10000"))
+    monkeypatch.setattr(settings, "baseline_reset_at", None)
+
+    now = datetime.now(UTC)
+    with session_factory() as s:
+        s.add(Trade(  # directional win +$300
+            symbol="SPY260101C00500000", asset_class="option", side="buy",
+            strategy="directional_call", qty=Decimal("1"), entry_price=Decimal("2"),
+            exit_price=Decimal("5"), realized_pnl_usd=Decimal("300"),
+            opened_at=now, closed_at=now,
+        ))
+        s.add(Trade(  # condor win +$1000
+            symbol="SPY_IC", asset_class="option", side="sell",
+            strategy="spy_0dte_ic", qty=Decimal("2"), entry_price=Decimal("3"),
+            exit_price=Decimal("0"), realized_pnl_usd=Decimal("1000"),
+            opened_at=now, closed_at=now,
+        ))
+        s.add(Trade(  # shadow row +$9999 — must be excluded from BOTH pools
+            symbol="SPY260101P00490000", asset_class="option", side="buy",
+            strategy="directional_shadow", qty=Decimal("1"), entry_price=Decimal("1"),
+            exit_price=Decimal("100"), realized_pnl_usd=Decimal("9999"),
+            opened_at=now, closed_at=now,
+        ))
+        s.commit()
+
+    dir_pool = await get_effective_capital(session_factory, strategy_group="directional")
+    shared_pool = await get_effective_capital(session_factory)  # legacy/condor view
+    # directional pool sees only its +$300 (not condor's +$1000, not shadow's +$9999)
+    assert dir_pool == Decimal("10300"), dir_pool
+    # shared/condor pool sees all real realized (+300 +1000 +9999 shadow) off $50k base
+    assert shared_pool == Decimal("61299"), shared_pool
 
 
 async def test_directional_deployed_only_counts_directional(session_factory, monkeypatch):

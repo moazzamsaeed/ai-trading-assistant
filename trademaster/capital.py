@@ -38,8 +38,19 @@ from trademaster.db import Trade, get_cumulative_realized_pnl, make_session_fact
 _DIRECTIONAL_STRATEGIES = ("directional_call", "directional_put")
 
 
-async def get_effective_capital(session_factory=None) -> Decimal:
-    """Return the trading capital available for sizing/limits right now."""
+async def get_effective_capital(
+    session_factory=None, *, strategy_group: str | None = None
+) -> Decimal:
+    """Return the trading capital available for sizing/limits right now.
+
+    `strategy_group` selects an isolated capital pool (paper mode only):
+      - "directional" → `directional_capital_usd` + realized P&L of directional
+        trades only. Keeps the directional engine's sizing + loss limits on its
+        own $10k pool, separate from the iron condor's $50k.
+      - None → the legacy shared pool: `trading_capital_usd` + all realized P&L.
+    Live mode returns Alpaca account equity regardless (a single funded account
+    can't be split), so pool isolation is a paper-mode construct.
+    """
     settings = get_settings()
 
     if settings.trading_mode == "live":
@@ -52,10 +63,50 @@ async def get_effective_capital(session_factory=None) -> Decimal:
             # could over-deploy if the real account is smaller.
             return Decimal("0")
 
-    # Paper: configured base + cumulative realized P&L (since baseline reset)
+    # Paper: configured base + cumulative realized P&L (since baseline reset),
+    # scoped to the pool's strategies.
     sf = session_factory or make_session_factory()
-    realized = get_cumulative_realized_pnl(sf)
-    return max(Decimal("0"), settings.trading_capital_usd + realized)
+    if strategy_group == "directional":
+        base = settings.directional_capital_usd
+        realized = get_cumulative_realized_pnl(sf, strategies=_DIRECTIONAL_STRATEGIES)
+    else:
+        base = settings.trading_capital_usd
+        realized = get_cumulative_realized_pnl(sf)
+    return max(Decimal("0"), base + realized)
+
+
+async def directional_unrealized_pnl(session_factory=None) -> Decimal:
+    """Unrealized P&L of open DIRECTIONAL option positions only.
+
+    Matches live Alpaca positions to the OCC symbols of open directional trades,
+    so the directional loss limit reflects its own $10k pool and never trips on
+    the iron condor's open-position swings. Returns 0 on any error (a blip must
+    never halt trading) or when directional has nothing open."""
+    sf = session_factory or make_session_factory()
+    with sf() as session:
+        occs = {
+            t.symbol
+            for t in session.execute(
+                select(Trade).where(
+                    Trade.strategy.in_(_DIRECTIONAL_STRATEGIES),
+                    Trade.closed_at.is_(None),
+                )
+            ).scalars()
+        }
+    if not occs:
+        return Decimal("0")
+    try:
+        positions = await alpaca_client.get_positions()
+    except Exception:  # noqa: BLE001
+        return Decimal("0")
+    return sum(
+        (
+            Decimal(str(getattr(p, "unrealized_pl", 0) or 0))
+            for p in positions
+            if getattr(p, "symbol", None) in occs
+        ),
+        Decimal("0"),
+    )
 
 
 def directional_deployed_usd(session: Session) -> Decimal:

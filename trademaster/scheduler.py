@@ -24,19 +24,21 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from agents.directional.executor import execute_directional_signal
+from agents.directional.shadow import record_shadow_signal, score_shadow_signals, shadow_summary
 from agents.directional.exit_monitor import (
     format_scale_out,
     run_directional_exit_monitor,
     run_trailing_stop_tick,
 )
 from agents.directional.intraday import (
+    format_directional_signal,
     format_entry_combined,
     format_setup_forming,
     is_fresh_leg,
     run_directional_scan,
 )
 from agents.intraday.scan import run_intraday_scan
-from agents.options.exit_monitor import run_exit_monitor
+from agents.options.exit_monitor import STRATEGY_NAME as STRATEGY_NAME_CONDOR, run_exit_monitor
 from agents.options.strategist import (
     run_deterministic_condor,
     run_iron_condor_strategist,
@@ -45,7 +47,12 @@ from agents.research.premarket import run_premarket_briefing
 from decimal import Decimal
 
 from integrations import alpaca_client
-from trademaster.capital import directional_deployed_usd, get_effective_capital
+from trademaster.capital import (
+    _DIRECTIONAL_STRATEGIES,
+    directional_deployed_usd,
+    directional_unrealized_pnl,
+    get_effective_capital,
+)
 from trademaster.config import get_settings
 from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, get_today_trade_count_by_conviction, get_today_directional_streak, get_today_failed_breakouts, make_session_factory
 from trademaster.event_calendar import is_blackout_day
@@ -224,41 +231,43 @@ async def _directional_scan_job(
     narrative for #research is posted separately by `_market_analysis_job`
     (mid-day + close), not from this scan.
     """
-    if get_state().is_paused():
+    if get_state().is_directional_paused():
         log.info("directional_scan_skipped_paused")
         return
 
-    # Daily loss limit: halt if realized + unrealized P&L exceeds 15% of capital.
-    # Capital tracks the actual account size (paper: base + cumulative realized;
-    # live: Alpaca equity), so the limit shrinks with prior losses and grows
-    # with gains automatically.
+    # Daily loss limit: halt DIRECTIONAL if its realized + unrealized P&L exceeds
+    # 15% of its OWN $10k pool (directional_capital_usd + directional-only
+    # realized). Kept separate from the iron condor's $50k — a directional halt
+    # pauses only directional (pause_directional), never the condor.
     settings = get_settings()
-    capital = await get_effective_capital(make_session_factory())
+    capital = await get_effective_capital(
+        make_session_factory(), strategy_group="directional"
+    )
 
     # Capital floor: with 0 capital there's nothing to deploy and dividing
     # by it for the limit gives 0, which would tautologically trip "loss <= 0".
-    # Halt outright instead of erroring.
+    # Halt directional outright instead of erroring.
     if capital <= Decimal("0"):
-        get_state().pause(hours=24)
+        get_state().pause_directional(hours=24)
         await log_poster(
-            "🛑 Effective capital is $0 (cumulative losses exceed base). "
-            "Trading halted until tomorrow."
+            "🛑 Directional capital is $0 (cumulative losses exceed the $10k pool). "
+            "Directional halted until tomorrow (condor unaffected)."
         )
         log.warning("scan_skipped_capital_zero")
         return
 
-    # ---- Daily loss limit ----
+    # ---- Daily loss limit (directional pool only) ----
     limit_usd = capital * Decimal(str(settings.daily_loss_limit_pct))
-    realized = get_today_realized_pnl(make_session_factory())
-    unrealized = await alpaca_client.get_unrealized_pnl()
+    realized = get_today_realized_pnl(make_session_factory(), strategies=_DIRECTIONAL_STRATEGIES)
+    unrealized = await directional_unrealized_pnl(make_session_factory())
     total_pnl = realized + unrealized
     if total_pnl <= -limit_usd:
-        get_state().pause(hours=24)
+        get_state().pause_directional(hours=24)
         pct = float(-total_pnl / capital * 100)
         await log_poster(
-            f"🛑 Daily loss limit hit: **${float(total_pnl):.0f}** loss "
-            f"({pct:.0f}% of ${float(capital):.0f} capital). "
-            f"Trading halted until tomorrow. "
+            f"🛑 Directional daily loss limit hit: **${float(total_pnl):.0f}** loss "
+            f"({pct:.0f}% of ${float(capital):.0f} directional pool). "
+            f"Directional halted until tomorrow (condor unaffected). "
             f"Realized: ${float(realized):.0f} | Unrealized: ${float(unrealized):.0f}"
         )
         log.warning(
@@ -271,18 +280,18 @@ async def _directional_scan_job(
         )
         return
 
-    # ---- Weekly loss limit ----
+    # ---- Weekly loss limit (directional pool only) ----
     weekly_limit_usd = capital * Decimal(str(settings.weekly_loss_limit_pct))
-    weekly_realized = get_this_week_realized_pnl(make_session_factory())
+    weekly_realized = get_this_week_realized_pnl(make_session_factory(), strategies=_DIRECTIONAL_STRATEGIES)
     weekly_total = weekly_realized + unrealized
     if weekly_total <= -weekly_limit_usd:
         days_until_monday = (7 - today_et().weekday()) % 7 or 7
-        get_state().pause(hours=days_until_monday * 24)
+        get_state().pause_directional(hours=days_until_monday * 24)
         pct = float(-weekly_total / capital * 100)
         await log_poster(
-            f"🛑 Weekly loss limit hit: **${float(weekly_total):.0f}** loss "
-            f"({pct:.0f}% of ${float(capital):.0f} capital). "
-            f"Trading halted until Monday."
+            f"🛑 Directional weekly loss limit hit: **${float(weekly_total):.0f}** loss "
+            f"({pct:.0f}% of ${float(capital):.0f} directional pool). "
+            f"Directional halted until Monday (condor unaffected)."
         )
         log.warning(
             "weekly_loss_limit_hit",
@@ -379,9 +388,16 @@ async def _directional_scan_job(
     max_exposure = capital * Decimal(str(settings.max_total_exposure_pct))
 
     conviction_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    # high_conviction_only forces HIGH-only regardless of aggressive/selective mode
+    # (the loss analysis showed MEDIUM is −$6,558 while HIGH is the only profitable
+    # bucket — project_directional_loss_analysis). It filters conviction only; exit
+    # aggressiveness still follows `mode`.
+    allowed_conviction = (
+        {"HIGH"} if (mode == "selective" or settings.high_conviction_only)
+        else {"MEDIUM", "HIGH"}
+    )
     to_execute = sorted(
-        [d for d in decisions if d.action != "HOLD"
-         and d.conviction in ({"HIGH"} if mode == "selective" else {"MEDIUM", "HIGH"})],
+        [d for d in decisions if d.action != "HOLD" and d.conviction in allowed_conviction],
         key=lambda d: (conviction_rank.get(d.conviction, 2), d.ticker),
     )[:3]
 
@@ -502,6 +518,30 @@ async def _directional_scan_job(
             )
             continue
 
+        # Study mode: post the broker-ready signal but place NO order. Reached only
+        # after every quality/throttle gate above has passed (freshness, ADX,
+        # cooldowns) — so the signal fires exactly when the engine WOULD have
+        # traded. Update the cooldown trackers as if a trade opened, so repeat
+        # scans don't re-post the same signal. The exposure cap never binds here
+        # (nothing is ever deployed), which is why this sits after it.
+        if settings.directional_signals_only:
+            _last_trade_open[decision.ticker] = datetime.now(UTC)
+            _last_trade_open_by_action[action_key] = datetime.now(UTC)
+            log.info(
+                "directional_signal_only_posted",
+                ticker=decision.ticker, action=decision.action,
+                conviction=decision.conviction, strike=str(decision.strike),
+            )
+            # Record a shadow trade so score_shadow_signals can track this
+            # signal's hypothetical P&L (forward read on signal quality; no
+            # capital risked). Best-effort — never blocks the signal post.
+            try:
+                await record_shadow_signal(decision, mode=mode, today=today)
+            except Exception as e:  # noqa: BLE001
+                log.warning("shadow_record_failed", ticker=decision.ticker, error=str(e))
+            await signal_poster(format_directional_signal(decision, today=today, mode=mode))
+            continue
+
         # The pre-emptive "setup forming" alert was already posted earlier (when
         # this was a near-miss); here we just execute and confirm. On a fill →
         # "model entered"; on a skip → a brief deduped notice (per ticker+action
@@ -602,6 +642,40 @@ async def _directional_exit_job(
             await log_poster(r["error_text"])
 
 
+async def _shadow_score_job(
+    *,
+    log_poster: Poster = _noop_poster,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+    force: bool = False,
+) -> None:
+    """Score open directional shadow trades (signals-only P&L tracker).
+
+    Marks each open shadow to market and closes on PT/stop/force-close — no
+    orders, no capital. On the end-of-day force pass, posts the win-rate/P&L
+    summary by conviction so we can see whether HIGH-conviction signals clear
+    the ~43% break-even bar. Only registered when directional_signals_only=True.
+    """
+    if not force:
+        try:
+            clock = await clock_fetcher()
+        except Exception as e:  # noqa: BLE001
+            log.warning("shadow_score_clock_failed", error=str(e))
+            return
+        if not clock.is_open:
+            return
+    try:
+        results = await score_shadow_signals(force_close=force or None)
+    except Exception as e:  # noqa: BLE001
+        log.error("shadow_score_failed", error=str(e), error_type=type(e).__name__)
+        return
+    closed = [r for r in results if r.get("status") == "closed"]
+    # On the end-of-day force pass, once everything is settled, post the summary.
+    if force and closed:
+        summary = shadow_summary()
+        if summary:
+            await log_poster(summary)
+
+
 async def _trailing_stop_tick_job(
     *,
     signal_poster: Poster,
@@ -688,6 +762,30 @@ async def _condor_settlement_job(
             await trade_poster(line)
         else:
             await log_poster(line)
+
+
+async def _condor_eod_logs_job(*, log_poster: Poster = _noop_poster) -> None:
+    """One-line end-of-day condor P&L → #logs: today + week-to-date + buffer to the
+    weekly loss-halt. Runs after settlement (16:03) so today's result is booked.
+    Skips silently on weeks with no condor activity at all (nothing to report)."""
+    settings = get_settings()
+    sf = make_session_factory()
+    strat = (STRATEGY_NAME_CONDOR,)
+    today = get_today_realized_pnl(sf, strategies=strat)
+    week = get_this_week_realized_pnl(sf, strategies=strat)
+    if today == 0 and week == 0:
+        log.info("condor_eod_no_activity")
+        return
+
+    line = f"📊 **Condor EOD** — today ${float(today):+,.0f} · week-to-date ${float(week):+,.0f}"
+    if settings.condor_weekly_loss_limit_pct > 0:
+        limit = settings.trading_capital_usd * settings.condor_weekly_loss_limit_pct
+        buffer = limit + week  # weekly halt trips when week <= -limit
+        if buffer <= 0:
+            line += f" · ⛔ weekly halt tripped (limit −${float(limit):,.0f}, paused until Mon)"
+        else:
+            line += f" · ${float(buffer):,.0f} buffer before the −${float(limit):,.0f} weekly halt"
+    await log_poster(line)
 
 
 # ----------------- daily / weekly #trades summaries -----------------
@@ -781,9 +879,37 @@ async def _iron_condor_entry_job(
 ) -> None:
     """Strategist run. Manual instructions → #signals; execution telem → #trades."""
     state = get_state()
-    if state.is_paused():
-        log.info("iron_condor_skipped_paused", paused_until=str(state.paused_until))
+    if state.is_condor_paused():
+        log.info("iron_condor_skipped_paused", paused_until=str(state.condor_paused_until))
         return
+
+    # Condor WEEKLY loss-halt (condor pool only). Checked before the once-daily
+    # entry: if this week's realized condor P&L has breached the limit, pause the
+    # condor until Monday (directional keeps trading). A single max-loss day can't
+    # be capped here — defined risk is on before this runs — but it stops further
+    # entries for the rest of the week after a bad day.
+    settings = get_settings()
+    if settings.condor_weekly_loss_limit_pct > 0:
+        limit = settings.trading_capital_usd * settings.condor_weekly_loss_limit_pct
+        weekly = get_this_week_realized_pnl(
+            make_session_factory(), strategies=(STRATEGY_NAME_CONDOR,)
+        )
+        if weekly <= -limit:
+            days_until_monday = (7 - today_et().weekday()) % 7 or 7
+            state.pause_condor(hours=days_until_monday * 24)
+            pct = float(-weekly / settings.trading_capital_usd * 100)
+            await log_poster(
+                f"🛑 Condor weekly loss limit hit: **${float(weekly):.0f}** "
+                f"({pct:.0f}% of ${float(settings.trading_capital_usd):.0f} pool, "
+                f"limit ${float(limit):.0f}). Condor paused until Monday "
+                f"(directional unaffected)."
+            )
+            log.warning(
+                "condor_weekly_loss_limit_hit",
+                weekly=float(weekly), limit=float(limit),
+                pool=float(settings.trading_capital_usd),
+            )
+            return
 
     try:
         clock = await clock_fetcher()
@@ -956,8 +1082,13 @@ async def _equities_scan_job(
         return
     write_signals_snapshot(decisions)  # current-state file for the Mission Control dashboard
     posted = 0
+    high_only = get_settings().high_conviction_only
     for d in decisions:
         if not actionable_changed(d):
+            continue
+        if high_only and d.conviction != "HIGH":
+            log.info("equities_signal_skipped_low_conviction",
+                     ticker=d.ticker, conviction=d.conviction)
             continue
         price = (d.analysis or {}).get("spy_price")  # key name is legacy; holds the ticker price
         try:
@@ -1019,23 +1150,53 @@ def make_scheduler(
     # Real-time triggers come from the WebSocket stream (alpaca_stream.py).
     # This fallback catches slow-building setups and guards against stream gaps.
     # SPY 0DTE timing is critical — 15 min ensures no setup is missed between surges.
-    scheduler.add_job(
-        _directional_scan_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="9-15",
-            minute="0,15,30,45",
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={
-            "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
-            "log_poster": log_post,
-        },
-        id="directional_scan",
-        replace_existing=True,
-        misfire_grace_time=300,
-    )
+    # Suppressed entirely when the directional engine is disabled (condor-only mode);
+    # the directional EXIT job below is always registered so open positions still close.
+    if get_settings().enable_directional:
+        scheduler.add_job(
+            _directional_scan_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-15",
+                minute="0,15,30,45",
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={
+                "signal_poster": signal_poster,
+                "trade_poster": trade_poster,
+                "log_poster": log_post,
+            },
+            id="directional_scan",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+
+        # Shadow P&L scorer (signals-only study mode only). Marks open shadow
+        # trades to market every 5 min (10:00–15:45 ET), then a 15:55 force pass
+        # closes any survivors and posts the win-rate/P&L-by-conviction summary.
+        if get_settings().directional_signals_only:
+            scheduler.add_job(
+                _shadow_score_job,
+                CronTrigger(
+                    day_of_week="mon-fri", hour="10-15",
+                    minute="0,5,10,15,20,25,30,35,40,45",
+                    timezone=PREMARKET_TZ,
+                ),
+                kwargs={"log_poster": log_post},
+                id="shadow_score",
+                replace_existing=True,
+                misfire_grace_time=120,
+            )
+            scheduler.add_job(
+                _shadow_score_job,
+                CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=55, timezone=PREMARKET_TZ
+                ),
+                kwargs={"log_poster": log_post, "force": True},
+                id="shadow_score_force",
+                replace_existing=True,
+                misfire_grace_time=120,
+            )
 
     # #research market analysis — exactly two LLM updates a day (plus the 8 AM
     # pre-market briefing above). One mid-day read of the tape at 12:30 ET and
@@ -1142,6 +1303,17 @@ def make_scheduler(
         id="condor_settlement",
         replace_existing=True,
         misfire_grace_time=600,
+    )
+
+    # Condor end-of-day P&L one-liner → #logs, 16:06 ET Mon-Fri (after settlement
+    # books today's result). Today + week-to-date + buffer to the weekly loss-halt.
+    scheduler.add_job(
+        _condor_eod_logs_job,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=6, timezone=PREMARKET_TZ),
+        kwargs={"log_poster": log_post},
+        id="condor_eod_logs",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     # Daily trade summary — 16:05 ET Mon-Fri (after the 16:00 close, before the
