@@ -37,6 +37,15 @@ log = get_logger(__name__)
 STRATEGY_NAME = "spy_0dte_ic"
 FORCE_CLOSE_AFTER = time(15, 50)
 
+# Statuses in which an order is already off the book — no point cancelling. Any
+# other status (`new`, `accepted`, `pending_new`, `partially_filled`, …) means the
+# order may still be live and holding quantity, so an unfilled close in one of
+# those states is cancelled. Mirrors alpaca_client._TERMINAL_ORDER_STATUSES minus
+# `filled` (a filled close is handled on its own branch).
+_DEAD_ORDER_STATUSES = frozenset(
+    {"filled", "canceled", "cancelled", "expired", "rejected", "done_for_day", "replaced", "suspended"}
+)
+
 
 # ----------------- helpers -----------------
 
@@ -221,6 +230,7 @@ async def run_exit_monitor(
                 chain_fetcher=chain_fetcher,
                 submitter=submitter,
                 waiter=waiter,
+                canceller=canceller,
                 force_close=force_close,
                 fill_timeout_s=fill_timeout_s,
             )
@@ -231,26 +241,30 @@ async def run_exit_monitor(
     return results
 
 
-def _parse_broker_error(err: object) -> tuple[str | None, list[str]]:
-    """Best-effort extraction of (code, related_order_ids) from an Alpaca APIError.
+def _parse_broker_error(err: object) -> tuple[str | None, list[str], dict]:
+    """Best-effort extraction of (code, related_order_ids, full_data) from an Alpaca APIError.
 
     Alpaca embeds a JSON object in the exception text, e.g.
-    `{"available":"0","code":40310000,...,"related_orders":["<id>"]}`. Returns
-    (None, []) when nothing parseable is found."""
+    `{"available":"0","code":40310000,"held_for_orders":"0","existing_qty":"1",
+    ...,"related_orders":["<id>"]}`. Returns (None, [], {}) when nothing
+    parseable is found. The full `data` dict lets callers distinguish a
+    genuinely held quantity (`held_for_orders` > 0) from a position shortfall
+    (`held_for_orders` == 0 and `available` < requested) — two situations
+    Alpaca reports under the same 40310000 code but which need opposite handling."""
     s = str(err)
     brace = s.find("{")
     if brace == -1:
-        return None, []
+        return None, [], {}
     try:
         data = json.loads(s[brace:])
     except (ValueError, json.JSONDecodeError):
-        return None, []
+        return None, [], {}
     if not isinstance(data, dict):
-        return None, []
+        return None, [], {}
     code = data.get("code")
     related = data.get("related_orders")
     related_ids = [str(o) for o in related] if isinstance(related, list) else []
-    return (str(code) if code is not None else None), related_ids
+    return (str(code) if code is not None else None), related_ids, data
 
 
 async def _handle_condor_exit_error(
@@ -258,19 +272,48 @@ async def _handle_condor_exit_error(
 ) -> dict:
     """Turn a broker exception into an isolated, retry-safe result dict.
 
-    The dominant real failure is `insufficient qty available` (code 40310000): a
-    stale resting close order from a previous sweep still holds the legs' quantity,
-    so every re-submit fails. Cancel that order so the next sweep can submit cleanly
-    (cancel-replace). Other errors — e.g. the 0DTE force-close `position intent
-    mismatch` — are surfaced once (throttled downstream) and left for the next sweep
-    or the morning reconciler to settle by expiry."""
+    Alpaca reports several distinct 0DTE-close failures, and the journal on live
+    trades #124/#125/#126 (2026-07-20..22) showed they need different handling —
+    the previous code lumped them together and misreported all of them:
+
+    * **Held qty** (40310000, `held_for_orders` > 0 / `related_orders` present):
+      a stale resting close order holds the legs. Cancel it so the next sweep can
+      resubmit (cancel-replace). This is the only case where cancelling helps.
+    * **Position shortfall** (40310000, `held_for_orders` == 0, `available` <
+      requested): the broker position has fewer contracts than the trade row's
+      qty (partial fill / leg desync upstream). Nothing is held — cancelling does
+      nothing. #124 hit this and was mislabeled "held by a resting order
+      (cancelled: none found)". Report it accurately; the reconciler settles the
+      remainder at expiry.
+    * **Intent mismatch** (42210000): the broker won't accept `buy_to_close`
+      because it no longer sees the short leg as open at expiry (#125). Expected
+      0DTE endgame — the reconciler settles it. Surface calmly, don't cancel.
+
+    All three fall through to reconciler settlement, so realized P&L is unaffected;
+    the goal here is accurate, low-noise reporting and cancelling only when it
+    actually unblocks a resubmit."""
     err_str = str(err)
-    code, related = _parse_broker_error(err)
-    qty_held = (
+    code, related, data = _parse_broker_error(err)
+
+    def _as_int(key: str) -> int | None:
+        try:
+            return int(str(data.get(key)))
+        except (TypeError, ValueError):
+            return None
+
+    held_for_orders = _as_int("held_for_orders")
+    available = _as_int("available")
+    requested = _as_int("qty") or (int(trade.qty) if trade.qty is not None else None)
+
+    is_qty_err = (
         code == "40310000"
         or "insufficient qty" in err_str
         or "held_for_orders" in err_str
     )
+    # A quantity IS actually held only when the broker says so (held_for_orders>0)
+    # or hands us related order IDs to cancel. held_for_orders==0 with a short
+    # `available` is a position shortfall, not a held order — cancelling is a no-op.
+    qty_held = is_qty_err and (bool(related) or (held_for_orders or 0) > 0)
 
     if qty_held:
         for oid in related:
@@ -301,6 +344,44 @@ async def _handle_condor_exit_error(
             ),
         }
 
+    # Position shortfall — the broker has fewer contracts than we expect. Nothing
+    # to cancel; the reconciler settles the remainder at expiry. Report the real
+    # numbers instead of the old misleading "held by a resting order" text.
+    if is_qty_err:
+        log.warning(
+            "exit_monitor_position_shortfall",
+            trade_id=trade.id, available=available, requested=requested,
+            held_for_orders=held_for_orders, error=err_str,
+        )
+        return {
+            "trade_id": trade.id,
+            "status": "submit_error_qty_short",
+            "error_sig": f"{trade.id}:qty_short",
+            "error_text": (
+                f"ℹ️ Iron-condor #{trade.id} — broker position "
+                f"({available if available is not None else '?'}) is short of expected "
+                f"({requested if requested is not None else '?'}); "
+                "nothing held to cancel. Reconciler will settle at expiry."
+            ),
+        }
+
+    # Intent mismatch at expiry (42210000) — the broker no longer treats the short
+    # leg as closeable. Expected 0DTE endgame; reconciler settles. Calm message.
+    if code == "42210000" or "position intent mismatch" in err_str:
+        log.warning(
+            "exit_monitor_intent_mismatch",
+            trade_id=trade.id, error=err_str,
+        )
+        return {
+            "trade_id": trade.id,
+            "status": "submit_error_intent_mismatch",
+            "error_sig": f"{trade.id}:intent_mismatch",
+            "error_text": (
+                f"ℹ️ Iron-condor #{trade.id} — broker rejected intraday close at expiry "
+                "(position intent mismatch). Reconciler will settle at expiry."
+            ),
+        }
+
     log.error(
         "exit_monitor_trade_failed",
         trade_id=trade.id, error=err_str, error_type=type(err).__name__,
@@ -324,6 +405,7 @@ async def _process_one_condor_exit(
     chain_fetcher: Callable[..., object],
     submitter: Callable[..., object],
     waiter: Callable[..., object],
+    canceller: Callable[..., object],
     force_close: bool,
     fill_timeout_s: float,
 ) -> dict:
@@ -437,9 +519,27 @@ async def _process_one_condor_exit(
             "trade_text": trade_text,
         }
 
-    # Submitted but reached a terminal non-filled status (canceled/rejected) — an
-    # ops error, not routine telemetry. Route to #logs (throttled) so a repeatedly
-    # unfilled close doesn't spam every sweep.
+    # Submitted but did NOT fill — either a terminal non-filled status
+    # (canceled/rejected) or a still-live `new`/`accepted` after the wait timed out.
+    # A live unfilled order keeps holding the legs' quantity, so the NEXT sweep's
+    # resubmit hits `insufficient qty` (this is exactly how #126, 2026-07-22, left a
+    # `new` order resting until the DAY TIF expired it at 16:00). Cancel it here so
+    # the position is clean for the reconciler / next attempt. Best-effort: a cancel
+    # that fails (already terminal) is harmless.
+    if final.status not in _DEAD_ORDER_STATUSES:
+        try:
+            await canceller(final.order_id)
+            log.warning(
+                "exit_monitor_cancelled_unfilled_close",
+                trade_id=trade.id, order_id=final.order_id, status=final.status,
+            )
+        except Exception as ce:  # noqa: BLE001 — cancel is best-effort
+            log.warning(
+                "exit_monitor_cancel_unfilled_failed",
+                trade_id=trade.id, order_id=final.order_id, error=str(ce),
+            )
+    # Route to #logs (throttled) so a repeatedly unfilled close doesn't spam every
+    # sweep. The reconciler settles the position at expiry regardless.
     return {
         "trade_id": trade.id,
         "status": f"close_order_{final.status}",
