@@ -199,10 +199,18 @@ class Settings(BaseSettings):
     # $50k (scripts/backtest_condor_sizing.py 50000 10,20): 10ct worst week −$5,398,
     # 20ct −$10,796 (both < the $12,500 weekly limit); 20ct's worst SINGLE trade
     # −$7,684 = 15.4% of $50k breached the 15% daily line ONCE in 3.5y, 10ct never.
-    # Cap raised 12→20 on 2026-07-29 (user doubled per-trade risk 9.1%→18.2% of
-    # $50k). NOTE: the condor has NO loss-halt, so a 20ct max-loss day (~$9k) has no
-    # auto-stop. If capital drops, re-run the backtest before keeping a high count.
-    condor_contracts: int = Field(default=1, ge=1, le=20)
+    # Cap raised 12→20 (07-29) then 20→60 (07-30) as the user scaled per-trade risk
+    # 9.1%→18.2%→50% of $50k (~55ct ≈ $25k committed). At this size the condor has a
+    # WEEKLY loss-halt (condor_weekly_loss_limit_pct) as the circuit-breaker — a
+    # single max-loss day (~$25k) still can't be capped (defined risk is on before
+    # the halt checks), but the halt stops the rest of the week after a bad day.
+    condor_contracts: int = Field(default=1, ge=1, le=60)
+
+    # Condor WEEKLY loss-halt as a fraction of the condor pool (trading_capital_usd).
+    # 0 = disabled (default). Checked before the daily 10:00 entry: if this week's
+    # realized condor P&L ≤ −(pct × pool), the condor is paused (condor-only) until
+    # Monday — directional keeps trading. Set 0.125 (= $6,250 on $50k) 2026-07-30.
+    condor_weekly_loss_limit_pct: Decimal = Field(default=Decimal("0"), ge=0)
 
     # Tiered daily trade caps. **0 = UNLIMITED** (no per-day count cap) — set as
     # the default 2026-06-07: with capital at $25k and risk bounded by the daily

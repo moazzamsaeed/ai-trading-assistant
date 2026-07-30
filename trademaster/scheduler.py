@@ -38,7 +38,7 @@ from agents.directional.intraday import (
     run_directional_scan,
 )
 from agents.intraday.scan import run_intraday_scan
-from agents.options.exit_monitor import run_exit_monitor
+from agents.options.exit_monitor import STRATEGY_NAME as STRATEGY_NAME_CONDOR, run_exit_monitor
 from agents.options.strategist import (
     run_deterministic_condor,
     run_iron_condor_strategist,
@@ -855,9 +855,37 @@ async def _iron_condor_entry_job(
 ) -> None:
     """Strategist run. Manual instructions → #signals; execution telem → #trades."""
     state = get_state()
-    if state.is_paused():
-        log.info("iron_condor_skipped_paused", paused_until=str(state.paused_until))
+    if state.is_condor_paused():
+        log.info("iron_condor_skipped_paused", paused_until=str(state.condor_paused_until))
         return
+
+    # Condor WEEKLY loss-halt (condor pool only). Checked before the once-daily
+    # entry: if this week's realized condor P&L has breached the limit, pause the
+    # condor until Monday (directional keeps trading). A single max-loss day can't
+    # be capped here — defined risk is on before this runs — but it stops further
+    # entries for the rest of the week after a bad day.
+    settings = get_settings()
+    if settings.condor_weekly_loss_limit_pct > 0:
+        limit = settings.trading_capital_usd * settings.condor_weekly_loss_limit_pct
+        weekly = get_this_week_realized_pnl(
+            make_session_factory(), strategies=(STRATEGY_NAME_CONDOR,)
+        )
+        if weekly <= -limit:
+            days_until_monday = (7 - today_et().weekday()) % 7 or 7
+            state.pause_condor(hours=days_until_monday * 24)
+            pct = float(-weekly / settings.trading_capital_usd * 100)
+            await log_poster(
+                f"🛑 Condor weekly loss limit hit: **${float(weekly):.0f}** "
+                f"({pct:.0f}% of ${float(settings.trading_capital_usd):.0f} pool, "
+                f"limit ${float(limit):.0f}). Condor paused until Monday "
+                f"(directional unaffected)."
+            )
+            log.warning(
+                "condor_weekly_loss_limit_hit",
+                weekly=float(weekly), limit=float(limit),
+                pool=float(settings.trading_capital_usd),
+            )
+            return
 
     try:
         clock = await clock_fetcher()

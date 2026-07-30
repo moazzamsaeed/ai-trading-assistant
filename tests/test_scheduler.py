@@ -460,6 +460,51 @@ async def test_iron_condor_job_skipped_when_paused(monkeypatch):
     assert trade_posted == []
 
 
+async def test_condor_weekly_loss_halt_pauses_condor_only(monkeypatch):
+    """When this week's condor realized P&L breaches condor_weekly_loss_limit_pct
+    of the pool, the condor entry pauses the CONDOR (not directional) and the
+    strategist never runs."""
+    import datetime as _dmod
+    import trademaster.db as _db
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(_db, "today_et", lambda: _dmod.date(2026, 7, 1))  # Wednesday
+    monkeypatch.setattr(sch, "today_et", lambda: _dmod.date(2026, 7, 1))
+    monkeypatch.setattr(sch.get_settings(), "trading_capital_usd", _D("50000"))
+    monkeypatch.setattr(sch.get_settings(), "condor_weekly_loss_limit_pct", _D("0.125"))
+    monkeypatch.setattr(sch.get_settings(), "deterministic_engine", False)
+
+    # Seed a −$7,000 condor loss earlier this week (Mon) → over the $6,250 limit
+    seed_when = _dt.combine(_dmod.date(2026, 6, 29), _dmod.time(15, 0), tzinfo=_UTC)
+    with sf() as s:
+        s.add(_Trade(
+            symbol="SPY_IC", asset_class="option", side="sell", strategy="spy_0dte_ic",
+            qty=_D("55"), entry_price=_D("46"), exit_price=_D("500"),
+            realized_pnl_usd=_D("-7000"),
+            opened_at=seed_when - _dmod.timedelta(hours=1), closed_at=seed_when,
+        ))
+        s.commit()
+
+    async def boom_strat(**_kwargs):
+        raise AssertionError("strategist must not run after the condor loss-halt")
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", boom_strat)
+    monkeypatch.setattr(sch, "run_deterministic_condor", boom_strat)
+
+    logs: list[str] = []
+    async def log_capture(t): logs.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(is_open=True)
+
+    await sch._iron_condor_entry_job(
+        signal_poster=_noop_poster, trade_poster=_noop_poster,
+        log_poster=log_capture, clock_fetcher=clock_open,
+    )
+    assert get_state().is_condor_paused(), "condor must be paused after weekly loss halt"
+    assert not get_state().is_directional_paused(), "directional must NOT be paused"
+    assert any("weekly loss" in m.lower() for m in logs), logs
+
+
 async def test_iron_condor_job_skipped_when_market_closed(monkeypatch):
     sig: list[str] = []
     trd: list[str] = []
