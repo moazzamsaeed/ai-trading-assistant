@@ -764,6 +764,30 @@ async def _condor_settlement_job(
             await log_poster(line)
 
 
+async def _condor_eod_logs_job(*, log_poster: Poster = _noop_poster) -> None:
+    """One-line end-of-day condor P&L → #logs: today + week-to-date + buffer to the
+    weekly loss-halt. Runs after settlement (16:03) so today's result is booked.
+    Skips silently on weeks with no condor activity at all (nothing to report)."""
+    settings = get_settings()
+    sf = make_session_factory()
+    strat = (STRATEGY_NAME_CONDOR,)
+    today = get_today_realized_pnl(sf, strategies=strat)
+    week = get_this_week_realized_pnl(sf, strategies=strat)
+    if today == 0 and week == 0:
+        log.info("condor_eod_no_activity")
+        return
+
+    line = f"📊 **Condor EOD** — today ${float(today):+,.0f} · week-to-date ${float(week):+,.0f}"
+    if settings.condor_weekly_loss_limit_pct > 0:
+        limit = settings.trading_capital_usd * settings.condor_weekly_loss_limit_pct
+        buffer = limit + week  # weekly halt trips when week <= -limit
+        if buffer <= 0:
+            line += f" · ⛔ weekly halt tripped (limit −${float(limit):,.0f}, paused until Mon)"
+        else:
+            line += f" · ${float(buffer):,.0f} buffer before the −${float(limit):,.0f} weekly halt"
+    await log_poster(line)
+
+
 # ----------------- daily / weekly #trades summaries -----------------
 
 
@@ -1279,6 +1303,17 @@ def make_scheduler(
         id="condor_settlement",
         replace_existing=True,
         misfire_grace_time=600,
+    )
+
+    # Condor end-of-day P&L one-liner → #logs, 16:06 ET Mon-Fri (after settlement
+    # books today's result). Today + week-to-date + buffer to the weekly loss-halt.
+    scheduler.add_job(
+        _condor_eod_logs_job,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=6, timezone=PREMARKET_TZ),
+        kwargs={"log_poster": log_post},
+        id="condor_eod_logs",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     # Daily trade summary — 16:05 ET Mon-Fri (after the 16:00 close, before the

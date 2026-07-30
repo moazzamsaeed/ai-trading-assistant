@@ -505,6 +505,49 @@ async def test_condor_weekly_loss_halt_pauses_condor_only(monkeypatch):
     assert any("weekly loss" in m.lower() for m in logs), logs
 
 
+async def test_condor_eod_logs_posts_pnl_and_buffer(monkeypatch):
+    """The EOD condor line reports today + week-to-date + buffer to the weekly halt."""
+    import datetime as _dmod
+    import trademaster.db as _db
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(_db, "today_et", lambda: _dmod.date(2026, 7, 1))  # Wed
+    monkeypatch.setattr(sch.get_settings(), "trading_capital_usd", _D("50000"))
+    monkeypatch.setattr(sch.get_settings(), "condor_weekly_loss_limit_pct", _D("0.125"))
+
+    # −$2,000 condor loss today (Wed) → week-to-date −$2,000, buffer = 6250 − 2000
+    when = _dt.combine(_dmod.date(2026, 7, 1), _dmod.time(15, 0), tzinfo=_UTC)
+    with sf() as s:
+        s.add(_Trade(
+            symbol="SPY_IC", asset_class="option", side="sell", strategy="spy_0dte_ic",
+            qty=_D("55"), entry_price=_D("46"), exit_price=_D("82"),
+            realized_pnl_usd=_D("-2000"),
+            opened_at=when - _dmod.timedelta(hours=1), closed_at=when,
+        ))
+        s.commit()
+
+    logs: list[str] = []
+    async def log_capture(t): logs.append(t)
+
+    await sch._condor_eod_logs_job(log_poster=log_capture)
+    assert len(logs) == 1, logs
+    msg = logs[0]
+    assert "Condor EOD" in msg
+    assert "-2,000" in msg or "-2000" in msg  # today + week
+    assert "4,250" in msg  # buffer = 6250 - 2000
+    assert "6,250" in msg  # the weekly halt limit
+
+
+async def test_condor_eod_logs_silent_when_no_activity(monkeypatch):
+    """No condor trades this week → no #logs line (avoid pure-noise heartbeats)."""
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    logs: list[str] = []
+    async def log_capture(t): logs.append(t)
+    await sch._condor_eod_logs_job(log_poster=log_capture)
+    assert logs == []
+
+
 async def test_iron_condor_job_skipped_when_market_closed(monkeypatch):
     sig: list[str] = []
     trd: list[str] = []
