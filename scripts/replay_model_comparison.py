@@ -51,11 +51,11 @@ from alpaca.data.enums import DataFeed
 UTC = timezone.utc
 ET = ZoneInfo("America/New_York")
 
-# (provider, model) tuples to compare. DeepSeek is the current production entry
-# model; the two Claude models are the candidate "smarter" upgrades.
+# (provider, model) tuples to compare. 07-23 run: Fable 5 counterfactual vs the
+# deterministic v3 engine (set DETERMINISTIC_ENGINE=false so entries route to
+# the LLM). Earlier 06-15 study compared deepseek-v4-flash vs claude-sonnet-4-6.
 MODELS = [
-    ("deepseek", "deepseek-v4-flash"),
-    ("anthropic", "claude-sonnet-4-6"),
+    ("anthropic", "claude-fable-5"),
 ]
 
 # $/1M tokens (input, output) — used for the cost rollup independent of the repo
@@ -64,6 +64,7 @@ PRICES = {
     "deepseek-v4-flash": (0.14, 0.28),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-opus-4-8": (5.0, 25.0),
+    "claude-fable-5": (10.0, 50.0),
 }
 
 # Real production DB factory — only read, for the as-of-T position context.
