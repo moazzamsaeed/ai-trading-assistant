@@ -195,14 +195,14 @@ class Settings(BaseSettings):
     # Iron-condor position size (contracts per entry). Defined-risk, so P&L and
     # drawdown scale LINEARLY with this (defined-risk P&L is linear in contracts,
     # so the edge — win%, Sharpe, DSR — is size-invariant). The cap exists only to
-    # keep the doubled drawdown inside the daily/weekly loss limits at the CURRENT
-    # capital. Re-validated 2026-07-28 at $50k (scripts/backtest_condor_sizing.py
-    # 50000 2,5,10,12): 10 contracts' worst week −$5,398 vs the $12,500 weekly limit
-    # → 0 historical breaches over 2023→2026 (12ct also clean). Cap raised 2→12 for
-    # the $50k condor-only test; set to 10 in .env for ~9.4%/trade risk (the same
-    # relative sizing the 2ct-on-$10k test ran at). If capital drops, re-run the
-    # backtest before keeping a high count — this cap is calibrated to $50k.
-    condor_contracts: int = Field(default=1, ge=1, le=12)
+    # keep the drawdown sane vs the pool at the CURRENT capital. Re-validated at
+    # $50k (scripts/backtest_condor_sizing.py 50000 10,20): 10ct worst week −$5,398,
+    # 20ct −$10,796 (both < the $12,500 weekly limit); 20ct's worst SINGLE trade
+    # −$7,684 = 15.4% of $50k breached the 15% daily line ONCE in 3.5y, 10ct never.
+    # Cap raised 12→20 on 2026-07-29 (user doubled per-trade risk 9.1%→18.2% of
+    # $50k). NOTE: the condor has NO loss-halt, so a 20ct max-loss day (~$9k) has no
+    # auto-stop. If capital drops, re-run the backtest before keeping a high count.
+    condor_contracts: int = Field(default=1, ge=1, le=20)
 
     # Tiered daily trade caps. **0 = UNLIMITED** (no per-day count cap) — set as
     # the default 2026-06-07: with capital at $25k and risk bounded by the daily
