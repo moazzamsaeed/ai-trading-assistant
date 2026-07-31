@@ -216,6 +216,14 @@ class Settings(BaseSettings):
     # Monday — directional keeps trading. Set 0.125 (= $6,250 on $50k) 2026-07-30.
     condor_weekly_loss_limit_pct: Decimal = Field(default=Decimal("0"), ge=0)
 
+    # Condor DAILY hard loss cap as a fraction of the pool (0 = disabled). Enforced
+    # intraday by the exit monitor: if an open condor's per-contract loss reaches
+    # pct × pool ÷ qty, it force-closes MARKETABLY — so no single day can lose more
+    # than this % of the pool. Higher threshold than the 1.5× stop (which cuts
+    # first at a smaller loss); this is the backstop for a fast gap that jumps past
+    # the stop between sweeps. Set 0.15 (= $3,750 on $25k) 2026-07-31.
+    condor_daily_loss_limit_pct: Decimal = Field(default=Decimal("0"), ge=0)
+
     # Tiered daily trade caps. **0 = UNLIMITED** (no per-day count cap) — set as
     # the default 2026-06-07: with capital at $25k and risk bounded by the daily
     # loss limit (15%), per-trade cap (10%), 30% exposure cap, and the per-ticker

@@ -564,11 +564,11 @@ async def test_force_close_submits_marketable_limit(session_factory):
     assert captured["limit_debit_per_contract"] == Decimal("500.00")
 
 
-async def test_stop_loss_keeps_conservative_limit(session_factory):
-    """A non-force (stop) exit keeps the computed exit debit — the marketable cap
-    is reserved for force-close so a transient mid-session spike isn't paid up to
-    the full wing width."""
-    _ic_trade(session_factory)
+async def test_stop_loss_submits_marketable(session_factory):
+    """Option A (2026-07-31): the 1.5× stop now closes MARKETABLY (limit capped at
+    the wing width), like the 15:50 force-close — so the stop actually fills instead
+    of resting at a fair-value limit and letting the loss ride to full defined risk."""
+    _ic_trade(session_factory)  # wing 5 → marketable cap $500
     chain = _chain_at_debit(Decimal("2.60"))  # $260/ct → breaches the 1.5x stop
 
     async def chain_fetcher(*_a, **_k):
@@ -584,11 +584,48 @@ async def test_stop_loss_keeps_conservative_limit(session_factory):
         )
 
     async def waiter(_id, *, timeout_s):
-        return _fake_fill("2.65")
+        return _fake_fill("2.65")  # actual fill at the true price, not the $500 cap
 
     results = await run_exit_monitor(
         session_factory=session_factory, chain_fetcher=chain_fetcher,
         submitter=submitter, waiter=waiter, force_close=False,
     )
     assert results[0]["reason"] == "stop_loss_1.5x"
-    assert captured["limit_debit_per_contract"] == Decimal("260.00")
+    # marketable: max($260 fair debit, $500 wing cap) = $500 → order always crosses
+    assert captured["limit_debit_per_contract"] == Decimal("500.00")
+
+
+async def test_daily_loss_cap_force_closes_marketably(session_factory, monkeypatch):
+    """Option B: a per-contract loss ≥ condor_daily_loss_limit_pct × pool ÷ qty
+    force-closes marketably with reason 'daily_loss_cap'. Uses a debit high enough
+    to clear the daily cap ($3,750/pool ÷ qty) — verifies the hard-floor path."""
+    # Patch via em.get_settings() — the reference the exit monitor actually reads —
+    # so the config-reload pollution from test_config can't swap it out from under us.
+    _s = em.get_settings()
+    monkeypatch.setattr(_s, "trading_capital_usd", Decimal("25000"))
+    monkeypatch.setattr(_s, "condor_daily_loss_limit_pct", Decimal("0.15"))
+    # qty 1 → per-ct cap = $3,750; a $400/ct debit (credit $80) = $320 loss < cap,
+    # but we need loss ≥ $3,750 which is impossible at qty 1 with a $5 wing ($500 max).
+    # So seed a larger position: qty 30 → per-ct cap = $3,750/30 = $125/ct.
+    _ic_trade(session_factory, qty=30, credit="80.00")
+    chain = _chain_at_debit(Decimal("2.10"))  # $210/ct debit → loss $130/ct ≥ $125 cap
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    captured: dict = {}
+    async def submitter(**kw):
+        captured.update(kw)
+        return OrderResult(
+            order_id="c1", status="new", filled_avg_price=None,
+            filled_qty=Decimal("0"), submitted_at=datetime.now(UTC), raw_status="new",
+        )
+    async def waiter(_id, *, timeout_s):
+        return _fake_fill("2.10")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, force_close=False,
+    )
+    assert results[0]["reason"] == "daily_loss_cap"
+    assert captured["limit_debit_per_contract"] == Decimal("500.00")  # marketable

@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from agents.options.condor_engine import STOP_MULT, stop_breached
 from integrations import alpaca_client
 from integrations.alpaca_client import OptionQuote, OrderResult
+from trademaster.config import get_settings
 from trademaster.db import Trade, make_session_factory
 from trademaster.logging import get_logger
 from trademaster.timeutils import to_et
@@ -93,13 +94,23 @@ def _decide_exit(
     credit_received: Decimal,
     exit_debit: Decimal,
     force: bool,
+    daily_loss_cap_per_contract: Decimal | None = None,
 ) -> tuple[bool, str]:
     """Return (should_exit, reason) — matches the validated condor backtest:
     a 1.5×-credit intraday stop + force-close, and NO profit target (the edge
     comes from full-credit expiries; a 50% PT would cap winners and degrade it).
-    Stop fires when buy-back debit ≥ credit × (1 + STOP_MULT)."""
+    Stop fires when buy-back debit ≥ credit × (1 + STOP_MULT).
+
+    `daily_loss_cap_per_contract` (option B) is a hard per-contract loss ceiling
+    derived from condor_daily_loss_limit_pct × pool ÷ qty. It's a HIGHER threshold
+    than the 1.5× stop, so it only fires when a fast gap jumped the loss past the
+    stop between sweeps — the backstop that guarantees no single day exceeds the
+    daily % cap. All three exits close marketably (see _process_one_condor_exit)."""
     if force:
         return True, "force_close_15:50"
+    loss_per_ct = exit_debit - credit_received
+    if daily_loss_cap_per_contract is not None and loss_per_ct >= daily_loss_cap_per_contract:
+        return True, "daily_loss_cap"
     if stop_breached(float(credit_received), float(exit_debit)):
         return True, f"stop_loss_{STOP_MULT:g}x"
     return False, ""
@@ -129,7 +140,9 @@ def _format_exit_signal(trade: Trade, exit_debit: Decimal, reason: str) -> str:
     # Plain-language reason mapping.
     reason_text = {
         "profit_target_50pct": "✅ profit target hit",
-        "stop_loss_2x": "🛑 stop loss — cap the loss now",
+        "stop_loss_1.5x": "🛑 stop loss (1.5× credit) — cap the loss now",
+        "daily_loss_cap": "🛑 daily loss cap hit — hard floor, close now",
+        "force_close_15:50": "⏰ closing before market close",
         "force_close": "⏰ closing before market close",
     }.get(reason, f"closing ({reason})")
 
@@ -442,10 +455,20 @@ async def _process_one_condor_exit(
         return {"trade_id": trade.id, "status": "no_quotes"}
 
     credit = Decimal(str(trade.entry_price))
+    # Option B — hard daily loss cap: a per-contract loss ceiling from
+    # condor_daily_loss_limit_pct × pool ÷ qty. When enabled, no single day can
+    # exceed that % of the pool (the 1.5× stop normally cuts first at a smaller
+    # loss; this catches a fast gap that jumped past the stop between sweeps).
+    settings = get_settings()
+    daily_cap_per_ct: Decimal | None = None
+    if settings.condor_daily_loss_limit_pct > 0 and trade.qty:
+        cap_total = settings.trading_capital_usd * settings.condor_daily_loss_limit_pct
+        daily_cap_per_ct = (cap_total / Decimal(str(trade.qty))).quantize(Decimal("0.01"))
     should_exit, reason = _decide_exit(
         credit_received=credit,
         exit_debit=exit_debit,
         force=force_close,
+        daily_loss_cap_per_contract=daily_cap_per_ct,
     )
     if not should_exit:
         return {
@@ -455,18 +478,17 @@ async def _process_one_condor_exit(
             "exit_debit": str(exit_debit),
         }
 
-    # Force-close must actually get us out before expiry — an ITM short leg left
-    # open is assigned/exercised. A limit at the fair exit debit can rest unfilled
-    # if the tape moved since the chain snapshot (this stranded condor #97 on
-    # 2026-07-02: SPY broke the short put, the close order never filled, and it rode
-    # to a full expiry loss). On force-close, submit a cap-marketable limit at the
+    # Option A — EVERY condor exit closes marketably. All condor exits are
+    # loss-cuts or the time-based force-close (there's no profit target), so a
+    # fair-value limit that rests unfilled just lets the loss ride to full defined
+    # risk (the recurring MLEG close-failure). Submit a cap-marketable limit at the
     # wing width — the intrinsic max cost to close a defined-risk spread — so the
     # order always crosses while never paying more than the max loss we already
     # accepted. The actual fill (final.filled_avg_price) still drives realized P&L.
-    submit_debit = exit_debit
-    if force_close:
-        wing = Decimal(str(extra.get("wing_width") or "5"))
-        submit_debit = max(exit_debit, (wing * Decimal("100")).quantize(Decimal("0.01")))
+    # (Previously only force_close_15:50 was marketable, which is why the 1.5× stop
+    # so often failed to actually cap the loss.)
+    wing = Decimal(str(extra.get("wing_width") or "5"))
+    submit_debit = max(exit_debit, (wing * Decimal("100")).quantize(Decimal("0.01")))
 
     order = await submitter(
         qty=int(Decimal(str(trade.qty))),
