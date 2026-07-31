@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     account_type: Literal["cash"] = "cash"
 
     enable_iron_condor: bool = False
+    # #research channel posts: the 8 AM pre-market briefing + the 12:30 mid-day and
+    # 16:05 closing market-analysis updates. False = register none of them (stops
+    # the #research notifications AND saves the market-analysis LLM cost).
+    enable_research: bool = True
     # Master switch for the directional (SPY/QQQ 0DTE trend) engine. When False,
     # NO new directional entries are taken — both the 15-min fallback scan job and
     # the real-time WebSocket trigger are suppressed. The directional EXIT monitor

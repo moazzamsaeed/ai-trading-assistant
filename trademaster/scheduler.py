@@ -1120,14 +1120,17 @@ def make_scheduler(
 
     scheduler = AsyncIOScheduler(timezone=PREMARKET_TZ)
 
-    scheduler.add_job(
-        _premarket_job,
-        CronTrigger(day_of_week="mon-fri", hour=8, minute=0, timezone=PREMARKET_TZ),
-        kwargs={"research_poster": research_poster, "log_poster": log_post},
-        id="premarket_briefing",
-        replace_existing=True,
-        misfire_grace_time=900,
-    )
+    # #research posts (pre-market briefing + mid-day/close market analysis) are
+    # gated behind enable_research — off = no #research notifications, no analysis LLM.
+    if get_settings().enable_research:
+        scheduler.add_job(
+            _premarket_job,
+            CronTrigger(day_of_week="mon-fri", hour=8, minute=0, timezone=PREMARKET_TZ),
+            kwargs={"research_poster": research_poster, "log_poster": log_post},
+            id="premarket_briefing",
+            replace_existing=True,
+            misfire_grace_time=900,
+        )
 
     # RTH is 9:30-16:00 ET. The cron fires every 15 min from 9:00-15:45 to
     # be permissive; the in-job Alpaca clock check is authoritative for
@@ -1201,30 +1204,31 @@ def make_scheduler(
     # #research market analysis — exactly two LLM updates a day (plus the 8 AM
     # pre-market briefing above). One mid-day read of the tape at 12:30 ET and
     # one closing wrap with tomorrow's outlook at 16:05 ET (after the bell).
-    scheduler.add_job(
-        _market_analysis_job,
-        CronTrigger(day_of_week="mon-fri", hour=12, minute=30, timezone=PREMARKET_TZ),
-        kwargs={
-            "research_poster": research_poster,
-            "log_poster": log_post,
-            "mode": "intraday",
-        },
-        id="research_midday",
-        replace_existing=True,
-        misfire_grace_time=900,
-    )
-    scheduler.add_job(
-        _market_analysis_job,
-        CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=PREMARKET_TZ),
-        kwargs={
-            "research_poster": research_poster,
-            "log_poster": log_post,
-            "mode": "close",
-        },
-        id="research_close",
-        replace_existing=True,
-        misfire_grace_time=900,
-    )
+    if get_settings().enable_research:
+        scheduler.add_job(
+            _market_analysis_job,
+            CronTrigger(day_of_week="mon-fri", hour=12, minute=30, timezone=PREMARKET_TZ),
+            kwargs={
+                "research_poster": research_poster,
+                "log_poster": log_post,
+                "mode": "intraday",
+            },
+            id="research_midday",
+            replace_existing=True,
+            misfire_grace_time=900,
+        )
+        scheduler.add_job(
+            _market_analysis_job,
+            CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=PREMARKET_TZ),
+            kwargs={
+                "research_poster": research_poster,
+                "log_poster": log_post,
+                "mode": "close",
+            },
+            id="research_close",
+            replace_existing=True,
+            misfire_grace_time=900,
+        )
 
     # Directional exit monitor — every MINUTE during RTH (9:00–15:59 ET).
     # Tightened from every-5-min on 2026-06-05: the LLM hold/sell decision is

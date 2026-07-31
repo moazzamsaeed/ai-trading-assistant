@@ -75,6 +75,16 @@ def test_make_scheduler_registers_research_analysis_jobs():
     assert cfields["minute"] == "5"
 
 
+def test_make_scheduler_research_jobs_absent_when_disabled(monkeypatch):
+    """enable_research=False → none of the three #research jobs are registered."""
+    monkeypatch.setattr(sch.get_settings(), "enable_research", False)
+    scheduler = sch.make_scheduler(**_all_posters())
+    for jid in ("premarket_briefing", "research_midday", "research_close"):
+        assert scheduler.get_job(jid) is None, f"{jid} must not be registered"
+    # a non-research job is still present (always registered regardless of flags)
+    assert scheduler.get_job("daily_trade_summary") is not None
+
+
 async def test_market_analysis_job_posts_to_research(monkeypatch):
     posted: list[str] = []
 
