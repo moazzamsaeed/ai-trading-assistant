@@ -260,6 +260,14 @@ class Settings(BaseSettings):
     alpaca_api_secret: SecretStr = SecretStr("")
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
     alpaca_data_url: str = "https://data.alpaca.markets"
+    # Options market-data feed. "indicative" (default) = free, delayed/estimated
+    # quotes with no greeks — fine for paper. "opra" = real-time OPRA, which
+    # REQUIRES the Alpaca Algo Trader Plus subscription (~$99/mo). Must be "opra"
+    # for LIVE 0DTE trading: strike selection and the exit stops (1.5× stop, daily
+    # cap) need real-time marks. Cutover is this one env var — no code change.
+    # See the go-live checklist. An "opra" request without the subscription will
+    # error/return empty, so only flip this once the subscription is active.
+    alpaca_options_feed: Literal["indicative", "opra"] = "indicative"
 
     anthropic_api_key: SecretStr = SecretStr("")
     deepseek_api_key: SecretStr = SecretStr("")

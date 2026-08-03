@@ -209,3 +209,34 @@ async def test_close_all_positions_returns_count(monkeypatch):
     monkeypatch.setattr(alpaca_client, "_trading_client", lambda: FakeTrading())
     assert await alpaca_client.close_all_positions(True) == 2
     assert received_kwargs["cancel_orders"] is True
+
+
+# ----------------- options data feed (OPRA cutover) -----------------
+
+
+def test_options_feed_resolves_indicative_and_opra(monkeypatch):
+    from alpaca.data.enums import OptionsFeed
+    s = alpaca_client.get_settings()  # the reference alpaca_client actually reads
+    monkeypatch.setattr(s, "alpaca_options_feed", "indicative")
+    assert alpaca_client._options_feed() == OptionsFeed.INDICATIVE
+    monkeypatch.setattr(s, "alpaca_options_feed", "opra")
+    assert alpaca_client._options_feed() == OptionsFeed.OPRA
+
+
+async def test_get_options_chain_passes_configured_feed(monkeypatch):
+    """get_options_chain must set the request feed from config (default indicative);
+    without it alpaca-py silently uses indicative even when OPRA-subscribed."""
+    from alpaca.data.enums import OptionsFeed
+
+    captured: dict = {}
+
+    class FakeOptClient:
+        def get_option_chain(self, req):
+            captured["feed"] = req.feed
+            return {}  # empty chain is fine — we only assert the feed
+
+    monkeypatch.setattr(alpaca_client, "_options_client", lambda: FakeOptClient())
+    monkeypatch.setattr(alpaca_client.get_settings(), "alpaca_options_feed", "opra")
+
+    await alpaca_client.get_options_chain("SPY")
+    assert captured["feed"] == OptionsFeed.OPRA

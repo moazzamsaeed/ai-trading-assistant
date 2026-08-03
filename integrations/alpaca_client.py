@@ -20,7 +20,7 @@ from enum import Enum
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import DataFeed, OptionsFeed
 from alpaca.data.requests import (
     NewsRequest,
     OptionChainRequest,
@@ -346,6 +346,18 @@ def _options_client() -> OptionHistoricalDataClient:
     )
 
 
+def _options_feed() -> OptionsFeed:
+    """Resolve the configured options feed. 'opra' (real-time, needs the Algo
+    Trader Plus subscription) for live; 'indicative' (free, delayed) otherwise.
+    Unknown values fall back to indicative so a typo can't silently request a
+    feed we can't serve."""
+    return (
+        OptionsFeed.OPRA
+        if get_settings().alpaca_options_feed == "opra"
+        else OptionsFeed.INDICATIVE
+    )
+
+
 @dataclass(frozen=True)
 class OptionQuote:
     """Normalized snapshot for one option contract."""
@@ -424,7 +436,10 @@ async def get_options_chain(
     """
 
     def _fetch() -> list[OptionQuote]:
-        kwargs: dict = {"underlying_symbol": underlying}
+        # feed: real-time OPRA in live (needs the subscription) vs free indicative
+        # in paper. Without this explicit feed, alpaca-py defaults to indicative
+        # even when subscribed — so it must be set for a live 0DTE cutover.
+        kwargs: dict = {"underlying_symbol": underlying, "feed": _options_feed()}
         if expiry is not None:
             kwargs["expiration_date"] = expiry
         if strike_lo is not None:
