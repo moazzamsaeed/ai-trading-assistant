@@ -144,10 +144,14 @@ def main():
 
     gates = [
         ("BASELINE  prior-ADX<25 & VIX1D<40", lambda d: prior_adx[d] < 25.0 and vix[d] * 100 < 40),
-        ("VIX1D<40 only  (drop daily ADX)",    lambda d: vix[d] * 100 < 40),
-        ("VIX1D<35 only",                       lambda d: vix[d] * 100 < 35),
-        ("VIX1D<30 only",                       lambda d: vix[d] * 100 < 30),
-        ("VIX1D<25 only",                       lambda d: vix[d] * 100 < 25),
+        ("VIX1D<35 only  (CURRENT live gate)", lambda d: vix[d] * 100 < 35),
+        # Re-add a trend filter (prior-day ADX) ON TOP of the current VIX1D<35 gate,
+        # at a range of thresholds — 2026-08-04, after two trend-day call-side breaches.
+        ("VIX1D<35 & ADX<30",                  lambda d: vix[d] * 100 < 35 and prior_adx[d] < 30.0),
+        ("VIX1D<35 & ADX<27",                  lambda d: vix[d] * 100 < 35 and prior_adx[d] < 27.0),
+        ("VIX1D<35 & ADX<25",                  lambda d: vix[d] * 100 < 35 and prior_adx[d] < 25.0),
+        ("VIX1D<35 & ADX<22",                  lambda d: vix[d] * 100 < 35 and prior_adx[d] < 22.0),
+        ("VIX1D<35 & ADX<20",                  lambda d: vix[d] * 100 < 35 and prior_adx[d] < 20.0),
     ]
     hdr = f"{'gate':<36} | {'days':>4} | {'OOS n':>5} | {'OOS Shrp':>8} | {'DSR%':>5} | {'win%':>4} | {'worst':>6} | verdict"
     print(hdr); print("-" * len(hdr))

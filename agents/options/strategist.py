@@ -472,7 +472,9 @@ async def run_deterministic_condor(
     mtc = max((close_et - now_et).total_seconds() / 60.0, 1.0)
     vix1d = vix1d_from_chain(chain, spot, mtc)
 
-    decision = decide_condor(spot, vix1d, prior_adx, mtc)
+    decision = decide_condor(
+        spot, vix1d, prior_adx, mtc, max_adx=get_settings().condor_max_adx
+    )
     log.info("condor_engine_decision", action=decision.action, reason=decision.reason,
              vix1d=vix1d, prior_adx=prior_adx)
 

@@ -112,25 +112,34 @@ def decide_condor(
     vix1d,            # vol POINTS (e.g. 12.5), as returned by vix1d_from_chain
     prior_adx,        # prior-day Wilder ADX (known at entry; no lookahead)
     minutes_to_close,
+    max_adx=None,     # trend filter: HOLD if prior_adx ≥ this (None/0 = disabled)
 ) -> CondorDecision:
     """Pure function: market state → CondorDecision. No I/O, no chain, no LLM.
 
     Identical regime/strike logic to scripts/backtest_wide_condor.py.
+
+    `max_adx` re-adds a prior-day ADX trend filter on top of the VIX1D gate. The
+    v2 engine dropped it as over-conservative, but a re-backtest (2026-08-04,
+    scripts/backtest_condor_vix_gate.py) showed VIX1D<35 & ADX<25 IMPROVES the
+    OOS Sharpe (+2.54 → +3.10) and win rate (73→76%) — a trending prior day is a
+    real breach risk for a range-bound condor. Configurable via condor_max_adx.
     """
     spot = _f(spot); vix1d = _f(vix1d); prior_adx = _f(prior_adx)
-    mtc = _f(minutes_to_close)
+    mtc = _f(minutes_to_close); max_adx = _f(max_adx)
 
     def hold(reason):
         return CondorDecision("HOLD", f"{CONDOR_VERSION}: {reason}",
                               vix1d=vix1d, prior_adx=prior_adx)
 
-    # v2: prior_adx is telemetry only — NOT required and NOT a gate.
     if None in (spot, vix1d, mtc) or spot <= 0:
         return hold("inputs missing (spot/vix1d/time)")
     if vix1d <= 0:
         return hold(f"invalid VIX1D ({vix1d})")
     if vix1d >= VIX1D_MAX:
         return hold(f"vol too rich (VIX1D {vix1d:.1f} ≥ {VIX1D_MAX:.0f}) — stand aside")
+    # Trend filter (re-added 2026-08-04): a trending prior day breaches the condor.
+    if max_adx and prior_adx is not None and prior_adx >= max_adx:
+        return hold(f"trending (prior ADX {prior_adx:.1f} ≥ {max_adx:.0f}) — stand aside")
 
     T = max(mtc, 1.0) / YEAR_MIN
     em = spot * (vix1d / 100.0) * math.sqrt(T)

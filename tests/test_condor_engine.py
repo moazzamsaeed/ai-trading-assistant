@@ -26,12 +26,21 @@ def test_calm_day_sells_condor():
     assert CONDOR_VERSION in d.reason
 
 
-def test_high_adx_trades_in_v2():
-    # v2 (2026-06-25): the prior-day DAILY-ADX gate was DROPPED. A high-ADX but
-    # calm-VIX1D day now TRADES (validated by scripts/backtest_condor_vix_gate.py).
+def test_high_adx_trades_when_filter_disabled():
+    # Default (max_adx=None/0): the prior-day ADX gate is off, so a high-ADX but
+    # calm-VIX1D day TRADES (the v2 behaviour).
     d = decide_condor(spot=600.0, vix1d=12.0, prior_adx=45.0, minutes_to_close=MTC)
     assert d.action == "SELL_CONDOR"
     assert d.short_put is not None
+
+
+def test_trend_filter_holds_on_high_adx():
+    # max_adx=25 (2026-08-04 re-add): a trending prior day (ADX ≥ 25) stands aside.
+    d = decide_condor(spot=600.0, vix1d=12.0, prior_adx=25.2, minutes_to_close=MTC, max_adx=25)
+    assert d.action == "HOLD" and "trending" in d.reason.lower()
+    # a calm prior day (ADX < 25) still trades with the filter on
+    d2 = decide_condor(spot=600.0, vix1d=12.0, prior_adx=18.0, minutes_to_close=MTC, max_adx=25)
+    assert d2.action == "SELL_CONDOR"
 
 
 def test_high_vol_holds():

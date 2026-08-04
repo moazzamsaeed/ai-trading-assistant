@@ -224,6 +224,14 @@ class Settings(BaseSettings):
     # the stop between sweeps. Set 0.15 (= $3,750 on $25k) 2026-07-31.
     condor_daily_loss_limit_pct: Decimal = Field(default=Decimal("0"), ge=0)
 
+    # Condor TREND filter: HOLD the condor when the prior-day Wilder ADX is ≥ this
+    # (0 = disabled). A trending prior day breaches the range-bound condor. The v2
+    # engine dropped the ADX gate as over-conservative, but a re-backtest
+    # (scripts/backtest_condor_vix_gate.py, 2026-08-04) showed VIX1D<35 & ADX<25
+    # IMPROVES OOS Sharpe (+2.54→+3.10) and win rate (73→76%) while still trading
+    # ~495/858 days. <22 over-filters (FAILS the DSR gate). Set 25 on 2026-08-04.
+    condor_max_adx: float = Field(default=0.0, ge=0)
+
     # Tiered daily trade caps. **0 = UNLIMITED** (no per-day count cap) — set as
     # the default 2026-06-07: with capital at $25k and risk bounded by the daily
     # loss limit (15%), per-trade cap (10%), 30% exposure cap, and the per-ticker
