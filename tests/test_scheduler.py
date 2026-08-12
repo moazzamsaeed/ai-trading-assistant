@@ -548,6 +548,39 @@ async def test_condor_eod_logs_posts_pnl_and_buffer(monkeypatch):
     assert "6,250" in msg  # the weekly halt limit
 
 
+async def test_condor_eod_logs_no_trade_day_says_stood_aside(monkeypatch):
+    """A stand-aside day that still carries a prior win in the week total must read
+    'no trade today (stood aside)', not a bare 'today $+0' that looks like a fresh fill."""
+    import datetime as _dmod
+    import trademaster.db as _db
+    sf = _fresh_db()
+    monkeypatch.setattr(sch, "make_session_factory", lambda: sf)
+    monkeypatch.setattr(_db, "today_et", lambda: _dmod.date(2026, 7, 2))  # Thu, no trade
+    monkeypatch.setattr(sch.get_settings(), "trading_capital_usd", _D("25000"))
+    monkeypatch.setattr(sch.get_settings(), "condor_weekly_loss_limit_pct", _D("0.20"))
+
+    # +$700 condor win earlier in the week (Mon) → today (Thu) = 0, week-to-date = +700
+    mon = _dt.combine(_dmod.date(2026, 6, 29), _dmod.time(20, 0), tzinfo=_UTC)
+    with sf() as s:
+        s.add(_Trade(
+            symbol="SPY_IC", asset_class="option", side="sell", strategy="spy_0dte_ic",
+            qty=_D("28"), entry_price=_D("49"), exit_price=_D("24"),
+            realized_pnl_usd=_D("700"),
+            opened_at=mon - _dmod.timedelta(hours=6), closed_at=mon,
+        ))
+        s.commit()
+
+    logs: list[str] = []
+    async def log_capture(t): logs.append(t)
+
+    await sch._condor_eod_logs_job(log_poster=log_capture)
+    assert len(logs) == 1, logs
+    msg = logs[0]
+    assert "no trade today (stood aside)" in msg
+    assert "today $+0" not in msg          # the confusing form is gone
+    assert "week-to-date" in msg and "700" in msg  # prior win still carried forward
+
+
 async def test_condor_eod_logs_silent_when_no_activity(monkeypatch):
     """No condor trades this week → no #logs line (avoid pure-noise heartbeats)."""
     sf = _fresh_db()
