@@ -1404,7 +1404,10 @@ def make_scheduler(
             misfire_grace_time=120,
         )
 
-        # Force-close at 15:50 ET — last call regardless of P&L.
+        # Safety-net force-close at 15:50 ET. The PRIMARY smart force-close now runs
+        # in the 15:45 sweep (FORCE_CLOSE_AFTER=15:45) while the position is still
+        # whole and quotes are live; this 15:50 re-run catches anything that failed
+        # to close (e.g. a leg-shortfall rejection). Both apply the near-strike gate.
         scheduler.add_job(
             _iron_condor_exit_job,
             CronTrigger(
