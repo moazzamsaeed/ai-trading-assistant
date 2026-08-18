@@ -171,17 +171,17 @@ def test_directional_force_close_clock_15_45_et_triggered():
     assert et_now.time() >= FORCE_CLOSE_AFTER
 
 
-def test_iron_condor_force_close_clock_15_49_et_not_triggered():
+def test_iron_condor_force_close_clock_15_44_et_not_triggered():
     from agents.options.exit_monitor import FORCE_CLOSE_AFTER
 
-    et_now = to_et(datetime(2026, 5, 13, 19, 49, tzinfo=UTC))  # 15:49 EDT
-    assert et_now.time() < FORCE_CLOSE_AFTER
+    et_now = to_et(datetime(2026, 5, 13, 19, 44, tzinfo=UTC))  # 15:44 EDT
+    assert et_now.time() < FORCE_CLOSE_AFTER  # primary force-close moved to 15:45
 
 
-def test_iron_condor_force_close_clock_15_50_et_triggered():
+def test_iron_condor_force_close_clock_15_45_et_triggered():
     from agents.options.exit_monitor import FORCE_CLOSE_AFTER
 
-    et_now = to_et(datetime(2026, 5, 13, 19, 50, tzinfo=UTC))  # 15:50 EDT
+    et_now = to_et(datetime(2026, 5, 13, 19, 45, tzinfo=UTC))  # 15:45 EDT
     assert et_now.time() >= FORCE_CLOSE_AFTER
 
 

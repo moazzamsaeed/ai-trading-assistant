@@ -6,9 +6,12 @@ debit, and submits a closing order when any of these fire:
 
 - **1.5× stop loss**: exit when current debit ≥ 2.5 × credit_received
   (running loss is 1.5× the credit collected; the validated condor stop)
-- **Force close at/after 15:50 ET**: time-based; we never hold past close
+- **Force close at/after 15:45 ET**: time-based; we never hold past close
   (≈ the backtest's close settlement). NO profit target — the condor's edge is
-  full-credit expiries, so we hold winners to the force-close.
+  full-credit expiries, so we hold winners to the force-close. SMART variant: at
+  the deadline we only actually close when SPY is near a short strike (pin/breach
+  risk); a condor comfortably inside its shorts is left to EXPIRE worthless for
+  free rather than paying the 4-leg exit spread. Loss-cut exits always close.
 
 P&L per contract = entry_credit - exit_debit (positive = profit).
 On fill, the `trades` row is updated with exit_price, realized_pnl_usd,
@@ -36,7 +39,15 @@ from trademaster.timeutils import to_et
 log = get_logger(__name__)
 
 STRATEGY_NAME = "spy_0dte_ic"
-FORCE_CLOSE_AFTER = time(15, 50)
+# Primary force-close moved 15:50 → 15:45 (2026-08-17): the 15:45 sweep force-closes
+# via the clock check below, while the full position is still held and quotes are
+# live — before the broker starts pre-processing 0DTE expiry (which desynced #150's
+# close). The explicit 15:50 scheduler job remains as a safety-net retry.
+FORCE_CLOSE_AFTER = time(15, 45)
+# Smart force-close band: at the deadline, only close when SPY is within this
+# fraction of a short strike (or already breached) — otherwise let the condor
+# expire worthless for free instead of paying the exit spread on a clean winner.
+FORCE_CLOSE_NEAR_STRIKE_PCT = 0.003  # 0.3% ≈ $2.3 on SPY at 770
 
 # Statuses in which an order is already off the book — no point cancelling. Any
 # other status (`new`, `accepted`, `pending_new`, `partially_filled`, …) means the
@@ -56,6 +67,32 @@ def _open_iron_condor_trades(session: Session) -> list[Trade]:
         Trade.strategy == STRATEGY_NAME, Trade.closed_at.is_(None)
     )
     return list(session.execute(stmt).scalars())
+
+
+def _occ_strike(occ: str | None) -> Decimal | None:
+    """Strike from an OCC symbol (last 8 digits / 1000), or None if unparseable."""
+    if not occ or len(occ) < 8 or not occ[-8:].isdigit():
+        return None
+    return Decimal(occ[-8:]) / Decimal("1000")
+
+
+def _near_short_strike(
+    spot: Decimal | None, short_put_occ: str | None, short_call_occ: str | None,
+    pct: float = FORCE_CLOSE_NEAR_STRIKE_PCT,
+) -> bool:
+    """True if SPY is within `pct` of a short strike (or already through one) — the
+    only regime where force-closing beats letting the condor expire. FAIL-SAFE: an
+    unknown spot (feed blip) or unparseable strikes return True, so we close rather
+    than gamble on a position we can't evaluate."""
+    if spot is None:
+        return True
+    sp = _occ_strike(short_put_occ)
+    sc = _occ_strike(short_call_occ)
+    if sp is None or sc is None:
+        return True
+    spot = Decimal(str(spot))
+    band = Decimal(str(pct))
+    return spot <= sp * (Decimal("1") + band) or spot >= sc * (Decimal("1") - band)
 
 
 def _quote_by_occ(chain: list[OptionQuote], occ: str) -> OptionQuote | None:
@@ -212,6 +249,9 @@ async def run_exit_monitor(
     submitter: Callable[..., object] = alpaca_client.submit_iron_condor_close,
     waiter: Callable[..., object] = alpaca_client.wait_for_order,
     canceller: Callable[..., object] = alpaca_client.cancel_order,
+    stock_fetcher: Callable[..., object] = alpaca_client.get_latest_stock_quote,
+    position_fetcher: Callable[..., object] = alpaca_client.get_positions,
+    position_closer: Callable[..., object] = alpaca_client.close_position,
     force_close: bool | None = None,
     fill_timeout_s: float = 60.0,
 ) -> list[dict]:
@@ -244,11 +284,15 @@ async def run_exit_monitor(
                 submitter=submitter,
                 waiter=waiter,
                 canceller=canceller,
+                stock_fetcher=stock_fetcher,
                 force_close=force_close,
                 fill_timeout_s=fill_timeout_s,
             )
         except Exception as e:  # noqa: BLE001 — one stuck trade must not abort the sweep
-            result = await _handle_condor_exit_error(trade, e, canceller=canceller)
+            result = await _handle_condor_exit_error(
+                trade, e, canceller=canceller,
+                position_fetcher=position_fetcher, position_closer=position_closer,
+            )
         results.append(result)
 
     return results
@@ -280,8 +324,55 @@ def _parse_broker_error(err: object) -> tuple[str | None, list[str], dict]:
     return (str(code) if code is not None else None), related_ids, data
 
 
+async def _flatten_available_legs(
+    trade, position_fetcher: Callable[..., object] | None,
+    position_closer: Callable[..., object] | None,
+) -> list[str]:
+    """Close each condor leg the broker STILL holds after a combo-order shortfall
+    rejection (the worthless side + wings), so nothing lingers into assignment.
+    Best-effort and P&L-neutral (closeable legs are near-worthless). Returns the OCC
+    symbols actually flattened."""
+    if position_fetcher is None or position_closer is None:
+        return []
+    extra = trade.extra or {}
+    legs = [extra.get(k) for k in ("short_put", "long_put", "short_call", "long_call")]
+    legs = [occ for occ in legs if occ]
+    try:
+        positions = await position_fetcher()
+    except Exception as e:  # noqa: BLE001 — a fetch blip must not abort error handling
+        log.warning("exit_monitor_leg_flatten_fetch_failed", trade_id=trade.id, error=str(e))
+        return []
+    held: dict[str, int] = {}
+    for p in positions:
+        sym = getattr(p, "symbol", None)
+        try:
+            qty = int(Decimal(str(getattr(p, "qty", 0) or 0)))
+        except (TypeError, ValueError):
+            qty = 0
+        if sym and qty != 0:
+            held[sym] = qty
+    flattened: list[str] = []
+    for occ in legs:
+        if occ in held:
+            try:
+                await position_closer(occ)
+                flattened.append(occ)
+                log.info(
+                    "exit_monitor_leg_flattened",
+                    trade_id=trade.id, symbol=occ, qty=held[occ],
+                )
+            except Exception as e:  # noqa: BLE001 — one leg failing must not block the rest
+                log.warning(
+                    "exit_monitor_leg_flatten_failed",
+                    trade_id=trade.id, symbol=occ, error=str(e),
+                )
+    return flattened
+
+
 async def _handle_condor_exit_error(
-    trade, err: Exception, *, canceller: Callable[..., object]
+    trade, err: Exception, *, canceller: Callable[..., object],
+    position_fetcher: Callable[..., object] | None = None,
+    position_closer: Callable[..., object] | None = None,
 ) -> dict:
     """Turn a broker exception into an isolated, retry-safe result dict.
 
@@ -357,24 +448,30 @@ async def _handle_condor_exit_error(
             ),
         }
 
-    # Position shortfall — the broker has fewer contracts than we expect. Nothing
-    # to cancel; the reconciler settles the remainder at expiry. Report the real
-    # numbers instead of the old misleading "held by a resting order" text.
+    # Position shortfall — the broker has fewer contracts than we expect (a leg was
+    # pre-processed/exercised at expiry, so the combo order was rejected as a whole).
+    # Nothing to cancel. LEG-LEVEL FALLBACK: the OTHER legs (the worthless side +
+    # wings) are usually still fully held — flatten whatever IS still open so nothing
+    # lingers into assignment/residue. The reconciler settles the exercised remainder;
+    # the flattened legs are near-worthless so realized P&L is unaffected.
     if is_qty_err:
         log.warning(
             "exit_monitor_position_shortfall",
             trade_id=trade.id, available=available, requested=requested,
             held_for_orders=held_for_orders, error=err_str,
         )
+        flattened = await _flatten_available_legs(trade, position_fetcher, position_closer)
+        flat_note = f" Flattened still-open legs: {', '.join(flattened)}." if flattened else ""
         return {
             "trade_id": trade.id,
             "status": "submit_error_qty_short",
             "error_sig": f"{trade.id}:qty_short",
+            "flattened_legs": flattened,
             "error_text": (
                 f"ℹ️ Iron-condor #{trade.id} — broker position "
                 f"({available if available is not None else '?'}) is short of expected "
-                f"({requested if requested is not None else '?'}); "
-                "nothing held to cancel. Reconciler will settle at expiry."
+                f"({requested if requested is not None else '?'}); nothing held to cancel."
+                f"{flat_note} Reconciler will settle the remainder at expiry."
             ),
         }
 
@@ -419,6 +516,7 @@ async def _process_one_condor_exit(
     submitter: Callable[..., object],
     waiter: Callable[..., object],
     canceller: Callable[..., object],
+    stock_fetcher: Callable[..., object],
     force_close: bool,
     fill_timeout_s: float,
 ) -> dict:
@@ -477,6 +575,32 @@ async def _process_one_condor_exit(
             "credit": str(credit),
             "exit_debit": str(exit_debit),
         }
+
+    # Smart force-close: the time-based deadline pays the 4-leg exit spread on EVERY
+    # open condor. On a position comfortably inside its short strikes — which would
+    # expire worthless for free — that spread is pure drag. So when the ONLY reason
+    # to exit is the deadline (not a loss-cut), skip the close and let it expire
+    # unless SPY is near a short strike (pin/breach risk). Stop / daily-cap exits
+    # always close (they mean the position is already losing).
+    if reason.startswith("force_close"):
+        spot: Decimal | None = None
+        try:
+            q = await stock_fetcher("SPY")
+            if q is not None:
+                spot = q.mid if getattr(q, "mid", None) and q.mid > 0 else (q.bid or q.ask)
+        except Exception as e:  # noqa: BLE001 — feed blip → fail safe to closing
+            log.warning("exit_monitor_spot_fetch_failed", trade_id=trade.id, error=str(e))
+        if not _near_short_strike(spot, legs[0], legs[2]):
+            log.info(
+                "exit_monitor_expire_inside", trade_id=trade.id,
+                spot=str(spot), short_put=legs[0], short_call=legs[2],
+            )
+            return {
+                "trade_id": trade.id,
+                "status": "expire_inside",
+                "reason": reason,
+                "exit_debit": str(exit_debit),
+            }
 
     # Option A — EVERY condor exit closes marketably. All condor exits are
     # loss-cuts or the time-based force-close (there's no profit target), so a

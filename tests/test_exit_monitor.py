@@ -12,7 +12,7 @@ from agents.options.exit_monitor import (
     _decide_exit,
     run_exit_monitor,
 )
-from integrations.alpaca_client import OptionQuote, OrderResult
+from integrations.alpaca_client import OptionQuote, OrderResult, StockQuote
 from trademaster.db import Base, Trade, make_engine, make_session_factory
 
 
@@ -143,6 +143,18 @@ def _fake_fill(price_per_share: str) -> OrderResult:
     )
 
 
+def _stock_fetcher(mid: str):
+    """Async SPY spot fetcher for the smart force-close gate. The test condor's
+    shorts are 495/505, so mid ~500 = comfortably inside; 495/505 = at a strike."""
+    m = Decimal(mid)
+    async def _f(_symbol):
+        return StockQuote(
+            symbol="SPY", bid=m - Decimal("0.01"), ask=m + Decimal("0.01"),
+            mid=m, timestamp=datetime.now(UTC),
+        )
+    return _f
+
+
 # ----------------- monitor scenarios -----------------
 
 
@@ -269,9 +281,65 @@ async def test_monitor_force_closes_regardless(session_factory):
         chain_fetcher=chain_fetcher,
         submitter=submitter,
         waiter=waiter,
+        stock_fetcher=_stock_fetcher("495"),  # AT the short put → near strike → close
         force_close=True,
     )
     assert "force_close" in results[0]["reason"]
+    assert results[0]["status"] == "closed"
+
+
+async def test_force_close_lets_comfortably_inside_condor_expire(session_factory):
+    """Smart force-close: a condor comfortably inside its shorts (SPY mid-range) is
+    left to EXPIRE for free at the deadline — no exit order is submitted."""
+    _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("0.10"))  # cheap to close, both shorts worthless
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_):
+        raise AssertionError("must NOT submit a close for a comfortably-inside condor")
+
+    async def waiter(*_a, **_k):
+        raise AssertionError("must NOT wait — nothing was submitted")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory,
+        chain_fetcher=chain_fetcher,
+        submitter=submitter,
+        waiter=waiter,
+        stock_fetcher=_stock_fetcher("500"),  # dead-center of 495-505 → expire free
+        force_close=True,
+    )
+    assert results[0]["status"] == "expire_inside"
+
+
+async def test_force_close_still_closes_when_spot_unknown(session_factory):
+    """Fail-safe: if the spot feed errors at the deadline, we CLOSE rather than
+    gamble on a position we can't evaluate."""
+    _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("1.00"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_):
+        return OrderResult(order_id="c", status="new", filled_avg_price=None,
+                           filled_qty=Decimal("0"), submitted_at=datetime.now(UTC),
+                           raw_status="new")
+
+    async def waiter(_id, *, timeout_s):
+        return _fake_fill("1.00")
+
+    async def broken_stock(_sym):
+        raise RuntimeError("stock feed down")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory,
+        chain_fetcher=chain_fetcher, submitter=submitter, waiter=waiter,
+        stock_fetcher=broken_stock, force_close=True,
+    )
+    assert results[0]["status"] == "closed"
 
 
 async def test_monitor_skips_trade_with_missing_legs(session_factory):
@@ -332,11 +400,12 @@ async def test_monitor_skips_trade_when_quote_missing(session_factory):
     assert results[0]["status"] == "no_quotes"
 
 
-async def test_force_close_auto_after_1550_et():
-    """Internal: now after 15:50 ET sets force=True without explicit arg."""
-    # 15:55 ET → 19:55 UTC (EDT) / 20:55 (EST). We assert the time-only check.
-    assert time(15, 55) >= em.FORCE_CLOSE_AFTER
-    assert time(15, 49) < em.FORCE_CLOSE_AFTER
+async def test_force_close_auto_after_1545_et():
+    """Internal: now at/after 15:45 ET sets force=True without an explicit arg
+    (moved 15:50 → 15:45 so the primary close runs while the position is whole)."""
+    assert em.FORCE_CLOSE_AFTER == time(15, 45)
+    assert time(15, 45) >= em.FORCE_CLOSE_AFTER
+    assert time(15, 44) < em.FORCE_CLOSE_AFTER
 
 
 # ----------------- error isolation / stuck-order handling -----------------
@@ -448,15 +517,41 @@ async def test_exit_monitor_position_shortfall_not_reported_as_held(session_fact
     async def canceller(oid):
         cancelled.append(oid)
 
+    # Leg-level fallback: the short put (495) was pre-exercised, but the other three
+    # legs are still held — the fallback should flatten them.
+    from types import SimpleNamespace
+    held = [
+        SimpleNamespace(symbol="SPY260511P00490000", qty=Decimal("2")),   # long put
+        SimpleNamespace(symbol="SPY260511C00505000", qty=Decimal("-2")),  # short call
+        SimpleNamespace(symbol="SPY260511C00510000", qty=Decimal("2")),   # long call
+    ]
+
+    async def position_fetcher():
+        return held
+
+    closed_legs: list[str] = []
+
+    async def position_closer(sym):
+        closed_legs.append(sym)
+        return "ok"
+
     results = await run_exit_monitor(
         session_factory=session_factory, chain_fetcher=chain_fetcher,
-        submitter=submitter, waiter=waiter, canceller=canceller, force_close=True,
+        submitter=submitter, waiter=waiter, canceller=canceller,
+        stock_fetcher=_stock_fetcher("495"),  # near strike → gate lets it submit
+        position_fetcher=position_fetcher, position_closer=position_closer,
+        force_close=True,
     )
     assert cancelled == []  # nothing is held → canceller must NOT be called
     assert results[0]["status"] == "submit_error_qty_short"
     assert results[0]["error_sig"].endswith(":qty_short")
+    # the three still-open legs were flattened; the exercised short put wasn't present
+    assert set(closed_legs) == {
+        "SPY260511P00490000", "SPY260511C00505000", "SPY260511C00510000",
+    }
+    assert set(results[0]["flattened_legs"]) == set(closed_legs)
     assert "held by a resting order" not in results[0]["error_text"]
-    assert "settle at expiry" in results[0]["error_text"]
+    assert "settle the remainder at expiry" in results[0]["error_text"]
 
 
 async def test_exit_monitor_intent_mismatch_reported_calmly(session_factory):
