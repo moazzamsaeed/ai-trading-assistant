@@ -777,7 +777,14 @@ async def _condor_eod_logs_job(*, log_poster: Poster = _noop_poster) -> None:
         log.info("condor_eod_no_activity")
         return
 
-    line = f"📊 **Condor EOD** — today ${float(today):+,.0f} · week-to-date ${float(week):+,.0f}"
+    # On a no-trade day (nothing realized today) the leading "today $+0" reads like a
+    # fresh fill when the carried-forward week total is non-zero. Say "no trade today"
+    # explicitly so a stand-aside day can't be mistaken for a re-report of the last win.
+    today_part = (
+        "no trade today (stood aside)" if today == 0
+        else f"today ${float(today):+,.0f}"
+    )
+    line = f"📊 **Condor EOD** — {today_part} · week-to-date ${float(week):+,.0f}"
     if settings.condor_weekly_loss_limit_pct > 0:
         limit = settings.trading_capital_usd * settings.condor_weekly_loss_limit_pct
         buffer = limit + week  # weekly halt trips when week <= -limit
