@@ -80,12 +80,17 @@ def fetch_closed_trades(
     since_dt: datetime | None,
 ) -> list[dict]:
     cur = conn.cursor()
+    # Every check here audits DIRECTIONAL-trade metadata (original_qty, peak_pnl_pct,
+    # conviction, scale-out tiers). Iron condors have none of those by design, so
+    # they were false-flagging with 3 bogus "missing" issues on every close. Exclude
+    # them — this auditor is for the directional engine only.
     sql = """
         SELECT id, opened_at, closed_at, symbol, strategy, qty,
                entry_price, exit_price, realized_pnl_usd, extra
         FROM trades
         WHERE closed_at IS NOT NULL
           AND id > ?
+          AND strategy != 'spy_0dte_ic'
     """
     params: list = [after_id]
     if since_dt is not None:
