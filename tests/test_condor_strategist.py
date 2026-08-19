@@ -95,9 +95,61 @@ async def test_calm_day_sells_condor(session_factory, monkeypatch):
         executor=_fake_executor,
     )
     assert sig.action.value == "open"
-    assert signals_text is not None and "SELL" in signals_text.upper()
+    assert signals_text is not None and "FILLED" in signals_text.upper() and "contracts" in signals_text
     assert trade_text is not None and "EXECUTED" in trade_text
     assert sig.extra["engine"].startswith("vrp_condor")
+
+
+@pytest.mark.asyncio
+async def test_signal_reports_filled_credit_not_plan_target(session_factory, monkeypatch):
+    """Option B (2026-08-19): the #signals alert is built AFTER the fill and shows the
+    ACTUAL filled credit, not the optimistic model-mid target. A fill $30 under the
+    plan credit must surface the filled number (the #152 $1,120→$924 gap)."""
+    async def _adx(*_a, **_k):
+        return 18.0
+    monkeypatch.setattr(strategist, "_prior_day_adx", _adx)
+
+    captured = {}
+
+    async def _haircut_executor(plan, **_kw):
+        # plan builds ~$200/ct on this chain; simulate a fill $30 under.
+        captured["plan_credit"] = plan.credit_per_contract
+        filled = plan.credit_per_contract - Decimal("30")
+        return ExecutionResult(executed=True, reason=f"filled at ${filled}/contract",
+                               trade_id=1, order=plan.to_trade_order(),
+                               credit_per_contract=filled)
+
+    sig, signals_text, _ = await strategist.run_deterministic_condor(
+        now=NOW, session_factory=session_factory,
+        stock_fetcher=_spy_fetcher(), chain_fetcher=_chain_fetcher,
+        daily_fetcher=_daily_fetcher, account_fetcher=_account_fetcher,
+        executor=_haircut_executor,
+    )
+    filled = captured["plan_credit"] - Decimal("30")
+    assert signals_text is not None
+    assert f"${filled}/contract" in signals_text          # the FILLED per-ct credit
+    assert f"${captured['plan_credit']}/contract" not in signals_text  # NOT the target
+    assert "max profit" in signals_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_when_not_filled(session_factory, monkeypatch):
+    """A rejected/failed execution posts NO #signals alert (nothing was opened)."""
+    async def _adx(*_a, **_k):
+        return 18.0
+    monkeypatch.setattr(strategist, "_prior_day_adx", _adx)
+
+    async def _rejected_executor(plan, **_kw):
+        return ExecutionResult(executed=False, reason="order ended in status=canceled",
+                               trade_id=None, order=None)
+
+    _sig, signals_text, _ = await strategist.run_deterministic_condor(
+        now=NOW, session_factory=session_factory,
+        stock_fetcher=_spy_fetcher(), chain_fetcher=_chain_fetcher,
+        daily_fetcher=_daily_fetcher, account_fetcher=_account_fetcher,
+        executor=_rejected_executor,
+    )
+    assert signals_text is None
 
 
 @pytest.mark.asyncio
@@ -114,7 +166,7 @@ async def test_high_adx_now_trades_v2(session_factory, monkeypatch):
         executor=_fake_executor,
     )
     assert sig.action.value == "open"
-    assert signals_text is not None and "SELL" in signals_text.upper()
+    assert signals_text is not None and "FILLED" in signals_text.upper() and "contracts" in signals_text
 
 
 @pytest.mark.asyncio
