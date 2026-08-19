@@ -1125,6 +1125,16 @@ def make_scheduler(
     if enable_iron_condor is None:
         enable_iron_condor = get_settings().enable_iron_condor
 
+    # Condor-alerts-only Discord mode: keep every job RUNNING but route the
+    # NON-condor jobs' Discord posts to a no-op, so only iron-condor alerts reach
+    # Discord. The condor jobs below keep the real posters. #logs (errors + condor
+    # EOD) is always kept. Reversible via the config flag; no code change.
+    _condor_only = get_settings().condor_alerts_only
+    nc_signal = _noop_poster if _condor_only else signal_poster
+    nc_trade = _noop_poster if _condor_only else trade_poster
+    nc_research = _noop_poster if _condor_only else research_poster
+    nc_stock = _noop_poster if _condor_only else stock_signal_poster
+
     scheduler = AsyncIOScheduler(timezone=PREMARKET_TZ)
 
     # #research posts (pre-market briefing + mid-day/close market analysis) are
@@ -1133,7 +1143,7 @@ def make_scheduler(
         scheduler.add_job(
             _premarket_job,
             CronTrigger(day_of_week="mon-fri", hour=8, minute=0, timezone=PREMARKET_TZ),
-            kwargs={"research_poster": research_poster, "log_poster": log_post},
+            kwargs={"research_poster": nc_research, "log_poster": log_post},
             id="premarket_briefing",
             replace_existing=True,
             misfire_grace_time=900,
@@ -1150,7 +1160,7 @@ def make_scheduler(
             minute="0,15,30,45",
             timezone=PREMARKET_TZ,
         ),
-        kwargs={"signal_poster": signal_poster, "log_poster": log_post},
+        kwargs={"signal_poster": nc_signal, "log_poster": log_post},
         id="intraday_scan",
         replace_existing=True,
         misfire_grace_time=120,
@@ -1172,8 +1182,8 @@ def make_scheduler(
                 timezone=PREMARKET_TZ,
             ),
             kwargs={
-                "signal_poster": signal_poster,
-                "trade_poster": trade_poster,
+                "signal_poster": nc_signal,
+                "trade_poster": nc_trade,
                 "log_poster": log_post,
             },
             id="directional_scan",
@@ -1216,7 +1226,7 @@ def make_scheduler(
             _market_analysis_job,
             CronTrigger(day_of_week="mon-fri", hour=12, minute=30, timezone=PREMARKET_TZ),
             kwargs={
-                "research_poster": research_poster,
+                "research_poster": nc_research,
                 "log_poster": log_post,
                 "mode": "intraday",
             },
@@ -1228,7 +1238,7 @@ def make_scheduler(
             _market_analysis_job,
             CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=PREMARKET_TZ),
             kwargs={
-                "research_poster": research_poster,
+                "research_poster": nc_research,
                 "log_poster": log_post,
                 "mode": "close",
             },
@@ -1252,8 +1262,8 @@ def make_scheduler(
             timezone=PREMARKET_TZ,
         ),
         kwargs={
-            "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
+            "signal_poster": nc_signal,
+            "trade_poster": nc_trade,
             "log_poster": log_post,
         },
         id="directional_exit",
@@ -1276,8 +1286,8 @@ def make_scheduler(
             timezone=PREMARKET_TZ,
         ),
         kwargs={
-            "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
+            "signal_poster": nc_signal,
+            "trade_poster": nc_trade,
             "log_poster": log_post,
         },
         id="directional_0dte_final_close",
@@ -1360,8 +1370,8 @@ def make_scheduler(
             timezone=PREMARKET_TZ,
         ),
         kwargs={
-            "signal_poster": signal_poster,
-            "trade_poster": trade_poster,
+            "signal_poster": nc_signal,
+            "trade_poster": nc_trade,
             "log_poster": log_post,
         },
         id="trailing_stop_tick",
@@ -1446,7 +1456,7 @@ def make_scheduler(
                 minute="5,20,35,50",
                 timezone=PREMARKET_TZ,
             ),
-            kwargs={"stock_signal_poster": stock_signal_poster, "log_poster": log_post},
+            kwargs={"stock_signal_poster": nc_stock, "log_poster": log_post},
             id="equities_scan",
             replace_existing=True,
             misfire_grace_time=300,

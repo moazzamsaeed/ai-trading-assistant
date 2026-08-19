@@ -68,10 +68,16 @@ async def _run() -> None:
         # way in make_scheduler). Directional exits still run via the scheduler.
         stream = None
         if settings.enable_directional:
+            # Condor-alerts-only: the directional stream still RUNS (real-time
+            # triggers/booking unaffected) but its Discord posts route to no-op so
+            # only iron-condor alerts reach Discord. Errors still go to #logs.
+            async def _noop(_text: str) -> None:
+                return None
+
             stream = make_directional_trigger(
                 main_loop=loop,
-                signal_poster=bot.post_signal,
-                trade_poster=bot.post_trade,
+                signal_poster=_noop if settings.condor_alerts_only else bot.post_signal,
+                trade_poster=_noop if settings.condor_alerts_only else bot.post_trade,
                 log_poster=bot.post_log,
             )
             stream.start()
