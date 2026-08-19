@@ -44,12 +44,17 @@ class ExecutionResult:
         trade_id: int | None,
         reason: str,
         pending_id: int | None = None,
+        credit_per_contract: Decimal | None = None,
     ) -> None:
         self.executed = executed
         self.order = order
         self.trade_id = trade_id
         self.reason = reason
         self.pending_id = pending_id
+        # ACTUAL filled net credit per contract ($) — set on a real fill. Differs
+        # from plan.credit_per_contract (the model-mid target) by the 4-leg entry
+        # haircut, so #signals/#trades can report the true collected credit.
+        self.credit_per_contract = credit_per_contract
 
 
 def _net_credit_per_contract_at_fill(
@@ -186,6 +191,7 @@ async def _submit_and_persist(
         order=final,
         trade_id=trade_id,
         reason=f"filled at ${credit}/contract",
+        credit_per_contract=credit,
     )
 
 

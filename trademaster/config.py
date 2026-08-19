@@ -27,6 +27,15 @@ class Settings(BaseSettings):
     account_type: Literal["cash"] = "cash"
 
     enable_iron_condor: bool = False
+    # Condor-alerts-only Discord mode (2026-08-19). When True, ONLY iron-condor posts
+    # reach Discord — entry/exit signals (#signals), fills/settlement/summaries
+    # (#trades), and the condor EOD line + all system errors (#logs). Every other job
+    # (directional scan/exit, intraday macro scan, equities scanner, #research
+    # briefings, the directional WebSocket stream) still RUNS in code — it just posts
+    # to a no-op instead of Discord. Reversible: flip the flag, no code change. Note
+    # this only silences Discord; it does NOT stop directional from booking trades
+    # (that's enable_directional / directional_signals_only).
+    condor_alerts_only: bool = False
     # #research channel posts: the 8 AM pre-market briefing + the 12:30 mid-day and
     # 16:05 closing market-analysis updates. False = register none of them (stops
     # the #research notifications AND saves the market-analysis LLM cost).

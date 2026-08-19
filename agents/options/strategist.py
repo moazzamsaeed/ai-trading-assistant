@@ -236,6 +236,37 @@ def format_manual_signal(plan: IronCondorPlan, signal: Signal) -> str:
     )
 
 
+def format_fill_confirmation(plan: IronCondorPlan, signal: Signal, execution) -> str:
+    """Post-FILL #signals confirmation — the true picture after the order fills.
+
+    Reports the exact contract count and the ACTUAL credit collected (max profit)
+    from the fill, not the model-mid target. Sent instead of a pre-fill estimate so
+    #signals carries one accurate number (see #152: quoted $1,120 → filled $924)."""
+    qty = plan.qty
+    # actual filled credit per contract ($); fall back to plan target if absent
+    credit_ct = execution.credit_per_contract
+    if credit_ct is None:
+        credit_ct = plan.credit_per_contract
+    credit_ct = Decimal(str(credit_ct))
+    max_profit = (credit_ct * Decimal(qty)).quantize(Decimal("0.01"))
+    # max loss = (wing width × 100 − credit) × qty, using the real filled credit
+    max_loss_ct = (Decimal(str(plan.wing_width)) * Decimal("100") - credit_ct)
+    max_loss = (max_loss_ct * Decimal(qty)).quantize(Decimal("0.01"))
+    return (
+        f"🎯 **SPY iron condor FILLED — today's expiry (0DTE)**\n"
+        f"\n"
+        f"**{qty} contracts** · strikes "
+        f"${plan.short_put.strike}/${plan.long_put.strike} put · "
+        f"${plan.short_call.strike}/${plan.long_call.strike} call\n"
+        f"\n"
+        f"💰 **Collected ${max_profit}** (${credit_ct}/contract) — this is your **max profit** "
+        f"if SPY stays between **${plan.short_put.strike}** and **${plan.short_call.strike}** at close.\n"
+        f"🛑 Max loss / collateral tied up: **${max_loss}**.\n"
+        f"\n"
+        f"Held to expiry unless an EXIT message posts here or the 15:45 ET force-close fires."
+    )
+
+
 def format_trade_telemetry(plan: IronCondorPlan, signal: Signal, execution) -> str:
     """Automated-execution telemetry for #trades (read-only)."""
     mode = get_settings().trading_mode.upper()
@@ -541,12 +572,28 @@ async def run_deterministic_condor(
             row.accepted = True
             s.commit()
 
-    signals_text = format_manual_signal(plan, open_signal)
+    # Pre-fill manual signal — used ONLY as the executor's stored summary (live
+    # /approve flow re-reads it). It is NOT posted to #signals; the posted alert is
+    # built AFTER the fill below so #signals shows the TRUE filled credit, not the
+    # optimistic model-mid target (which overstated it ~18% — e.g. #152 $1,120→$924).
+    pre_fill_summary = format_manual_signal(plan, open_signal)
     execution = await executor(
-        plan, session_factory=factory, summary=signals_text, signal_id=persisted_id,
+        plan, session_factory=factory, summary=pre_fill_summary, signal_id=persisted_id,
     )
     log.info("condor_execution", executed=execution.executed, reason=execution.reason,
              trade_id=execution.trade_id, pending_id=getattr(execution, "pending_id", None))
+
+    # One #signals alert, with the true picture:
+    #   * paper fill → post the fill confirmation (actual credit, qty, max profit).
+    #   * live pending → post the pre-fill manual signal so the user knows what to
+    #     /approve (there's no fill yet); the true numbers land on the exit alert.
+    #   * rejected/failed → no #signals post (nothing was opened).
+    if execution.executed:
+        signals_text = format_fill_confirmation(plan, open_signal, execution)
+    elif getattr(execution, "pending_id", None) is not None:
+        signals_text = pre_fill_summary
+    else:
+        signals_text = None
     trade_text = format_trade_telemetry(plan, open_signal, execution)
     return open_signal, signals_text, trade_text
 

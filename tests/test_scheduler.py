@@ -41,6 +41,64 @@ def _all_posters():
     }
 
 
+# ----------------- condor-alerts-only Discord mode -----------------
+
+
+def test_condor_alerts_only_silences_noncondor_jobs(monkeypatch):
+    """condor_alerts_only=True routes every NON-condor job's signal/trade/stock
+    poster to the no-op, while condor jobs keep the real posters — so only iron
+    condor alerts reach Discord. Every job is still registered (still runs)."""
+    monkeypatch.setattr(sch.get_settings(), "condor_alerts_only", True)
+    monkeypatch.setattr(sch.get_settings(), "enable_directional", True)
+    monkeypatch.setattr(sch.get_settings(), "enable_equities_scanner", True)
+
+    async def real(_t):  # a distinct real poster we can identify
+        return None
+
+    scheduler = sch.make_scheduler(
+        research_poster=real, signal_poster=real, trade_poster=real,
+        log_poster=real, stock_signal_poster=real, enable_iron_condor=True,
+    )
+    noop = sch._noop_poster
+
+    def posters(job_id):
+        j = scheduler.get_job(job_id)
+        return {n: v for n, v in (j.kwargs if j else {}).items()
+                if n.endswith("_poster") and n != "log_poster"}
+
+    # Non-condor jobs: signal/trade/stock posters must all be the no-op.
+    for jid in ("directional_scan", "directional_exit", "directional_0dte_final_close",
+                "trailing_stop_tick", "intraday_scan", "equities_scan"):
+        p = posters(jid)
+        assert p, f"{jid} should still be registered"
+        assert all(v is noop for v in p.values()), f"{jid} not silenced: {p}"
+
+    # Condor jobs keep the REAL posters.
+    for jid in ("iron_condor_entry", "iron_condor_exit", "iron_condor_force_close",
+                "condor_settlement"):
+        p = posters(jid)
+        assert p and all(v is real for v in p.values()), f"{jid} lost its real poster: {p}"
+
+
+def test_condor_alerts_only_off_keeps_all_real(monkeypatch):
+    """Default (flag off): every job keeps its real posters — no silencing."""
+    monkeypatch.setattr(sch.get_settings(), "condor_alerts_only", False)
+    monkeypatch.setattr(sch.get_settings(), "enable_directional", True)
+    monkeypatch.setattr(sch.get_settings(), "enable_equities_scanner", True)
+
+    async def real(_t):
+        return None
+
+    scheduler = sch.make_scheduler(
+        research_poster=real, signal_poster=real, trade_poster=real,
+        log_poster=real, stock_signal_poster=real, enable_iron_condor=True,
+    )
+    for jid in ("directional_scan", "intraday_scan", "equities_scan"):
+        j = scheduler.get_job(jid)
+        p = {n: v for n, v in j.kwargs.items() if n.endswith("_poster") and n != "log_poster"}
+        assert p and all(v is real for v in p.values()), f"{jid} should be REAL when flag off"
+
+
 # ----------------- premarket -----------------
 
 
