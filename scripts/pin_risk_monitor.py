@@ -18,11 +18,47 @@ import argparse
 import asyncio
 import json
 import sqlite3
+import subprocess
 from decimal import Decimal
 
 import integrations.alpaca_client as ac
 from trademaster.config import get_settings
 from trademaster.timeutils import today_et
+
+
+def _smart_close_decision(tid: int) -> str:
+    """What did the daemon's exit monitor actually DO for this condor today?
+
+    Reads the daemon journal (the source of truth) rather than guessing from
+    'still open'. A condor left open because it was comfortably INSIDE at 15:45
+    (exit_monitor_expire_inside) is CORRECT behavior, not a failed fill.
+    Returns: 'closed' | 'failed' | 'expired_inside' | 'unknown'.
+    """
+    try:
+        out = subprocess.run(
+            ["journalctl", "--user", "-u", "trademaster.service",
+             "--since", "today", "--no-pager"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except Exception:  # noqa: BLE001 — journal unavailable → unknown
+        return "unknown"
+    key = f'"trade_id": {tid}'
+    lines = [ln for ln in out.splitlines() if key in ln]
+    filled = any("exit_monitor_close_terminal" in ln and '"status": "filled"' in ln
+                 for ln in lines)
+    fail_events = ("exit_monitor_position_shortfall", "exit_monitor_intent_mismatch",
+                   "exit_monitor_cancelled_unfilled_close")
+    failed = any(ev in ln for ln in lines for ev in fail_events) or any(
+        "exit_monitor_close_terminal" in ln and '"status": "filled"' not in ln
+        for ln in lines)
+    expired = any("exit_monitor_expire_inside" in ln for ln in lines)
+    if filled:
+        return "closed"
+    if failed:
+        return "failed"
+    if expired:
+        return "expired_inside"
+    return "unknown"
 
 NEAR_PCT = 0.003  # 0.3% band = the smart-close near-strike gate
 
@@ -64,22 +100,24 @@ async def close_mode() -> str | None:
         return f"⚠️ Pin-risk monitor #{tid}: couldn't read spot/strikes — check manually."
     near = spot <= sp * (1 + NEAR_PCT) or spot >= sc * (1 - NEAR_PCT)
     if not near:
-        return None  # comfortably inside → expires free → quiet, no alert
+        return None  # comfortably inside → minimal assignment risk → quiet, no alert
 
     where = f"SPY {spot:.2f} vs shorts {sp:.0f}P/{sc:.0f}C"
-    closed_in_market = bool(e.get("close_order_id")) or str(
-        e.get("exit_reason", "")
-    ).startswith(("force_close", "stop", "daily"))
-    settled = "reconciler" in str(e.get("exit_reasoning") or "").lower()
+    decision = _smart_close_decision(tid)
 
-    if closed_in_market:
-        return (f"📌✅ PIN RISK today — condor #{tid}: {where}. Smart 15:45 close CAUGHT it "
-                f"(closed in-market, P&L ${float(pnl or 0):+,.0f}) — assignment avoided.")
-    if settled or closed_at is not None:
-        return (f"📌⚠️ PIN RISK today — condor #{tid}: {where}. It FELL THROUGH to settlement "
-                f"(smart close didn't fill). WATCH FOR ASSIGNMENT overnight — the 09:25 check will confirm.")
-    return (f"📌⚠️ PIN RISK today — condor #{tid}: {where}, and it's STILL OPEN at 15:47 — "
-            f"the smart 15:45 close did not fill. Will settle at 16:03; assignment risk overnight.")
+    if decision == "closed":
+        return (f"📌✅ PIN RISK today — condor #{tid}: {where}. Smart close CAUGHT it "
+                f"(closed in-market) — assignment avoided.")
+    if decision == "failed":
+        return (f"📌⚠️ PIN RISK today — condor #{tid}: {where}. Smart close ATTEMPTED but did NOT fill — "
+                f"assignment risk overnight. The 09:25 check will confirm.")
+    if decision == "expired_inside":
+        # NOT a failure — the close correctly stood down because SPY was inside at 15:45.
+        return (f"📌ℹ️ Pin watch — condor #{tid}: near a short now ({where}), but the smart close "
+                f"correctly let it EXPIRE (SPY was inside the range at 15:45 — no close was needed). "
+                f"A late dip could still breach, so the 09:25 check confirms no assignment. Not a fill failure.")
+    return (f"📌 Pin watch — condor #{tid}: {where} into the close, still open. Couldn't read the "
+            f"smart-close decision from the daemon logs; watch for assignment overnight (09:25 check).")
 
 
 async def assign_mode() -> str | None:
