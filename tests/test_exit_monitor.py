@@ -342,6 +342,98 @@ async def test_force_close_still_closes_when_spot_unknown(session_factory):
     assert results[0]["status"] == "closed"
 
 
+# ----------------- distance-aware stop (opt-in) -----------------
+
+
+async def test_distance_aware_stop_suppressed_when_inside(session_factory, monkeypatch):
+    """Distance-aware ON: the 1.5× stop is SUPPRESSED (held) when SPY is comfortably
+    inside its shorts — the thin-credit OTM-approach whipsaw we want to avoid."""
+    monkeypatch.setattr(em.get_settings(), "condor_distance_aware_stop", True)
+    trade_id = _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("2.60"))  # $260 debit → the 1.5× stop would fire
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_):
+        raise AssertionError("must NOT close a stop that's suppressed inside the shorts")
+
+    async def waiter(*_a, **_k):
+        raise AssertionError("must NOT wait — nothing was submitted")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter,
+        stock_fetcher=_stock_fetcher("500"),  # dead-center of 495-505 → suppress
+        force_close=False,
+    )
+    assert results[0]["status"] == "stop_suppressed_inside"
+    assert results[0]["reason"] == "stop_loss_1.5x"
+    with session_factory() as s:
+        assert s.get(Trade, trade_id).closed_at is None  # still open → can fire later
+
+
+async def test_distance_aware_stop_fires_at_strike(session_factory, monkeypatch):
+    """Distance-aware ON: once SPY reaches a short strike (a real breach), the stop
+    fires and closes normally."""
+    monkeypatch.setattr(em.get_settings(), "condor_distance_aware_stop", True)
+    _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("2.60"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    submitted: dict = {}
+    async def submitter(**kw):
+        submitted.update(kw)
+        return OrderResult(order_id="c1", status="new", filled_avg_price=None,
+                           filled_qty=Decimal("0"), submitted_at=datetime.now(UTC),
+                           raw_status="new")
+
+    async def waiter(_id, *, timeout_s):
+        return _fake_fill("2.65")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter,
+        stock_fetcher=_stock_fetcher("505"),  # AT the short call → real breach → fire
+        force_close=False,
+    )
+    assert results[0]["reason"] == "stop_loss_1.5x"
+    assert results[0]["status"] == "closed"
+    assert submitted, "a close order must be submitted once SPY reaches the strike"
+
+
+async def test_distance_aware_stop_fires_when_spot_unknown(session_factory, monkeypatch):
+    """Fail-safe: distance-aware ON but the spot feed errors → the stop still FIRES
+    (we don't ride a losing position blind)."""
+    monkeypatch.setattr(em.get_settings(), "condor_distance_aware_stop", True)
+    _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("2.60"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_):
+        return OrderResult(order_id="c", status="new", filled_avg_price=None,
+                           filled_qty=Decimal("0"), submitted_at=datetime.now(UTC),
+                           raw_status="new")
+
+    async def waiter(_id, *, timeout_s):
+        return _fake_fill("2.65")
+
+    async def broken_stock(_sym):
+        raise RuntimeError("stock feed down")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter,
+        stock_fetcher=broken_stock, force_close=False,
+    )
+    assert results[0]["reason"] == "stop_loss_1.5x"
+    assert results[0]["status"] == "closed"
+
+
 async def test_monitor_skips_trade_with_missing_legs(session_factory):
     with session_factory() as s:
         row = Trade(

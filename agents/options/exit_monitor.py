@@ -95,6 +95,18 @@ def _near_short_strike(
     return spot <= sp * (Decimal("1") + band) or spot >= sc * (Decimal("1") - band)
 
 
+async def _fetch_spot(stock_fetcher, trade_id) -> Decimal | None:
+    """Best-effort SPY spot for the near-strike gates. Returns None on a feed blip;
+    callers pass None to _near_short_strike, which FAIL-SAFEs to 'near' (→ close)."""
+    try:
+        q = await stock_fetcher("SPY")
+        if q is not None:
+            return q.mid if getattr(q, "mid", None) and q.mid > 0 else (q.bid or q.ask)
+    except Exception as e:  # noqa: BLE001 — feed blip → caller fails safe
+        log.warning("exit_monitor_spot_fetch_failed", trade_id=trade_id, error=str(e))
+    return None
+
+
 def _quote_by_occ(chain: list[OptionQuote], occ: str) -> OptionQuote | None:
     for q in chain:
         if q.occ_symbol == occ:
@@ -576,6 +588,30 @@ async def _process_one_condor_exit(
             "exit_debit": str(exit_debit),
         }
 
+    # Distance-aware stop (opt-in): the 1.5× stop triggers on the mark-to-market loss
+    # alone, so on thin-credit days it fires on the OTM APPROACH — while SPY is still
+    # short of a short strike — then SPY reverts and it would have expired for full
+    # credit (a whipsaw). When enabled, SUPPRESS the stop (hold) unless SPY is within
+    # condor_stop_arm_band_pct of a short strike (or through it) — only cut on a real
+    # breach. Only stop_loss reasons are gated: daily_loss_cap is the fast-gap backstop
+    # and force_close has its own near-strike logic below. FAIL-SAFE: unknown spot →
+    # _near_short_strike True → the stop still fires (we don't gamble on a blind quote).
+    if settings.condor_distance_aware_stop and reason.startswith("stop_loss"):
+        spot = await _fetch_spot(stock_fetcher, trade.id)
+        if not _near_short_strike(spot, legs[0], legs[2], settings.condor_stop_arm_band_pct):
+            log.info(
+                "exit_monitor_stop_suppressed_inside", trade_id=trade.id,
+                spot=str(spot), short_put=legs[0], short_call=legs[2],
+                reason=reason, exit_debit=str(exit_debit),
+            )
+            return {
+                "trade_id": trade.id,
+                "status": "stop_suppressed_inside",
+                "reason": reason,
+                "credit": str(credit),
+                "exit_debit": str(exit_debit),
+            }
+
     # Smart force-close: the time-based deadline pays the 4-leg exit spread on EVERY
     # open condor. On a position comfortably inside its short strikes — which would
     # expire worthless for free — that spread is pure drag. So when the ONLY reason
@@ -583,13 +619,7 @@ async def _process_one_condor_exit(
     # unless SPY is near a short strike (pin/breach risk). Stop / daily-cap exits
     # always close (they mean the position is already losing).
     if reason.startswith("force_close"):
-        spot: Decimal | None = None
-        try:
-            q = await stock_fetcher("SPY")
-            if q is not None:
-                spot = q.mid if getattr(q, "mid", None) and q.mid > 0 else (q.bid or q.ask)
-        except Exception as e:  # noqa: BLE001 — feed blip → fail safe to closing
-            log.warning("exit_monitor_spot_fetch_failed", trade_id=trade.id, error=str(e))
+        spot = await _fetch_spot(stock_fetcher, trade.id)
         if not _near_short_strike(spot, legs[0], legs[2]):
             log.info(
                 "exit_monitor_expire_inside", trade_id=trade.id,

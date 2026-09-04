@@ -233,6 +233,24 @@ class Settings(BaseSettings):
     # the stop between sweeps. Set 0.15 (= $3,750 on $25k) 2026-07-31.
     condor_daily_loss_limit_pct: Decimal = Field(default=Decimal("0"), ge=0)
 
+    # DISTANCE-AWARE STOP (opt-in, default OFF). The 1.5× intraday stop triggers on
+    # the mark-to-market loss alone. On thin-credit days 1.5× of a small credit is a
+    # tiny move, so the stop fires on the OTM APPROACH — while SPY is still short of a
+    # short strike — then SPY reverts and the position would have expired for full
+    # credit (a whipsaw; the 2026-09-01..04 week was 4/4 such whipsaws). When True,
+    # the stop is SUPPRESSED unless SPY is within condor_stop_arm_band_pct of a short
+    # strike (or through it) — i.e. only cut on a real breach, not an approach. The
+    # daily_loss_cap (fast-gap backstop) and force_close are NOT gated. Backtest
+    # (scripts/backtest_condor_stop_compare.py): ~halves the worst day (−29%→−15%)
+    # while lifting total, vs just widening the multiplier which does neither. Flip
+    # CONDOR_DISTANCE_AWARE_STOP=true in .env to test in paper.
+    condor_distance_aware_stop: bool = False
+    # Band around a short strike within which the distance-aware stop is armed.
+    # 0.0 = fire only once SPY is AT or THROUGH a short strike (the best-worst-day
+    # backtest point). A small positive value arms slightly earlier (more protective,
+    # a touch more whipsaw). Ignored unless condor_distance_aware_stop is True.
+    condor_stop_arm_band_pct: float = Field(default=0.0, ge=0)
+
     # Condor TREND filter: HOLD the condor when the prior-day Wilder ADX is ≥ this
     # (0 = disabled). A trending prior day breaches the range-bound condor. The v2
     # engine dropped the ADX gate as over-conservative, but a re-backtest
