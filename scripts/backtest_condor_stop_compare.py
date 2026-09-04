@@ -107,6 +107,7 @@ def main():
     byday,vix,prior=load()
     variants=[("HOLD (no stop)","hold",None),
               ("FLAT 1.5x (current)","credit",1.5),
+              ("FLAT 2.0x (wider)","credit",2.0),
               ("FLAT 2.5x (wider)","credit",2.5),
               ("DIST-AWARE @ strike","dist",0.0),
               ("DIST-AWARE thru 0.05%","dist",-0.0005),
