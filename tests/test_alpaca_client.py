@@ -63,6 +63,57 @@ async def test_get_recent_news_handles_empty(monkeypatch):
     assert articles == []
 
 
+async def test_get_recent_news_retries_then_succeeds(monkeypatch):
+    """A transient fetch failure (e.g. the data.alpaca.markets read timeout) is
+    retried, and a later success returns the articles."""
+    monkeypatch.setattr(alpaca_client, "NEWS_FETCH_BACKOFF_S", 0.0)
+    calls = {"n": 0}
+    good = [
+        SimpleNamespace(
+            headline="ok", summary="s", url="u",
+            created_at=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+            symbols=["SPY"], source="alpaca",
+        )
+    ]
+
+    class FlakyClient:
+        def __init__(self, **_):
+            pass
+
+        def get_news(self, _req):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("read timed out")
+            return SimpleNamespace(news=good)
+
+    monkeypatch.setattr(alpaca_client, "_client", lambda: FlakyClient())
+
+    articles = await alpaca_client.get_recent_news(("SPY",))
+    assert calls["n"] == 2  # first attempt failed, retry succeeded
+    assert len(articles) == 1 and articles[0].headline == "ok"
+
+
+async def test_get_recent_news_returns_empty_on_persistent_failure(monkeypatch):
+    """A persistently failing/hanging news feed degrades to [] (callers treat it as
+    no-news / HOLD) instead of crashing the scan — and never raises."""
+    monkeypatch.setattr(alpaca_client, "NEWS_FETCH_BACKOFF_S", 0.0)
+    calls = {"n": 0}
+
+    class DeadClient:
+        def __init__(self, **_):
+            pass
+
+        def get_news(self, _req):
+            calls["n"] += 1
+            raise RuntimeError("read timeout=None")
+
+    monkeypatch.setattr(alpaca_client, "_client", lambda: DeadClient())
+
+    articles = await alpaca_client.get_recent_news()
+    assert articles == []  # fail closed, no exception propagated
+    assert calls["n"] == alpaca_client.NEWS_FETCH_RETRIES + 1  # all attempts used
+
+
 async def test_get_recent_news_tolerates_missing_fields(monkeypatch):
     raw_items = [
         SimpleNamespace(headline="No symbols article"),  # no summary/url/symbols

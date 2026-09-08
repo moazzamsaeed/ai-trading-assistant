@@ -248,6 +248,14 @@ def _to_article(raw) -> NewsArticle:
     )
 
 
+# The alpaca-py NewsClient issues its request with NO read timeout, so a stalled
+# data.alpaca.markets response hangs indefinitely (`read timeout=None`) and takes the
+# whole scan down. Enforce a fast timeout at the async layer + a few retries.
+NEWS_FETCH_TIMEOUT_S = 10.0
+NEWS_FETCH_RETRIES = 2
+NEWS_FETCH_BACKOFF_S = 1.0
+
+
 async def get_recent_news(
     symbols: tuple[str, ...] = DEFAULT_WATCHLIST,
     *,
@@ -256,7 +264,10 @@ async def get_recent_news(
 ) -> list[NewsArticle]:
     """Fetch news articles for the given symbols in the last `hours_back` hours.
 
-    Sorted newest-first. Returns at most `limit` articles.
+    Sorted newest-first. Returns at most `limit` articles. Each attempt is bounded
+    by NEWS_FETCH_TIMEOUT_S and retried up to NEWS_FETCH_RETRIES times; on persistent
+    failure it degrades to [] (callers treat no-news as HOLD/skip) rather than
+    crashing the caller — a stalled/ flaky news feed must not take down the scan.
     """
 
     def _fetch() -> list[NewsArticle]:
@@ -273,7 +284,29 @@ async def get_recent_news(
         # not a list of empty ones (the bug that silently starved the bot of news).
         return [_to_article(a) for a in items if hasattr(a, "headline")]
 
-    return await asyncio.to_thread(_fetch)
+    last_err: Exception | None = None
+    for attempt in range(NEWS_FETCH_RETRIES + 1):
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_fetch), timeout=NEWS_FETCH_TIMEOUT_S
+            )
+        except Exception as e:  # noqa: BLE001 — timeout/connection/API blip → retry, then fail closed
+            last_err = e
+            log.warning(
+                "get_recent_news_attempt_failed",
+                attempt=attempt + 1,
+                retries=NEWS_FETCH_RETRIES,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            if attempt < NEWS_FETCH_RETRIES:
+                await asyncio.sleep(NEWS_FETCH_BACKOFF_S * (attempt + 1))
+    log.warning(
+        "get_recent_news_failed_empty",
+        error=str(last_err),
+        error_type=type(last_err).__name__ if last_err else None,
+    )
+    return []
 
 
 def _unwrap_news(raw) -> list:
