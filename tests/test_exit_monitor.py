@@ -434,6 +434,106 @@ async def test_distance_aware_stop_fires_when_spot_unknown(session_factory, monk
     assert results[0]["status"] == "closed"
 
 
+# ----------------- assignment config (opt-in, SPY-only) -----------------
+
+
+async def test_assignment_config_legs_out_only_the_near_short(session_factory, monkeypatch):
+    """Assignment config ON: at the deadline near a short strike, buy back ONLY the
+    at-risk short leg (single-leg), NOT the 4-leg combo, and leave the far short + longs."""
+    monkeypatch.setattr(em.get_settings(), "condor_assignment_close", True)
+    monkeypatch.setattr(em.get_settings(), "condor_assign_close_buffer_pct", 0.003)
+    trade_id = _ic_trade(session_factory)  # shorts 495/505
+    chain = _chain_at_debit(Decimal("0.50"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_):
+        raise AssertionError("assignment config must NOT submit the 4-leg close")
+
+    legout: list[str] = []
+    async def single_leg_closer(*, qty, occ_symbol, limit_price):
+        legout.append(occ_symbol)
+        return OrderResult(order_id="lo", status="filled", filled_avg_price=Decimal("0.50"),
+                           filled_qty=Decimal(str(qty)), submitted_at=datetime.now(UTC),
+                           raw_status="filled")
+
+    async def waiter(_id, *, timeout_s):
+        return _fake_fill("0.50")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, single_leg_closer=single_leg_closer,
+        stock_fetcher=_stock_fetcher("505"),  # AT the short call → call near, put far
+        force_close=True,
+    )
+    assert results[0]["status"] == "assignment_closed"
+    assert results[0]["legs_closed"] == ["call"]  # only the near short closed
+    assert len(legout) == 1  # exactly one single-leg buy-to-close
+    with session_factory() as s:
+        # residual (longs + far short) is left for the reconciler → not marked closed
+        assert s.get(Trade, trade_id).closed_at is None
+
+
+async def test_assignment_config_lets_comfortably_inside_expire(session_factory, monkeypatch):
+    """Assignment config ON but SPY dead-center → still expire free, no leg-out."""
+    monkeypatch.setattr(em.get_settings(), "condor_assignment_close", True)
+    _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("0.10"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_):
+        raise AssertionError("nothing to close when comfortably inside")
+
+    async def single_leg_closer(**_):
+        raise AssertionError("no leg-out when comfortably inside")
+
+    async def waiter(*_a, **_k):
+        raise AssertionError("no wait when nothing submitted")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, single_leg_closer=single_leg_closer,
+        stock_fetcher=_stock_fetcher("500"),  # dead-center of 495-505
+        force_close=True,
+    )
+    assert results[0]["status"] == "expire_inside"
+
+
+async def test_assignment_config_off_still_4leg_closes(session_factory, monkeypatch):
+    """Flag OFF (default): near-strike deadline still uses the 4-leg close, never the
+    single-leg leg-out — backward compatibility for the live SPY setup."""
+    monkeypatch.setattr(em.get_settings(), "condor_assignment_close", False)
+    _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("1.00"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    submitted: dict = {}
+    async def submitter(**kw):
+        submitted.update(kw)
+        return OrderResult(order_id="c1", status="new", filled_avg_price=None,
+                           filled_qty=Decimal("0"), submitted_at=datetime.now(UTC),
+                           raw_status="new")
+
+    async def single_leg_closer(**_):
+        raise AssertionError("flag off → must not leg out")
+
+    async def waiter(_id, *, timeout_s):
+        return _fake_fill("1.00")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, single_leg_closer=single_leg_closer,
+        stock_fetcher=_stock_fetcher("505"), force_close=True,
+    )
+    assert results[0]["status"] == "closed"
+    assert submitted, "flag off must still submit the 4-leg close"
+
+
 async def test_monitor_skips_trade_with_missing_legs(session_factory):
     with session_factory() as s:
         row = Trade(

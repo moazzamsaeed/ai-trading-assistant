@@ -107,6 +107,54 @@ async def _fetch_spot(stock_fetcher, trade_id) -> Decimal | None:
     return None
 
 
+async def _assignment_leg_out(
+    trade, *, spot, legs, chain, closer, waiter, buf, fill_timeout_s, factory,
+) -> dict:
+    """Assignment config: at the deadline, buy back ONLY the short leg(s) near/ITM via
+    single-leg market orders so a physically-settled short can't assign shares
+    overnight. Longs + comfortably-OTM shorts are left to expire; the reconciler
+    settles the residual at 16:03. Records the buybacks on the trade; does NOT mark it
+    closed. FAIL-SAFE: unknown spot/strike → close the leg (never leave a blind short)."""
+    short_put, _long_put, short_call, _long_call = legs
+    band = Decimal(str(buf))
+    spot_d = Decimal(str(spot)) if spot is not None else None
+    closed: list[dict] = []
+    for occ, is_put in ((short_put, True), (short_call, False)):
+        strike = _occ_strike(occ)
+        if strike is None or spot_d is None:
+            near = True  # fail-safe: can't evaluate → close rather than risk assignment
+        else:
+            near = (spot_d <= strike * (Decimal("1") + band)) if is_put \
+                else (spot_d >= strike * (Decimal("1") - band))
+        if not near:
+            continue
+        q = _quote_by_occ(chain, occ)
+        ref = (q.ask if q and getattr(q, "ask", None) else Decimal("0"))
+        order = await closer(qty=int(Decimal(str(trade.qty))), occ_symbol=occ, limit_price=ref)
+        final = await waiter(order.order_id, timeout_s=fill_timeout_s)
+        closed.append({
+            "occ": occ, "side": "put" if is_put else "call",
+            "order_id": order.order_id, "status": final.status,
+            "fill": str(final.filled_avg_price) if final.filled_avg_price else None,
+        })
+        log.info(
+            "exit_monitor_assignment_leg_out", trade_id=trade.id, occ=occ,
+            side="put" if is_put else "call", status=final.status,
+            fill=str(final.filled_avg_price) if final.filled_avg_price else None,
+        )
+    with factory() as s:
+        row = s.get(Trade, trade.id)
+        if row is not None:
+            ex = row.extra or {}
+            ex["assignment_legs_closed"] = closed
+            row.extra = ex
+            s.commit()
+    return {
+        "trade_id": trade.id, "status": "assignment_closed",
+        "legs_closed": [c["side"] for c in closed],
+    }
+
+
 def _quote_by_occ(chain: list[OptionQuote], occ: str) -> OptionQuote | None:
     for q in chain:
         if q.occ_symbol == occ:
@@ -264,6 +312,7 @@ async def run_exit_monitor(
     stock_fetcher: Callable[..., object] = alpaca_client.get_latest_stock_quote,
     position_fetcher: Callable[..., object] = alpaca_client.get_positions,
     position_closer: Callable[..., object] = alpaca_client.close_position,
+    single_leg_closer: Callable[..., object] = alpaca_client.submit_single_option_buy_to_close,
     force_close: bool | None = None,
     fill_timeout_s: float = 60.0,
 ) -> list[dict]:
@@ -297,6 +346,7 @@ async def run_exit_monitor(
                 waiter=waiter,
                 canceller=canceller,
                 stock_fetcher=stock_fetcher,
+                single_leg_closer=single_leg_closer,
                 force_close=force_close,
                 fill_timeout_s=fill_timeout_s,
             )
@@ -529,6 +579,7 @@ async def _process_one_condor_exit(
     waiter: Callable[..., object],
     canceller: Callable[..., object],
     stock_fetcher: Callable[..., object],
+    single_leg_closer: Callable[..., object] = alpaca_client.submit_single_option_buy_to_close,
     force_close: bool,
     fill_timeout_s: float,
 ) -> dict:
@@ -631,6 +682,20 @@ async def _process_one_condor_exit(
                 "reason": reason,
                 "exit_debit": str(exit_debit),
             }
+        # Near a short strike at the deadline. ASSIGNMENT CONFIG (opt-in, SPY-only):
+        # instead of the blunt 4-leg close, buy back ONLY the at-risk short leg(s)
+        # (single-leg, marketable) and let the longs + OTM short expire — cheaper, and
+        # it's the short that carries assignment risk. NOTE (pre-deploy): the residual
+        # (longs + untouched OTM short) is left to the 16:03 reconciler to settle;
+        # verify the reconciler prices a partially-closed condor correctly before
+        # enabling. XSP condors never reach here with the flag on (cash-settled).
+        if settings.condor_assignment_close:
+            return await _assignment_leg_out(
+                trade, spot=spot, legs=legs, chain=chain,
+                closer=single_leg_closer, waiter=waiter,
+                buf=settings.condor_assign_close_buffer_pct,
+                fill_timeout_s=fill_timeout_s, factory=factory,
+            )
 
     # Option A — EVERY condor exit closes marketably. All condor exits are
     # loss-cuts or the time-based force-close (there's no profit target), so a

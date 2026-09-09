@@ -751,6 +751,43 @@ async def submit_single_option_buy(
     return await asyncio.to_thread(_do)
 
 
+async def submit_single_option_buy_to_close(
+    *,
+    qty: int,
+    occ_symbol: str,
+    limit_price: Decimal,
+) -> OrderResult:
+    """Market BUY-to-CLOSE with DAY — buys back a SHORT option leg to flatten it.
+
+    Used by the assignment config's late-day leg-out: buy back an ITM/near-strike
+    SHORT before expiry so a physically-settled underlying (SPY) can't assign shares
+    overnight. Market/DAY fills at the ask during RTH; `limit_price` is a logging
+    reference only. Distinct from submit_single_option_buy (BUY_TO_OPEN).
+    """
+    order_req = MarketOrderRequest(
+        symbol=occ_symbol,
+        qty=qty,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        position_intent=PositionIntent.BUY_TO_CLOSE,
+    )
+
+    def _do() -> OrderResult:
+        resp = _trading_client().submit_order(order_req)
+        result = _to_order_result(resp)
+        log.info(
+            "alpaca_single_option_buy_to_close_submitted",
+            occ=occ_symbol,
+            qty=qty,
+            ref_ask=str(limit_price),
+            order_id=result.order_id,
+            status=result.status,
+        )
+        return result
+
+    return await asyncio.to_thread(_do)
+
+
 async def submit_single_option_sell(
     *,
     qty: int,

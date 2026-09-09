@@ -251,6 +251,18 @@ class Settings(BaseSettings):
     # a touch more whipsaw). Ignored unless condor_distance_aware_stop is True.
     condor_stop_arm_band_pct: float = Field(default=0.0, ge=0)
 
+    # ASSIGNMENT CONFIG (opt-in, default OFF; SPY-only — XSP is cash-settled and needs
+    # none). SPY options are physically settled, so an ITM short at expiry delivers
+    # shares (assignment) = unbounded overnight risk. When on, at the force-close
+    # deadline the exit monitor closes ONLY the short leg(s) within
+    # condor_assign_close_buffer_pct of spot (or ITM) via single-leg BUY-to-close
+    # (marketable), and lets comfortably-OTM shorts + all longs expire — a cheaper
+    # leg-out that replaces the near-strike 4-leg force-close. Backtest
+    # (scripts/backtest_selective_close.py): 0 assignment at ~−23% (ideal) to −64%
+    # (realistic slippage) of profit. Flip CONDOR_ASSIGNMENT_CLOSE=true to enable.
+    condor_assignment_close: bool = False
+    condor_assign_close_buffer_pct: float = Field(default=0.003, ge=0)
+
     # Condor TREND filter: HOLD the condor when the prior-day Wilder ADX is ≥ this
     # (0 = disabled). A trending prior day breaches the range-bound condor. The v2
     # engine dropped the ADX gate as over-conservative, but a re-backtest
