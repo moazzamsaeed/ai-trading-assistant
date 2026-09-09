@@ -63,6 +63,39 @@ def _condor_settlement_debit(
     return debit
 
 
+def _condor_settlement_debit_legout(
+    spot: float,
+    *,
+    short_put: Decimal,
+    long_put: Decimal,
+    short_call: Decimal,
+    long_call: Decimal,
+    closed_put_fill: Decimal | None,
+    closed_call_fill: Decimal | None,
+    max_loss_per_contract: Decimal | None,
+) -> Decimal:
+    """Settlement debit for a condor whose short leg(s) were bought back by the
+    assignment config's 15:50 leg-out. For a CLOSED short, the cost is the actual
+    buyback price we paid (not intrinsic), and the same-side LONG is still held so it
+    still pays its expiry intrinsic. A non-closed side settles at normal spread
+    intrinsic. A closed side CAN net a credit (naked long finishes ITM) — so it is
+    NOT floored at 0, unlike a held spread. Result is $/contract to match entry_price.
+    """
+    sp, lp, sc, lc = float(short_put), float(long_put), float(short_call), float(long_call)
+    if closed_put_fill is not None:
+        put_cost = float(closed_put_fill) - max(0.0, lp - spot)   # paid buyback − long-put intrinsic
+    else:
+        put_cost = max(0.0, max(0.0, sp - spot) - max(0.0, lp - spot))
+    if closed_call_fill is not None:
+        call_cost = float(closed_call_fill) - max(0.0, spot - lc)  # paid buyback − long-call intrinsic
+    else:
+        call_cost = max(0.0, max(0.0, spot - sc) - max(0.0, spot - lc))
+    debit = Decimal(str(round((put_cost + call_cost) * 100, 2)))
+    if max_loss_per_contract is not None and debit > max_loss_per_contract:
+        debit = max_loss_per_contract
+    return debit
+
+
 async def _underlying_close_on(d: date, symbol: str = "SPY") -> float | None:
     """Settlement close for the underlying on expiry date `d` (ET session)."""
     try:
@@ -160,14 +193,31 @@ async def settle_expired_condors(
             continue
 
         mlc = extra.get("max_loss_per_contract")
-        debit = _condor_settlement_debit(
-            spot,
+        max_loss = Decimal(str(mlc)) if mlc is not None else None
+        strikes = dict(
             short_put=_strike_from_occ(legs["short_put"]),
             long_put=_strike_from_occ(legs["long_put"]),
             short_call=_strike_from_occ(legs["short_call"]),
             long_call=_strike_from_occ(legs["long_call"]),
-            max_loss_per_contract=Decimal(str(mlc)) if mlc is not None else None,
         )
+        # Assignment config: if the 15:50 leg-out bought back a short, price the residual
+        # off the actual buyback fills (a closed short cost us its fill, not intrinsic; its
+        # long still settles at intrinsic). A leg with a non-filled order is treated as
+        # still-held → normal intrinsic (fail-safe: it may still assign, but P&L is right).
+        legout = {
+            c.get("side"): c.get("fill")
+            for c in (extra.get("assignment_legs_closed") or [])
+            if c.get("status") == "filled" and c.get("fill")
+        }
+        if legout:
+            debit = _condor_settlement_debit_legout(
+                spot, **strikes,
+                closed_put_fill=Decimal(str(legout["put"])) if "put" in legout else None,
+                closed_call_fill=Decimal(str(legout["call"])) if "call" in legout else None,
+                max_loss_per_contract=max_loss,
+            )
+        else:
+            debit = _condor_settlement_debit(spot, **strikes, max_loss_per_contract=max_loss)
 
         with sf() as session:
             row = session.get(Trade, trade.id)
@@ -182,11 +232,13 @@ async def settle_expired_condors(
             # week attribution stays correct.
             row.closed_at = datetime.combine(expiry, time(16, 0), tzinfo=ET).astimezone(UTC)
             ex = dict(row.extra or {})
-            ex["exit_reason"] = "expired_settled"
+            ex["exit_reason"] = "expired_settled_legout" if legout else "expired_settled"
             ex["exit_reasoning"] = (
                 f"0DTE condor settled by reconciler from SPY {spot:.2f} close on "
-                f"{expiry} (intrinsic debit ${float(debit):.2f}/contract). The intraday "
-                f"MLEG close did not book (legs swept / no quotes at expiry)."
+                f"{expiry} (debit ${float(debit):.2f}/contract"
+                + (f", residual after assignment-config leg-out of {sorted(legout)})."
+                   if legout else "). The intraday MLEG close did not book "
+                   "(legs swept / no quotes at expiry).")
             )
             ex["settlement_spot"] = round(spot, 2)
             row.extra = ex

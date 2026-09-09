@@ -20,6 +20,7 @@ from trademaster import reconciler
 from trademaster.db import Base, Trade, make_engine, make_session_factory
 from trademaster.reconciler import (
     _condor_settlement_debit,
+    _condor_settlement_debit_legout,
     _strike_from_occ,
     reconcile_positions,
 )
@@ -70,6 +71,52 @@ def test_settlement_call_side_breach():
     # spot 507: short call 505 ITM by 2 → $200/ct (put side worthless).
     debit = _condor_settlement_debit(507.0, **_STRIKES, max_loss_per_contract=Decimal("420"))
     assert debit == Decimal("200.00")
+
+
+# --- assignment-config leg-out settlement (short bought back at 15:50) ---
+
+
+def test_legout_no_closed_legs_matches_standard():
+    # Both fills None → identical to the standard intrinsic settlement (spot 493).
+    d_std = _condor_settlement_debit(493.0, **_STRIKES, max_loss_per_contract=Decimal("420"))
+    d_lo = _condor_settlement_debit_legout(
+        493.0, **_STRIKES, closed_put_fill=None, closed_call_fill=None,
+        max_loss_per_contract=Decimal("420"),
+    )
+    assert d_lo == d_std == Decimal("200.00")
+
+
+def test_legout_false_alarm_costs_only_the_buyback():
+    # Bought back the short call @ $0.60, SPY closes 500 (inside) → cost is just the
+    # $0.60 buyback ($60/ct), NOT a $0 free expiry — the price of the insurance.
+    debit = _condor_settlement_debit_legout(
+        500.0, **_STRIKES, closed_put_fill=None, closed_call_fill=Decimal("0.60"),
+        max_loss_per_contract=Decimal("420"),
+    )
+    assert debit == Decimal("60.00")
+
+
+def test_legout_real_pin_avoids_intrinsic_double_count():
+    # Short call bought back @ $0.60, SPY closes 507 (short call would've been ITM $2).
+    # Held-to-expiry debit would be $200; the leg-out cost is only the $60 buyback —
+    # this is the double-count the standard reconciler would have booked wrong.
+    debit = _condor_settlement_debit_legout(
+        507.0, **_STRIKES, closed_put_fill=None, closed_call_fill=Decimal("0.60"),
+        max_loss_per_contract=Decimal("420"),
+    )
+    assert debit == Decimal("60.00")
+    assert _condor_settlement_debit(507.0, **_STRIKES,
+                                    max_loss_per_contract=Decimal("420")) == Decimal("200.00")
+
+
+def test_legout_naked_long_runs_itm_nets_a_credit():
+    # Short call bought back @ $0.60, then SPY runs to 513 → the still-held long call
+    # 510 finishes $3 ITM → net a CREDIT (debit negative): 0.60 − 3.00 = −2.40/sh.
+    debit = _condor_settlement_debit_legout(
+        513.0, **_STRIKES, closed_put_fill=None, closed_call_fill=Decimal("0.60"),
+        max_loss_per_contract=Decimal("420"),
+    )
+    assert debit == Decimal("-240.00")
 
 
 # ----------------- end-to-end settlement -----------------
