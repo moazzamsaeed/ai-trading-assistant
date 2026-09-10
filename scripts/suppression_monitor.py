@@ -27,7 +27,9 @@ from pathlib import Path
 from trademaster.config import get_settings
 
 STATE = Path("data/suppression_reported.txt")
+LEGOUT_STATE = Path("data/legout_reported.txt")
 SUPPRESS_EVT = "exit_monitor_stop_suppressed_inside"
+LEGOUT_EVT = "exit_monitor_assignment_leg_out"
 
 
 def _journal_today() -> str:
@@ -93,16 +95,64 @@ def _trade_final(tid: int) -> tuple[str | None, object]:
         return (None, None)
 
 
-def _already_reported() -> set[int]:
-    if not STATE.exists():
+def _already_reported(state: Path = STATE) -> set[int]:
+    if not state.exists():
         return set()
-    return {int(x) for x in STATE.read_text().split() if x.strip().isdigit()}
+    return {int(x) for x in state.read_text().split() if x.strip().isdigit()}
 
 
-def _mark_reported(tid: int) -> None:
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    with STATE.open("a") as f:
+def _mark_reported(tid: int, state: Path = STATE) -> None:
+    state.parent.mkdir(parents=True, exist_ok=True)
+    with state.open("a") as f:
         f.write(f"{tid}\n")
+
+
+def _legout_ids(journal: str) -> list[int]:
+    """Trade ids with an assignment-config leg-out event today, first-seen order."""
+    ids: list[int] = []
+    for ln in journal.splitlines():
+        if LEGOUT_EVT in ln:
+            m = re.search(r'"?trade_id"?[=:]\s*"?(\d+)', ln)
+            if m and int(m.group(1)) not in ids:
+                ids.append(int(m.group(1)))
+    return ids
+
+
+def _legout_detail(journal: str, tid: int) -> list[dict]:
+    """Each leg the assignment config bought back for tid: side + fill."""
+    out: list[dict] = []
+    for ln in journal.splitlines():
+        if LEGOUT_EVT in ln and re.search(rf'"?trade_id"?[=:]\s*"?{tid}\b', ln):
+            side = re.search(r'"?side"?[=:]\s*"?(put|call)', ln)
+            fill = re.search(r'"?fill"?[=:]\s*"?([\d.]+)', ln)
+            out.append({"side": side.group(1) if side else "?",
+                        "fill": fill.group(1) if fill else "?"})
+    return out
+
+
+def build_legout_messages() -> list[str]:
+    journal = _journal_today()
+    ids = _legout_ids(journal)
+    if not ids:
+        return []
+    done = _already_reported(LEGOUT_STATE)
+    first_ever = not done
+    out: list[str] = []
+    for tid in ids:
+        if tid in done:
+            continue
+        legs = _legout_detail(journal, tid)
+        desc = ", ".join(f"{lg['side']} short @ ${lg['fill']}" for lg in legs) or "short leg(s)"
+        _closed_at, pnl = _trade_final(tid)
+        outcome = (f"settled **${pnl}** (assignment avoided ✅)" if pnl is not None
+                   else "pending 16:03 settlement")
+        header = ("🛡️ **FIRST assignment-config leg-out** since it went live"
+                  if first_ever and not out else "🛡️ Assignment-config leg-out")
+        out.append(
+            f"{header} — condor #{tid}: near a short into the close, bought back {desc} "
+            f"(single-leg), left the longs + OTM short to expire. Outcome: {outcome}."
+        )
+    return out
 
 
 def _verdict(journal: str, tid: int) -> str:
@@ -160,20 +210,35 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--post", action="store_true", help="post to #logs and record state")
     args = ap.parse_args()
-    msgs = build_messages()
-    if not msgs:
-        print("[suppression] nothing to report (no new suppressions today).")
-        return 0
-    ids = _suppressed_ids(_journal_today())
-    done = _already_reported()
-    for msg in msgs:
-        print(msg)
+    journal = _journal_today()
+
+    reported_any = False
+    # Distance-aware stop suppressions.
+    sup_msgs = build_messages()
+    sup_done = _already_reported(STATE)
+    for msg in sup_msgs:
+        print(msg); reported_any = True
         if args.post:
             asyncio.run(_post(msg))
     if args.post:
-        for tid in ids:
-            if tid not in done:
-                _mark_reported(tid)
+        for tid in _suppressed_ids(journal):
+            if tid not in sup_done:
+                _mark_reported(tid, STATE)
+
+    # Assignment-config leg-outs.
+    lo_msgs = build_legout_messages()
+    lo_done = _already_reported(LEGOUT_STATE)
+    for msg in lo_msgs:
+        print(msg); reported_any = True
+        if args.post:
+            asyncio.run(_post(msg))
+    if args.post:
+        for tid in _legout_ids(journal):
+            if tid not in lo_done:
+                _mark_reported(tid, LEGOUT_STATE)
+
+    if not reported_any:
+        print("[exit-config monitor] nothing to report (no new suppressions or leg-outs today).")
     return 0
 
 
