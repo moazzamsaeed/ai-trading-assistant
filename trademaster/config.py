@@ -263,6 +263,16 @@ class Settings(BaseSettings):
     condor_assignment_close: bool = False
     condor_assign_close_buffer_pct: float = Field(default=0.003, ge=0)
 
+    # XSP SLEEVE (foundation; default OFF). Run a cash-settled Mini-SPX (XSP) condor
+    # side-by-side with SPY on its OWN isolated pool — same signal/strikes/gate (XSP
+    # tracks the same S&P index), so it's a clean A/B: SPY (physical, assignment config)
+    # vs XSP (European, cash-settled → needs NO assignment config, ~zero exit slippage).
+    # Books as 'xsp_0dte_ic'. Distance-aware stop applies; assignment config does NOT.
+    # NOT yet wired into entry/exit/reconciler — flipping this alone does nothing until
+    # the parallel scheduler jobs land (Phase 2). See [[project_xsp_cash_settled]].
+    enable_xsp_condor: bool = False
+    xsp_capital_usd: Decimal = Field(default=Decimal("25000"), ge=0)
+
     # Condor TREND filter: HOLD the condor when the prior-day Wilder ADX is ≥ this
     # (0 = disabled). A trending prior day breaches the range-bound condor. The v2
     # engine dropped the ADX gate as over-conservative, but a re-backtest
