@@ -471,8 +471,45 @@ async def test_assignment_config_legs_out_only_the_near_short(session_factory, m
     assert results[0]["legs_closed"] == ["call"]  # only the near short closed
     assert len(legout) == 1  # exactly one single-leg buy-to-close
     with session_factory() as s:
+        row = s.get(Trade, trade_id)
         # residual (longs + far short) is left for the reconciler → not marked closed
-        assert s.get(Trade, trade_id).closed_at is None
+        assert row.closed_at is None
+        # the buyback record MUST persist (JSON dict-copy) so the reconciler can price it
+        closed_legs = (row.extra or {}).get("assignment_legs_closed")
+        assert closed_legs and closed_legs[0]["side"] == "call"
+
+
+async def test_assignment_config_skips_already_legged_out(session_factory, monkeypatch):
+    """Idempotency: a trade already legged out (assignment_legs_closed in extra) is NOT
+    re-processed on a later pass — no re-fired leg-out, no stale 4-leg close."""
+    monkeypatch.setattr(em.get_settings(), "condor_assignment_close", True)
+    trade_id = _ic_trade(session_factory)
+    with session_factory() as s:
+        row = s.get(Trade, trade_id)
+        row.extra = {**(row.extra or {}),
+                     "assignment_legs_closed": [{"side": "call", "fill": "0.04",
+                                                 "status": "filled", "occ": "x"}]}
+        s.commit()
+    chain = _chain_at_debit(Decimal("2.60"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_):
+        raise AssertionError("must NOT 4-leg close an already-legged-out trade")
+
+    async def single_leg_closer(**_):
+        raise AssertionError("must NOT re-fire the leg-out")
+
+    async def waiter(*_a, **_k):
+        raise AssertionError("must NOT wait — nothing submitted")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, single_leg_closer=single_leg_closer,
+        stock_fetcher=_stock_fetcher("505"), force_close=True,
+    )
+    assert results[0]["status"] == "assignment_closed_already"
 
 
 async def test_assignment_config_lets_comfortably_inside_expire(session_factory, monkeypatch):

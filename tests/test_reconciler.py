@@ -198,6 +198,31 @@ async def test_expired_condor_settled_breach(session_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_expired_condor_settled_after_legout(session_factory, monkeypatch):
+    """End-to-end: the assignment config bought back the short CALL @ $0.30/sh, SPY
+    closes inside → the reconciler must price the buyback (not full credit, not the
+    call intrinsic). This is the 2026-09-14 first-live-firing bug: the record must
+    persist AND the reconciler must use the leg-out debit."""
+    tid = _open_condor(session_factory, expiry="2026-05-11", credit="80.00")
+    with session_factory() as s:
+        row = s.get(Trade, tid)
+        row.extra = {**row.extra, "assignment_legs_closed":
+                     [{"side": "call", "fill": "0.30", "status": "filled",
+                       "occ": "SPY260511C00505000"}]}
+        s.commit()
+    # SPY closes 503 (inside) → call would've expired worthless; the only cost is the $0.30 buyback.
+    _patch_alpaca(monkeypatch, positions=[], spot_on_expiry=503.0, expiry="2026-05-11")
+
+    await reconcile_positions(session_factory=session_factory)
+
+    with session_factory() as s:
+        row = s.get(Trade, tid)
+    assert row.exit_price == Decimal("30.00")            # $0.30/sh buyback ×100, NOT intrinsic
+    assert row.realized_pnl_usd == Decimal("50.00")      # (80 − 30) × 1, NOT the full $80 credit
+    assert row.extra["exit_reason"] == "expired_settled_legout"
+
+
+@pytest.mark.asyncio
 async def test_open_condor_not_yet_expired_left_alone(session_factory, monkeypatch):
     # Expiry in the far future → must NOT be settled.
     future = (datetime.now(UTC).date().replace(year=datetime.now(UTC).year + 1)).isoformat()

@@ -145,7 +145,10 @@ async def _assignment_leg_out(
     with factory() as s:
         row = s.get(Trade, trade.id)
         if row is not None:
-            ex = row.extra or {}
+            # Trade.extra is a plain JSON column (no MutableDict) — must reassign a NEW
+            # dict, or SQLAlchemy won't detect the change and the write is lost (the bug
+            # that dropped this record on the first live leg-out, 2026-09-14).
+            ex = dict(row.extra or {})
             ex["assignment_legs_closed"] = closed
             row.extra = ex
             s.commit()
@@ -598,6 +601,14 @@ async def _process_one_condor_exit(
     if not all(legs):
         log.warning("exit_monitor_missing_legs", trade_id=trade.id, extra=extra)
         return {"trade_id": trade.id, "status": "missing_legs"}
+
+    # Idempotency: once the assignment config has legged out this trade, its short(s)
+    # are already flat and it's waiting on the 16:03 reconciler for the residual. Do NOT
+    # re-process it on later force-close passes — that re-fired the leg-out and attempted
+    # a stale 4-leg close (intent_mismatch), and clobbered the assignment_legs_closed
+    # record so the reconciler mis-booked full credit (2026-09-14 first live firing).
+    if extra.get("assignment_legs_closed"):
+        return {"trade_id": trade.id, "status": "assignment_closed_already"}
 
     chain = await chain_fetcher(
         "SPY", expiry=trade.opened_at.date()
