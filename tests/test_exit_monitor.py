@@ -575,9 +575,10 @@ async def test_assignment_config_off_still_4leg_closes(session_factory, monkeypa
 
 
 async def test_stop_single_leg_fallback_on_mleg_failure(session_factory, monkeypatch):
-    """When the 4-leg MLEG stop-close fails to fill, fall back to single-leg buy-back
-    of BOTH shorts (the 2026-09-16 FOMC bug: MLEG canceled, loss rode to -$6k)."""
-    monkeypatch.setattr(em.get_settings(), "condor_stop_single_leg_fallback", True)
+    """Legacy path (single_leg OFF → MLEG first): when the 4-leg MLEG stop-close fails
+    to fill, the UNCONDITIONAL fallback buys back BOTH shorts single-leg (the
+    2026-09-16 FOMC bug: MLEG canceled, loss rode to -$6k)."""
+    monkeypatch.setattr(em.get_settings(), "condor_stop_single_leg", False)
     trade_id = _ic_trade(session_factory)
     chain = _chain_at_debit(Decimal("2.60"))  # pushes the 1.5x stop
 
@@ -619,33 +620,40 @@ async def test_stop_single_leg_fallback_on_mleg_failure(session_factory, monkeyp
         assert rec and len(rec) == 2  # persisted for the reconciler
 
 
-async def test_stop_no_fallback_when_flag_off(session_factory, monkeypatch):
-    """Flag OFF: an unfilled MLEG close reports the failure and rides to the reconciler
-    (legacy behavior) — no single-leg fallback."""
-    monkeypatch.setattr(em.get_settings(), "condor_stop_single_leg_fallback", False)
-    _ic_trade(session_factory)
-    chain = _chain_at_debit(Decimal("2.60"))
+async def test_stop_single_leg_first_skips_mleg(session_factory, monkeypatch):
+    """single_leg ON: the stop goes SINGLE-LEG FIRST — buys back BOTH shorts directly,
+    never touching the flaky 4-leg MLEG combo."""
+    monkeypatch.setattr(em.get_settings(), "condor_stop_single_leg", True)
+    trade_id = _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("2.60"))  # pushes the 1.5x stop
 
     async def chain_fetcher(*_a, **_k):
         return chain
 
     async def submitter(**_):
-        return OrderResult(order_id="mleg1", status="new", filled_avg_price=None,
-                           filled_qty=Decimal("0"), submitted_at=datetime.now(UTC), raw_status="new")
+        raise AssertionError("single-leg-first must NOT submit the 4-leg MLEG close")
 
-    async def waiter(_id, *, timeout_s):
-        return OrderResult(order_id="mleg1", status="canceled", filled_avg_price=None,
-                           filled_qty=Decimal("0"), submitted_at=datetime.now(UTC), raw_status="canceled")
+    legout: list[str] = []
+    async def single_leg_closer(*, qty, occ_symbol, limit_price):
+        legout.append(occ_symbol)
+        return OrderResult(order_id="lo_" + occ_symbol[-4:], status="filled",
+                           filled_avg_price=Decimal("0.50"), filled_qty=Decimal(str(qty)),
+                           submitted_at=datetime.now(UTC), raw_status="filled")
 
-    async def single_leg_closer(**_):
-        raise AssertionError("flag off → no single-leg fallback")
+    async def waiter(oid, *, timeout_s):
+        return _fake_fill("0.50")
 
     results = await run_exit_monitor(
         session_factory=session_factory, chain_fetcher=chain_fetcher,
         submitter=submitter, waiter=waiter, single_leg_closer=single_leg_closer,
         stock_fetcher=_stock_fetcher("500"), force_close=False,
     )
-    assert results[0]["status"].startswith("close_order_")
+    assert results[0]["status"] == "assignment_closed"
+    assert results[0]["reason"] == "stop_loss_1.5x"
+    assert sorted(results[0]["legs_closed"]) == ["call", "put"]  # both shorts, single-leg
+    assert len(legout) == 2
+    with session_factory() as s:
+        assert (s.get(Trade, trade_id).extra or {}).get("assignment_legs_closed")
 
 
 async def test_monitor_skips_trade_with_missing_legs(session_factory):
@@ -923,12 +931,29 @@ async def test_exit_monitor_cancels_unfilled_close_order(session_factory):
     async def canceller(oid):
         cancelled.append(oid)
 
+    legout: list[str] = []
+    async def single_leg_closer(*, qty, occ_symbol, limit_price):
+        legout.append(occ_symbol)
+        return OrderResult(order_id="lo_" + occ_symbol[-4:], status="filled",
+                           filled_avg_price=Decimal("0.50"), filled_qty=Decimal(str(qty)),
+                           submitted_at=datetime.now(UTC), raw_status="filled")
+
+    async def leg_waiter(oid, *, timeout_s):
+        if str(oid).startswith("lo_"):
+            return _fake_fill("0.50")
+        return await waiter(oid, timeout_s=timeout_s)  # MLEG stays `new`
+
     results = await run_exit_monitor(
         session_factory=session_factory, chain_fetcher=chain_fetcher,
-        submitter=submitter, waiter=waiter, canceller=canceller, force_close=True,
+        submitter=submitter, waiter=leg_waiter, canceller=canceller,
+        single_leg_closer=single_leg_closer, stock_fetcher=_stock_fetcher("505"),
+        force_close=True,  # SPY 505 = at the short call → not expire-inside → closes
     )
-    assert cancelled == ["stuck-new-1"]  # the abandoned `new` order was cancelled
-    assert results[0]["status"] == "close_order_new"
+    # Still cancels the abandoned `new` order (the #126 fix) — then legs out single-leg
+    # rather than abandoning it (the 2026-09-16 improvement).
+    assert cancelled == ["stuck-new-1"]
+    assert results[0]["status"] == "assignment_closed"
+    assert len(legout) == 2
 
 
 # ----------------- marketable force-close -----------------

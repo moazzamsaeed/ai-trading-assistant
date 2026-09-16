@@ -713,8 +713,27 @@ async def _process_one_condor_exit(
                 fill_timeout_s=fill_timeout_s, factory=factory,
             )
 
-    # Option A — EVERY condor exit closes marketably. All condor exits are
-    # loss-cuts or the time-based force-close (there's no profit target), so a
+    # SINGLE-LEG FIRST (primary path for loss-cuts). The 4-leg MLEG combo won't fill on
+    # illiquid/fast books (the 2026-09-16 FOMC breach → −$6k). So for stop_loss /
+    # daily_loss_cap / force_close that reach here, buy back BOTH shorts single-leg
+    # directly — each hits its own deep book and fills reliably, with no MLEG attempt
+    # and no fill-timeout latency. Longs expire; the reconciler prices the residual off
+    # the fills. Doesn't need a spot quote (close_all flattens both regardless). The
+    # assignment config's selective near-strike leg-out already returned above.
+    if settings.condor_stop_single_leg:
+        log.info("exit_monitor_single_leg_close", trade_id=trade.id, reason=reason)
+        spot = await _fetch_spot(stock_fetcher, trade.id)
+        result = await _assignment_leg_out(
+            trade, spot=spot, legs=legs, chain=chain,
+            closer=single_leg_closer, waiter=waiter,
+            buf=settings.condor_assign_close_buffer_pct,
+            fill_timeout_s=fill_timeout_s, factory=factory, close_all=True,
+        )
+        result["reason"] = reason
+        return result
+
+    # Option A (legacy, flag off) — EVERY condor exit closes marketably. All condor
+    # exits are loss-cuts or the time-based force-close (there's no profit target), so a
     # fair-value limit that rests unfilled just lets the loss ride to full defined
     # risk (the recurring MLEG close-failure). Submit a cap-marketable limit at the
     # wing width — the intrinsic max cost to close a defined-risk spread — so the
@@ -796,31 +815,17 @@ async def _process_one_condor_exit(
                 trade_id=trade.id, order_id=final.order_id, error=str(ce),
             )
 
-    # SINGLE-LEG FALLBACK: the 4-leg MLEG close won't fill on illiquid/fast books
-    # (just canceled above), so a stop/cap/force-close would otherwise ride to full
-    # defined risk (the 2026-09-16 FOMC breach → −$6k). Buy back BOTH shorts
-    # individually — single-leg orders hit each option's deep book and fill reliably;
-    # longs expire and the reconciler prices the residual off the fills. This is the
-    # difference between a stop that cuts at ~1.5× credit and one that never executes.
-    if settings.condor_stop_single_leg_fallback:
-        log.warning("exit_monitor_stop_single_leg_fallback", trade_id=trade.id, reason=reason)
-        spot = await _fetch_spot(stock_fetcher, trade.id)
-        return await _assignment_leg_out(
-            trade, spot=spot, legs=legs, chain=chain,
-            closer=single_leg_closer, waiter=waiter,
-            buf=settings.condor_assign_close_buffer_pct,
-            fill_timeout_s=fill_timeout_s, factory=factory, close_all=True,
-        )
-
-    # Route to #logs (throttled) so a repeatedly unfilled close doesn't spam every
-    # sweep. The reconciler settles the position at expiry regardless.
-    return {
-        "trade_id": trade.id,
-        "status": f"close_order_{final.status}",
-        "reason": reason,
-        "error_sig": f"{trade.id}:close_{final.status}",
-        "error_text": (
-            f"⚠️ Iron-condor close failed — trade #{trade.id} · "
-            f"reason `{reason}` · order status `{final.status}`"
-        ),
-    }
+    # SINGLE-LEG FALLBACK (unconditional): the legacy MLEG close just failed to fill,
+    # so rather than let the loss ride to full defined risk (the 2026-09-16 FOMC breach
+    # → −$6k), always buy back BOTH shorts single-leg — each hits its own deep book and
+    # fills reliably; longs expire and the reconciler prices the residual off the fills.
+    # (With condor_stop_single_leg on we never reach here — single-leg is the primary
+    # path above. This backstops the legacy MLEG path.)
+    log.warning("exit_monitor_stop_single_leg_fallback", trade_id=trade.id, reason=reason)
+    spot = await _fetch_spot(stock_fetcher, trade.id)
+    return await _assignment_leg_out(
+        trade, spot=spot, legs=legs, chain=chain,
+        closer=single_leg_closer, waiter=waiter,
+        buf=settings.condor_assign_close_buffer_pct,
+        fill_timeout_s=fill_timeout_s, factory=factory, close_all=True,
+    )
