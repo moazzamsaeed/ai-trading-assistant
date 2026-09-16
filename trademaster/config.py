@@ -263,6 +263,16 @@ class Settings(BaseSettings):
     condor_assignment_close: bool = False
     condor_assign_close_buffer_pct: float = Field(default=0.003, ge=0)
 
+    # STOP SINGLE-LEG FALLBACK (opt-in). The 1.5× stop / daily cap / force-close all
+    # unwind via a 4-leg MLEG combo order, which won't fill on illiquid/fast books —
+    # it canceled unfilled on the 2026-09-16 FOMC breach and the loss rode to −$6k
+    # (~−24%) instead of being capped at 1.5× credit (~−$1.2k). When on, if the MLEG
+    # close fails to fill, fall back to buying back the SHORT legs individually
+    # (single-leg orders hit each option's deep book and fill reliably); longs expire,
+    # the reconciler prices the residual off the fills. Same mechanism as the
+    # assignment config. Pure failure-fallback — no effect when the MLEG close fills.
+    condor_stop_single_leg_fallback: bool = False
+
     # XSP SLEEVE (foundation; default OFF). Run a cash-settled Mini-SPX (XSP) condor
     # side-by-side with SPY on its OWN isolated pool — same signal/strikes/gate (XSP
     # tracks the same S&P index), so it's a clean A/B: SPY (physical, assignment config)

@@ -109,20 +109,25 @@ async def _fetch_spot(stock_fetcher, trade_id) -> Decimal | None:
 
 async def _assignment_leg_out(
     trade, *, spot, legs, chain, closer, waiter, buf, fill_timeout_s, factory,
+    close_all: bool = False,
 ) -> dict:
-    """Assignment config: at the deadline, buy back ONLY the short leg(s) near/ITM via
-    single-leg market orders so a physically-settled short can't assign shares
-    overnight. Longs + comfortably-OTM shorts are left to expire; the reconciler
-    settles the residual at 16:03. Records the buybacks on the trade; does NOT mark it
-    closed. FAIL-SAFE: unknown spot/strike → close the leg (never leave a blind short)."""
+    """Buy back short leg(s) via single-leg market orders — the reliable unwind (each
+    leg hits its own deep book, unlike the 4-leg MLEG combo). Longs are left to expire;
+    the reconciler prices the residual off the fills. Records the buybacks; does NOT
+    mark the trade closed.
+
+    Assignment config (close_all=False): close only shorts near/ITM (within `buf`) so a
+    physically-settled short can't assign — comfortably-OTM shorts expire free.
+    Stop fallback (close_all=True): flatten BOTH shorts to actually cut a losing trade
+    when the MLEG close failed. FAIL-SAFE: unknown spot/strike → close the leg."""
     short_put, _long_put, short_call, _long_call = legs
     band = Decimal(str(buf))
     spot_d = Decimal(str(spot)) if spot is not None else None
     closed: list[dict] = []
     for occ, is_put in ((short_put, True), (short_call, False)):
         strike = _occ_strike(occ)
-        if strike is None or spot_d is None:
-            near = True  # fail-safe: can't evaluate → close rather than risk assignment
+        if close_all or strike is None or spot_d is None:
+            near = True  # flatten-all, or fail-safe (can't evaluate → close it)
         else:
             near = (spot_d <= strike * (Decimal("1") + band)) if is_put \
                 else (spot_d >= strike * (Decimal("1") - band))
@@ -790,6 +795,23 @@ async def _process_one_condor_exit(
                 "exit_monitor_cancel_unfilled_failed",
                 trade_id=trade.id, order_id=final.order_id, error=str(ce),
             )
+
+    # SINGLE-LEG FALLBACK: the 4-leg MLEG close won't fill on illiquid/fast books
+    # (just canceled above), so a stop/cap/force-close would otherwise ride to full
+    # defined risk (the 2026-09-16 FOMC breach → −$6k). Buy back BOTH shorts
+    # individually — single-leg orders hit each option's deep book and fill reliably;
+    # longs expire and the reconciler prices the residual off the fills. This is the
+    # difference between a stop that cuts at ~1.5× credit and one that never executes.
+    if settings.condor_stop_single_leg_fallback:
+        log.warning("exit_monitor_stop_single_leg_fallback", trade_id=trade.id, reason=reason)
+        spot = await _fetch_spot(stock_fetcher, trade.id)
+        return await _assignment_leg_out(
+            trade, spot=spot, legs=legs, chain=chain,
+            closer=single_leg_closer, waiter=waiter,
+            buf=settings.condor_assign_close_buffer_pct,
+            fill_timeout_s=fill_timeout_s, factory=factory, close_all=True,
+        )
+
     # Route to #logs (throttled) so a repeatedly unfilled close doesn't spam every
     # sweep. The reconciler settles the position at expiry regardless.
     return {
