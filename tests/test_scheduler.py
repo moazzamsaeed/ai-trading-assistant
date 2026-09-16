@@ -748,6 +748,69 @@ async def test_iron_condor_job_failure_routes_to_logs(monkeypatch):
     assert "failed" in logs[0].lower()
 
 
+async def test_iron_condor_job_skips_on_event_blackout(monkeypatch):
+    """The CONDOR entry job must stand aside on a scheduled-event (FOMC/CPI/NFP) day.
+    Regression for 2026-09-16: the blackout was only wired into the directional scan,
+    so the condor traded FOMC despite the blackout being on."""
+    sig: list[str] = []
+    trd: list[str] = []
+    logs: list[str] = []
+
+    async def s(t):
+        sig.append(t)
+
+    async def tr(t):
+        trd.append(t)
+
+    async def lg(t):
+        logs.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def boom(**_kwargs):
+        raise AssertionError("strategist must NOT run on a blackout day")
+
+    monkeypatch.setattr(sch.get_settings(), "enable_event_blackout", True)
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: "FOMC Decision")
+    monkeypatch.setattr(sch, "run_deterministic_condor", boom)
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", boom)
+
+    await sch._iron_condor_entry_job(
+        signal_poster=s, trade_poster=tr, log_poster=lg, clock_fetcher=clock_open
+    )
+    assert sig == [] and trd == []                       # no trade booked
+    assert len(logs) == 1 and "aside" in logs[0].lower()  # posted the stand-aside
+
+
+async def test_iron_condor_job_trades_when_not_a_blackout_day(monkeypatch):
+    """Blackout ON but today is NOT an event day → the condor trades normally."""
+    sig: list[str] = []
+    trd: list[str] = []
+
+    async def s(t):
+        sig.append(t)
+
+    async def tr(t):
+        trd.append(t)
+
+    async def clock_open() -> MarketClock:
+        return _clock(True)
+
+    async def fake_strat(**_kwargs):
+        return object(), "📋 manual signal", "🤖 trade telem"
+
+    monkeypatch.setattr(sch.get_settings(), "enable_event_blackout", True)
+    monkeypatch.setattr(sch, "is_blackout_day", lambda *_: None)  # ordinary day
+    monkeypatch.setattr(sch, "run_deterministic_condor", fake_strat)
+    monkeypatch.setattr(sch, "run_iron_condor_strategist", fake_strat)
+
+    await sch._iron_condor_entry_job(
+        signal_poster=s, trade_poster=tr, clock_fetcher=clock_open
+    )
+    assert sig == ["📋 manual signal"] and trd == ["🤖 trade telem"]
+
+
 async def _async(value):
     return value
 

@@ -896,6 +896,21 @@ async def _iron_condor_entry_job(
     # be capped here — defined risk is on before this runs — but it stops further
     # entries for the rest of the week after a bad day.
     settings = get_settings()
+    # Event blackout: stand the condor aside on scheduled high-impact days
+    # (FOMC/CPI/NFP). This gate lives here in the CONDOR entry job — the directional
+    # scan has its own copy — because the two run independently (the condor was NOT
+    # covered by the scan's check, so it traded 2026-09-16 FOMC despite the blackout).
+    # Distinct event name so a condor skip is unambiguous in the journal.
+    if settings.enable_event_blackout:
+        blackout_event = is_blackout_day(today_et())
+        if blackout_event:
+            log.info("condor_entry_skipped_event_blackout", blackout=blackout_event)
+            await log_poster(
+                f"📅 Condor stands aside today — **{blackout_event}** (event blackout). "
+                f"No entry; resumes next non-event session."
+            )
+            return
+
     if settings.condor_weekly_loss_limit_pct > 0:
         limit = settings.trading_capital_usd * settings.condor_weekly_loss_limit_pct
         weekly = get_this_week_realized_pnl(
