@@ -654,6 +654,39 @@ async def test_stop_single_leg_first_skips_mleg(session_factory, monkeypatch):
     assert len(legout) == 2
     with session_factory() as s:
         assert (s.get(Trade, trade_id).extra or {}).get("assignment_legs_closed")
+    # real-time close alert must be emitted (the single-leg path was previously silent)
+    alert = results[0].get("signal_text")
+    assert alert and "CLOSED" in alert and "stop loss" in alert.lower()
+
+
+async def test_assignment_config_leg_out_emits_close_alert(session_factory, monkeypatch):
+    """The assignment-config leg-out at the deadline also emits a real-time #signals alert."""
+    monkeypatch.setattr(em.get_settings(), "condor_assignment_close", True)
+    _ic_trade(session_factory)
+    chain = _chain_at_debit(Decimal("0.50"))
+
+    async def chain_fetcher(*_a, **_k):
+        return chain
+
+    async def submitter(**_):
+        raise AssertionError("assignment config must NOT submit the 4-leg close")
+
+    async def single_leg_closer(*, qty, occ_symbol, limit_price):
+        return OrderResult(order_id="lo", status="filled", filled_avg_price=Decimal("0.50"),
+                           filled_qty=Decimal(str(qty)), submitted_at=datetime.now(UTC),
+                           raw_status="filled")
+
+    async def waiter(_id, *, timeout_s):
+        return _fake_fill("0.50")
+
+    results = await run_exit_monitor(
+        session_factory=session_factory, chain_fetcher=chain_fetcher,
+        submitter=submitter, waiter=waiter, single_leg_closer=single_leg_closer,
+        stock_fetcher=_stock_fetcher("505"), force_close=True,
+    )
+    assert results[0]["status"] == "assignment_closed"
+    alert = results[0].get("signal_text")
+    assert alert and "CLOSED" in alert and "leg-out" in alert.lower()
 
 
 async def test_monitor_skips_trade_with_missing_legs(session_factory):

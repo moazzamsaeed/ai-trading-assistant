@@ -107,14 +107,42 @@ async def _fetch_spot(stock_fetcher, trade_id) -> Decimal | None:
     return None
 
 
+def _format_legout_alert(trade, closed: list[dict], reason: str | None) -> str | None:
+    """Real-time #signals alert when the single-leg stop / assignment config legs out a
+    short (the single-leg path was previously SILENT vs the MLEG path's EXIT alert)."""
+    if not closed:
+        return None
+    reason_text = {
+        "stop_loss_1.5x": "🛑 stop loss — SPY breached a short",
+        "daily_loss_cap": "🛑 daily loss cap hit",
+        "force_close_15:50": "⏰ close-time leg-out (assignment protection)",
+        "force_close": "⏰ close-time leg-out (assignment protection)",
+    }.get(reason or "", f"leg-out ({reason})")
+    qty = trade.qty
+    credit = Decimal(str(trade.entry_price))
+    buyback = sum(Decimal(str(c["fill"])) for c in closed if c.get("fill"))
+    # Estimated realized: credit − buyback of the closed shorts, longs assumed to expire
+    # (usual case). Final P&L is booked by the 16:03 reconciler off the actual fills.
+    est = ((credit / Decimal("100")) - buyback) * Decimal("100") * Decimal(str(qty))
+    legs_txt = ", ".join(
+        f"{c['side']} @ ${c['fill']}" for c in closed if c.get("fill")
+    ) or "short leg(s)"
+    word = "profit" if est >= 0 else "loss"
+    return (
+        f"🚨 **SPY condor #{trade.id} CLOSED — {reason_text}**\n"
+        f"Bought back {legs_txt} (single-leg); longs + any OTM short left to expire.\n"
+        f"Estimated {word}: **${abs(est):,.0f}** (final at 16:03 settlement)."
+    )
+
+
 async def _assignment_leg_out(
     trade, *, spot, legs, chain, closer, waiter, buf, fill_timeout_s, factory,
-    close_all: bool = False,
+    close_all: bool = False, reason: str | None = None,
 ) -> dict:
     """Buy back short leg(s) via single-leg market orders — the reliable unwind (each
     leg hits its own deep book, unlike the 4-leg MLEG combo). Longs are left to expire;
     the reconciler prices the residual off the fills. Records the buybacks; does NOT
-    mark the trade closed.
+    mark the trade closed. Emits a real-time #signals close alert (signal_text).
 
     Assignment config (close_all=False): close only shorts near/ITM (within `buf`) so a
     physically-settled short can't assign — comfortably-OTM shorts expire free.
@@ -157,10 +185,14 @@ async def _assignment_leg_out(
             ex["assignment_legs_closed"] = closed
             row.extra = ex
             s.commit()
-    return {
+    result = {
         "trade_id": trade.id, "status": "assignment_closed",
         "legs_closed": [c["side"] for c in closed],
     }
+    alert = _format_legout_alert(trade, closed, reason)
+    if alert:
+        result["signal_text"] = alert
+    return result
 
 
 def _quote_by_occ(chain: list[OptionQuote], occ: str) -> OptionQuote | None:
@@ -710,7 +742,7 @@ async def _process_one_condor_exit(
                 trade, spot=spot, legs=legs, chain=chain,
                 closer=single_leg_closer, waiter=waiter,
                 buf=settings.condor_assign_close_buffer_pct,
-                fill_timeout_s=fill_timeout_s, factory=factory,
+                fill_timeout_s=fill_timeout_s, factory=factory, reason=reason,
             )
 
     # SINGLE-LEG FIRST (primary path for loss-cuts). The 4-leg MLEG combo won't fill on
@@ -728,6 +760,7 @@ async def _process_one_condor_exit(
             closer=single_leg_closer, waiter=waiter,
             buf=settings.condor_assign_close_buffer_pct,
             fill_timeout_s=fill_timeout_s, factory=factory, close_all=True,
+            reason=reason,
         )
         result["reason"] = reason
         return result
@@ -828,4 +861,5 @@ async def _process_one_condor_exit(
         closer=single_leg_closer, waiter=waiter,
         buf=settings.condor_assign_close_buffer_pct,
         fill_timeout_s=fill_timeout_s, factory=factory, close_all=True,
+        reason=reason,
     )
