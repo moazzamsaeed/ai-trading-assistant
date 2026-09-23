@@ -1,0 +1,14 @@
+[Unit]
+Description=Check TradeMaster is running — 07:50 (post-start) and 09:35 ET (pre-condor-entry) Mon-Fri
+
+[Timer]
+# 07:50 — 5 min after trademaster-start.timer, the earliest possible warning.
+OnCalendar=Mon-Fri 07:50 America/New_York
+# 09:35 — market is open and there are still 25 min to fix things before the
+# 10:00 ET condor entry, which is the window that was silently lost on 09-23.
+OnCalendar=Mon-Fri 09:35 America/New_York
+# No Persistent= on purpose: a watchdog that fires hours late on boot-catchup
+# reports stale state and trains you to ignore it.
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=TradeMaster daemon watchdog — alert #logs when the daemon is not running
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/moazzam/ai-trading-assistant
+ExecStart=/home/moazzam/ai-trading-assistant/.venv/bin/python scripts/daemon_watchdog.py --post
+# The watchdog reports failure via exit 1; that is data, not a unit failure.
+SuccessExitStatus=0 1
