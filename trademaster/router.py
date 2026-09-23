@@ -48,36 +48,31 @@ class TaskType(StrEnum):
     DIRECTIONAL_ENTRY = "directional_entry"
 
 
+# 2026-09-22: ALL Anthropic/Claude routes REMOVED — the daemon must never call the
+# Claude API (user's Anthropic credits were being drained + account disabled; the
+# daemon itself was negligible at $0.0021/10d, but this makes it impossible). The
+# condor is deterministic (no LLM at all); the remaining LLM tasks (premarket briefing,
+# directional signals, equity scanner) now run on DeepSeek primary + Gemini fallback.
+# To restore Claude on any task, point it back at ("anthropic", "claude-…").
 MODEL_MAP: dict[TaskType, tuple[str, str]] = {
-    TaskType.ORCHESTRATE: ("anthropic", "claude-opus-4-7"),
-    # Primary swapped google→anthropic 2026-06-24: Gemini 2.5 Pro 503'd at ~8 AM
-    # ET three mornings straight (sustained "high demand"), failing the briefing
-    # daily. Claude Sonnet is reliable for this once-daily long-form synthesis;
-    # Gemini is now the fallback. Pair with the long timeout in premarket.py.
-    TaskType.PRE_MARKET_RESEARCH: ("anthropic", "claude-sonnet-4-6"),
+    TaskType.ORCHESTRATE: ("deepseek", "deepseek-v4-pro"),
+    TaskType.PRE_MARKET_RESEARCH: ("deepseek", "deepseek-v4-pro"),
     TaskType.INTRADAY_SCAN: ("deepseek", "deepseek-v4-flash"),
-    # Directional ENTRY runs on Sonnet 4.6 (2026-06-15). To revert to the prior
-    # config, change this one line back to ("deepseek", "deepseek-v4-flash").
-    TaskType.DIRECTIONAL_ENTRY: ("anthropic", "claude-sonnet-4-6"),
+    TaskType.DIRECTIONAL_ENTRY: ("deepseek", "deepseek-v4-flash"),
     TaskType.FORMAT_ALERT: ("deepseek", "deepseek-v4-flash"),
     TaskType.OPTIONS_STRATEGY: ("deepseek", "deepseek-v4-pro"),
     TaskType.CRYPTO_REGIME: ("deepseek", "deepseek-v4-pro"),
-    TaskType.EXECUTION_DECISION: ("anthropic", "claude-opus-4-7"),
-    TaskType.EXIT_DECISION: ("anthropic", "claude-sonnet-4-6"),
+    TaskType.EXECUTION_DECISION: ("deepseek", "deepseek-v4-pro"),
+    TaskType.EXIT_DECISION: ("deepseek", "deepseek-v4-flash"),
 }
 
-# Fallback providers used when the primary raises ProviderError (timeout, 5xx).
-# Only defined for tasks where missing a scan has real cost — not for
-# low-stakes formatting tasks.
+# Fallback providers when the primary raises ProviderError (timeout, 5xx). Cross-
+# provider to Gemini (NOT Anthropic) so an outage doesn't blind a scan AND Claude is
+# never called.
 FALLBACK_MAP: dict[TaskType, tuple[str, str]] = {
-    TaskType.INTRADAY_SCAN: ("anthropic", "claude-haiku-4-5-20251001"),
-    # Entry runs on Sonnet (Anthropic); fall back cross-provider to the prior
-    # entry model so an Anthropic outage doesn't blind the entry scan.
-    TaskType.DIRECTIONAL_ENTRY: ("deepseek", "deepseek-v4-flash"),
-    TaskType.OPTIONS_STRATEGY: ("anthropic", "claude-haiku-4-5-20251001"),
-    # Premarket fires once at 8 AM ET — no fallback means a missed briefing for
-    # the whole day. Gemini is the fallback now that Anthropic is primary (swap
-    # of 2026-06-24); if Anthropic is down, Gemini still produces the briefing.
+    TaskType.INTRADAY_SCAN: ("google", "gemini-2.5-pro"),
+    TaskType.DIRECTIONAL_ENTRY: ("google", "gemini-2.5-pro"),
+    TaskType.OPTIONS_STRATEGY: ("google", "gemini-2.5-pro"),
     TaskType.PRE_MARKET_RESEARCH: ("google", "gemini-2.5-pro"),
 }
 

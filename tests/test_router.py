@@ -61,18 +61,18 @@ async def test_dispatches_to_correct_provider_for_each_task(monkeypatch, session
         router.TaskType.INTRADAY_SCAN, "p", session_factory=session_factory
     )
 
-    assert ("anthropic", "claude-opus-4-7") in calls
-    # PRE_MARKET_RESEARCH primary swapped google→anthropic 2026-06-24 (Gemini
-    # 503'd daily at 8 AM); Gemini is now its fallback.
-    assert ("anthropic", "claude-sonnet-4-6") in calls
+    # 2026-09-22: all Claude/Anthropic routes removed (daemon must never call Claude).
+    # ORCHESTRATE + PRE_MARKET_RESEARCH now route to DeepSeek pro; INTRADAY_SCAN flash.
+    assert ("deepseek", "deepseek-v4-pro") in calls
     assert ("deepseek", "deepseek-v4-flash") in calls
+    assert not any(p == "anthropic" for p, _ in calls)  # Claude never called
 
 
 async def test_agent_run_row_written_on_success(monkeypatch, session_factory):
     async def fake(prompt, *, model, **_):
-        return _ok_response("anthropic", model)
+        return _ok_response("deepseek", model)
 
-    monkeypatch.setitem(router._DISPATCH, "anthropic", fake)
+    monkeypatch.setitem(router._DISPATCH, "deepseek", fake)
 
     await router.route_to_model(
         router.TaskType.ORCHESTRATE, "p", session_factory=session_factory
@@ -82,8 +82,8 @@ async def test_agent_run_row_written_on_success(monkeypatch, session_factory):
         rows = s.query(AgentRun).all()
         assert len(rows) == 1
         row = rows[0]
-        assert row.provider == "anthropic"
-        assert row.model == "claude-opus-4-7"
+        assert row.provider == "deepseek"
+        assert row.model == "deepseek-v4-pro"
         assert row.input_tokens == 100
         assert row.output_tokens == 50
         assert row.cost_usd == Decimal("0.01")
@@ -95,7 +95,7 @@ async def test_agent_run_row_written_on_failure(monkeypatch, session_factory):
     async def fake(prompt, *, model, **_):
         raise AuthError("bad key")
 
-    monkeypatch.setitem(router._DISPATCH, "anthropic", fake)
+    monkeypatch.setitem(router._DISPATCH, "deepseek", fake)
 
     with pytest.raises(AuthError):
         await router.route_to_model(
@@ -157,9 +157,9 @@ async def test_bypass_budget_allows_call_over_cap(monkeypatch, session_factory):
         s.commit()
 
     async def fake(prompt, *, model, **_):
-        return _ok_response("anthropic", model)
+        return _ok_response("deepseek", model)
 
-    monkeypatch.setitem(router._DISPATCH, "anthropic", fake)
+    monkeypatch.setitem(router._DISPATCH, "deepseek", fake)
 
     resp = await router.route_to_model(
         router.TaskType.ORCHESTRATE,
