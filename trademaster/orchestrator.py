@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import signal as _signal
+from pathlib import Path
 
 from integrations.discord_bot import TradeMasterBot
 from trademaster.config import get_settings
@@ -34,8 +35,70 @@ from trademaster.scheduler import (
     run_iron_condor_once,
     run_premarket_once,
 )
+from trademaster.timeutils import now_et, to_et
 
 log = get_logger(__name__)
+
+
+def _git_revision() -> str:
+    """Short SHA of the deployed tree, or '?' if git isn't available."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return out.stdout.strip() or "?"
+    except Exception:  # pragma: no cover - diagnostics only
+        return "?"
+
+
+def build_startup_heartbeat(settings, scheduler=None, now=None) -> str:
+    """The '#logs' message proving which stack actually booted.
+
+    Every line is config that has silently diverged from intent before, so the
+    heartbeat is the at-a-glance diff against what you *think* is deployed.
+    """
+    stamp = to_et(now) if now is not None else now_et()
+
+    def _flag(on: bool) -> str:
+        return "✅" if on else "❌"
+
+    mode = settings.trading_mode.upper()
+    icon = "🔴" if settings.trading_mode == "live" else "🟢"
+
+    lines = [
+        f"{icon} **TradeMaster started** — `{mode}` · {stamp:%Y-%m-%d %H:%M ET}"
+        f" · commit `{_git_revision()}`",
+        f"**Account** {settings.account_type} · capital "
+        f"${settings.trading_capital_usd:,.0f} · condor {settings.condor_contracts}ct",
+        f"**Condor** dist-aware stop {_flag(settings.condor_distance_aware_stop)}"
+        f" · assignment close {_flag(settings.condor_assignment_close)}"
+        f" · single-leg stop {_flag(settings.condor_stop_single_leg)}"
+        f" · event blackout {_flag(settings.enable_event_blackout)}",
+        f"**Feed** options={settings.alpaca_options_feed}"
+        f" · **Directional** "
+        + (
+            "signals-only"
+            if settings.directional_signals_only
+            else ("trading" if settings.enable_directional else "off")
+        ),
+    ]
+
+    if scheduler is not None:
+        job = scheduler.get_job("iron_condor_entry")
+        nxt = getattr(job, "next_run_time", None) if job else None
+        lines.append(
+            f"**Next condor entry** {to_et(nxt):%a %Y-%m-%d %H:%M ET}"
+            if nxt
+            else "**Next condor entry** ⚠️ not scheduled"
+        )
+
+    return "\n".join(lines)
 
 
 async def _run() -> None:
@@ -85,6 +148,14 @@ async def _run() -> None:
             log.info("directional_engine_disabled")
 
         log.info("trademaster_started", trading_mode=settings.trading_mode)
+
+        # Startup heartbeat to #logs. A cold-start failure is otherwise
+        # indistinguishable from a quiet day (09-23: 447 silent crash-loops
+        # through the morning). Never let a bad heartbeat take down the daemon.
+        try:
+            await bot.post_log(build_startup_heartbeat(settings, scheduler))
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            log.warning("startup_heartbeat_failed", error=str(exc))
 
         stop = asyncio.Event()
 
