@@ -111,9 +111,25 @@ def test_require_live_keys_lists_missing(monkeypatch, tmp_path):
     msg = str(exc.value)
     for key in (
         "ALPACA_API_KEY",
-        "ANTHROPIC_API_KEY",
         "DEEPSEEK_API_KEY",
         "GOOGLE_API_KEY",
         "DISCORD_BOT_TOKEN",
     ):
         assert key in msg
+
+
+def test_require_live_keys_does_not_need_anthropic(monkeypatch, tmp_path):
+    """The daemon routes to DeepSeek/Gemini only, so a blank ANTHROPIC_API_KEY
+    must not block startup (regression: crash-loop on 2026-09-23)."""
+    monkeypatch.chdir(tmp_path)
+    cfg = _fresh_settings(
+        monkeypatch,
+        ALPACA_API_KEY="k",
+        ALPACA_API_SECRET="s",
+        DEEPSEEK_API_KEY="d",
+        GOOGLE_API_KEY="g",
+        DISCORD_BOT_TOKEN="t",
+    )
+    s = cfg.get_settings()
+    assert not s.anthropic_api_key.get_secret_value()
+    s.require_live_keys()  # must not raise

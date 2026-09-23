@@ -376,7 +376,6 @@ class Settings(BaseSettings):
             for name, value in {
                 "ALPACA_API_KEY": self.alpaca_api_key,
                 "ALPACA_API_SECRET": self.alpaca_api_secret,
-                "ANTHROPIC_API_KEY": self.anthropic_api_key,
                 "DEEPSEEK_API_KEY": self.deepseek_api_key,
                 "GOOGLE_API_KEY": self.google_api_key,
                 "DISCORD_BOT_TOKEN": self.discord_bot_token,
