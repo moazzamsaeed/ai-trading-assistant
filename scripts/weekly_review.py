@@ -2,7 +2,7 @@
 """Generate the TradeMaster weekly strategy review.
 
 Reads trades from the SQLite DB, the strategy KB, and the last 4 prior
-reviews, then asks Claude Sonnet 4.6 to synthesize a markdown review and
+reviews, then asks DeepSeek (REVIEW_MODEL) to synthesize a markdown review and
 propose KB edits. Output is saved as `data/reviews/YYYY-Www.md` (ISO week).
 
 KB edits are PROPOSED in the review — never auto-applied. Human decides.
@@ -31,6 +31,16 @@ DB = PROJECT_ROOT / "data" / "trademaster.db"
 KB = PROJECT_ROOT / "data" / "strategy_kb.md"
 REVIEWS_DIR = PROJECT_ROOT / "data" / "reviews"
 ET = ZoneInfo("America/New_York")
+
+# Long-form synthesis model. Swap to google_client + "gemini-2.5-pro" here if
+# DeepSeek's reasoning proves thin for this job — the two clients share a
+# `complete()` signature, so it is a one-line change.
+REVIEW_MODEL = "deepseek-v4-pro"
+
+# v4-pro is a REASONING model: max_tokens covers chain-of-thought *and* the
+# answer. At the old Anthropic budget of 8192 the whole allowance went to
+# reasoning and the review came back empty, so this must stay generous.
+REVIEW_MAX_TOKENS = 32000
 
 
 def compute_week_range(offset: int) -> tuple[datetime, datetime, str]:
@@ -303,38 +313,32 @@ async def main() -> int:
         print(prompt)
         return 0
 
-    # Direct SDK call (not the shared trademaster.llm client, which has a 30s
-    # timeout suited to trading-path decisions). Long-form synthesis needs
-    # streaming per Anthropic's docs.
-    import anthropic
+    # Routed through the shared llm client, which takes an explicit timeout_s —
+    # the old direct-SDK call predated that parameter and only existed to escape
+    # the 30s trading-path default. The shared client also brings retries, typed
+    # errors and real per-model costing.
+    from trademaster.llm import deepseek_client
 
-    from trademaster.config import get_settings
+    print(f"[weekly_review] calling {REVIEW_MODEL}...", file=sys.stderr)
+    resp = await deepseek_client.complete(
+        prompt, model=REVIEW_MODEL, max_tokens=REVIEW_MAX_TOKENS, timeout_s=600.0
+    )
 
-    api_key = get_settings().anthropic_api_key.get_secret_value()
-    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=600.0)
-
-    print("[weekly_review] calling claude-sonnet-4-6 (streaming)...", file=sys.stderr)
-    chunks: list[str] = []
-    input_tokens = 0
-    output_tokens = 0
-    async with client.messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        async for text in stream.text_stream:
-            chunks.append(text)
-        final = await stream.get_final_message()
-        input_tokens = final.usage.input_tokens
-        output_tokens = final.usage.output_tokens
-
-    text = "".join(chunks)
-    # Sonnet 4.6 pricing: $3/MTok input, $15/MTok output
-    cost = (input_tokens * 3 + output_tokens * 15) / 1_000_000
+    text = resp.text
     print(
-        f"[weekly_review] ok in={input_tokens} out={output_tokens} cost=${cost:.4f}",
+        f"[weekly_review] ok in={resp.input_tokens} out={resp.output_tokens} "
+        f"cost=${float(resp.cost_usd):.4f}",
         file=sys.stderr,
     )
+    # A reasoning model that spends its whole budget thinking returns empty
+    # content. Fail loudly instead of writing a 0-byte review nobody notices.
+    if not text.strip():
+        print(
+            f"[weekly_review] ERROR: empty response ({resp.output_tokens} output "
+            f"tokens, all reasoning). Raise REVIEW_MAX_TOKENS.",
+            file=sys.stderr,
+        )
+        return 1
 
     REVIEWS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = REVIEWS_DIR / f"{week_label}.md"

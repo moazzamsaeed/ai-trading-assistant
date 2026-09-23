@@ -3,7 +3,7 @@
 
 The weekly review (scripts/weekly_review.py) summarises *one week* of trades.
 This engine is the complement: it takes the standing **hypotheses** in
-`data/strategy_kb.md` and, for each, gathers evidence and asks Claude Sonnet 4.6
+`data/strategy_kb.md` and, for each, gathers evidence and asks DeepSeek
 to issue a verdict against that hypothesis's own "disproves if" criterion, then
 proposes a specific KB edit. Like the weekly review, edits are PROPOSED only —
 the human applies them.
@@ -42,6 +42,12 @@ DB = PROJECT_ROOT / "data" / "trademaster.db"
 KB = PROJECT_ROOT / "data" / "strategy_kb.md"
 OUT_DIR = PROJECT_ROOT / "data" / "hypotheses"
 ET = ZoneInfo("America/New_York")
+
+# Long-form synthesis model — see the matching notes in weekly_review.py.
+# v4-pro is a REASONING model: max_tokens covers chain-of-thought *and* the
+# answer, so the budget must stay well above the old 8192 or the report is empty.
+REVIEW_MODEL = "deepseek-v4-pro"
+REVIEW_MAX_TOKENS = 32000
 
 # The I7 indicator-bootstrap fix (commit 9c7d621). The KB says H4 is "un-tested"
 # before this — trades opened earlier ran on silently-broken indicators.
@@ -457,33 +463,26 @@ async def main() -> int:
         print(prompt)
         return 0
 
-    # Direct SDK streaming call — same pattern as weekly_review.py (the shared
-    # trademaster.llm client has a 30s trading-path timeout, too short for synthesis).
-    import anthropic
+    # Shared llm client — same pattern as weekly_review.py. It accepts an
+    # explicit timeout_s, which is what the old direct-SDK call was working
+    # around, and adds retries, typed errors and real per-model costing.
+    from trademaster.llm import deepseek_client
 
-    from trademaster.config import get_settings
+    print(f"[hypothesis_review] calling {REVIEW_MODEL}...", file=sys.stderr)
+    resp = await deepseek_client.complete(
+        prompt, model=REVIEW_MODEL, max_tokens=REVIEW_MAX_TOKENS, timeout_s=600.0
+    )
 
-    api_key = get_settings().anthropic_api_key.get_secret_value()
-    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=600.0)
-
-    print("[hypothesis_review] calling claude-sonnet-4-6 (streaming)...", file=sys.stderr)
-    chunks: list[str] = []
-    input_tokens = output_tokens = 0
-    async with client.messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        async for text in stream.text_stream:
-            chunks.append(text)
-        final = await stream.get_final_message()
-        input_tokens = final.usage.input_tokens
-        output_tokens = final.usage.output_tokens
-
-    report = "".join(chunks)
-    cost = (input_tokens * 3 + output_tokens * 15) / 1_000_000  # Sonnet 4.6 pricing
-    print(f"[hypothesis_review] ok in={input_tokens} out={output_tokens} cost=${cost:.4f}",
+    report = resp.text
+    print(f"[hypothesis_review] ok in={resp.input_tokens} out={resp.output_tokens} "
+          f"cost=${float(resp.cost_usd):.4f}",
           file=sys.stderr)
+    # Reasoning model: an all-reasoning response yields empty content. Fail
+    # loudly rather than writing a 0-byte report.
+    if not report.strip():
+        print(f"[hypothesis_review] ERROR: empty response ({resp.output_tokens} output "
+              f"tokens, all reasoning). Raise REVIEW_MAX_TOKENS.", file=sys.stderr)
+        return 1
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUT_DIR / f"{today}.md"

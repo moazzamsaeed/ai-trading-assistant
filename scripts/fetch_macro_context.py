@@ -3,7 +3,7 @@
 
 Searches the last 30 minutes (but falls back to 2 hours if sparse)
 for headlines related to: Trump, tariffs, China, Fed, CPI, macro.
-Uses Claude/Anthropic to distill into ≤8 actionable headlines.
+Uses DeepSeek (HEADLINE_MODEL) to distill into ≤8 actionable headlines.
 """
 
 from __future__ import annotations
@@ -24,6 +24,11 @@ from integrations.alpaca_client import (
     _client as alpaca_news_client,
 )
 from trademaster.config import get_settings
+from trademaster.llm import deepseek_client
+
+# Cheap, high-volume extraction — the flash tier is the right fit for turning
+# news text into a JSON array.
+HEADLINE_MODEL = "deepseek-v4-flash"
 
 try:
     from alpaca.data.requests import NewsRequest
@@ -104,13 +109,8 @@ def format_articles_for_llm(articles: list[NewsArticle]) -> str:
     return "\n".join(lines)
 
 
-def call_anthropic_for_headlines(news_block: str, now_iso: str) -> list[str]:
-    """Use Anthropic to distill headlines into ≤8 actionable one-liners."""
-    import anthropic
-
-    settings = get_settings()
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
-
+def call_llm_for_headlines(news_block: str, now_iso: str) -> list[str]:
+    """Distill headlines into ≤8 actionable one-liners."""
     prompt = f"""You are a macro news analyst for an options trading desk. Current time: {now_iso}.
 
 Below are recent news articles (last 30-120 minutes). Your job:
@@ -130,14 +130,14 @@ Respond with ONLY a JSON array of strings (the headlines), no explanation, no ma
 If nothing significant: []
 """
 
-    msg = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
+    # Sync script, no running loop — asyncio.run is safe here.
+    resp = asyncio.run(
+        deepseek_client.complete(
+            prompt, model=HEADLINE_MODEL, max_tokens=1024, timeout_s=60.0
+        )
     )
 
-    block = msg.content[0]
-    text = (block.text if hasattr(block, "text") else str(block)).strip()
+    text = resp.text.strip()
     # Extract JSON array from response
     start_idx = text.find("[")
     end_idx = text.rfind("]") + 1
@@ -184,11 +184,11 @@ def main():
         headlines = []
     else:
         news_block = format_articles_for_llm(unique_articles)
-        print("  Calling Claude to distill headlines...")
+        print(f"  Calling {HEADLINE_MODEL} to distill headlines...")
         try:
-            headlines = call_anthropic_for_headlines(news_block, now_iso)
+            headlines = call_llm_for_headlines(news_block, now_iso)
         except Exception as e:
-            print(f"  ERROR calling Claude: {e}")
+            print(f"  ERROR calling {HEADLINE_MODEL}: {e}")
             # Fall back: use raw headlines
             headlines = []
             for a in unique_articles[:8]:
