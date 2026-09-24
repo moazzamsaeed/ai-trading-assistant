@@ -149,11 +149,16 @@ async def _run() -> None:
 
         log.info("trademaster_started", trading_mode=settings.trading_mode)
 
-        # Startup heartbeat to #logs. A cold-start failure is otherwise
-        # indistinguishable from a quiet day (09-23: 447 silent crash-loops
-        # through the morning). Never let a bad heartbeat take down the daemon.
+        # Startup heartbeat — journal only, NOT Discord. A good boot is the
+        # expected case and posting it every morning is noise; the watchdog
+        # (scripts/daemon_watchdog.py) is what speaks, and only on failure.
+        # Kept here because it records which config actually loaded, which is
+        # the thing you want in the journal when reconstructing a bad day.
         try:
-            await bot.post_log(build_startup_heartbeat(settings, scheduler))
+            log.info(
+                "startup_heartbeat",
+                heartbeat=build_startup_heartbeat(settings, scheduler),
+            )
         except Exception as exc:  # pragma: no cover - diagnostics only
             log.warning("startup_heartbeat_failed", error=str(exc))
 
