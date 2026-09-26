@@ -798,52 +798,61 @@ async def _condor_eod_logs_job(*, log_poster: Poster = _noop_poster) -> None:
 # ----------------- daily / weekly #trades summaries -----------------
 
 
+async def _settlement_spot(expiry_d) -> float | None:
+    """The ~4pm settlement price for an expiry day, for projecting an unbooked condor.
+
+    The day-end reports run ~16:05, when the DAILY bar isn't published yet, so use
+    the last intraday close. Fall back to the daily bar (a rare prior-day expiry,
+    or an evening re-run). Shared by the daily and weekly summaries so both project
+    an unsettled condor the same way instead of dropping it from the net.
+    """
+    from trademaster.reconciler import _underlying_close_on
+    from trademaster.timeutils import to_et
+
+    try:
+        bars = await alpaca_client.get_recent_bars("SPY", timeframe_minutes=5, limit=80)
+        if bars and to_et(bars[-1].timestamp).date() == expiry_d:
+            return float(bars[-1].close)
+    except Exception:  # noqa: BLE001 — projection is best-effort
+        pass
+    return await _underlying_close_on(expiry_d)
+
+
+async def _condor_outcomes(sf, *, start, end) -> list[dict]:
+    """Condor outcomes for a window, projecting any not yet booked by the reconciler."""
+    from datetime import date as _date
+
+    from trademaster.db import get_condor_trades
+    from trademaster.reporting import build_condor_outcome
+
+    outcomes = []
+    for c in get_condor_trades(sf, start=start, end=end):
+        spot = None
+        if c.get("closed_at") is None:  # held to expiry → project from the close
+            exp = c.get("expiry")
+            try:
+                d = (_date.fromisoformat(exp) if exp
+                     else (c["opened_at"].date() if c.get("opened_at") else None))
+            except (ValueError, TypeError):
+                d = None
+            if d is not None:
+                spot = await _settlement_spot(d)
+        outcomes.append(build_condor_outcome(c, spot))
+    return outcomes
+
+
 async def _daily_summary_job(*, trade_poster: Poster, log_poster: Poster = _noop_poster) -> None:
     """End-of-day breakdown → #trades: the day's closed directional trades PLUS any
     0DTE iron condor traded today. A condor held to expiry isn't booked until the
     next-morning reconcile, so we project its expiry outcome (read-only) instead of
     omitting it — the report reflects reality even when the credit lands tomorrow."""
     try:
-        from datetime import date as _date
-
-        from trademaster.db import (
-            day_bounds_utc, get_closed_directional_trades, get_condor_trades,
-        )
-        from trademaster.reconciler import _underlying_close_on
-        from trademaster.reporting import (
-            build_condor_outcome, format_condor_summary, format_trades_summary,
-        )
-        from trademaster.timeutils import to_et
+        from trademaster.db import day_bounds_utc, get_closed_directional_trades
+        from trademaster.reporting import format_condor_summary, format_trades_summary
         start, end = day_bounds_utc()
         sf = make_session_factory()
         trades = get_closed_directional_trades(sf, start=start, end=end)
-
-        async def _settlement_spot(expiry_d):
-            # The report runs ~16:05, when today's DAILY bar isn't published yet, so
-            # use the last intraday close as the ~4pm settlement. Fall back to the
-            # daily bar (for a rare prior-day expiry, or an evening re-run).
-            try:
-                bars = await alpaca_client.get_recent_bars(
-                    "SPY", timeframe_minutes=5, limit=80)
-                if bars and to_et(bars[-1].timestamp).date() == expiry_d:
-                    return float(bars[-1].close)
-            except Exception:  # noqa: BLE001 — projection is best-effort
-                pass
-            return await _underlying_close_on(expiry_d)
-
-        outcomes = []
-        for c in get_condor_trades(sf, start=start, end=end):
-            spot = None
-            if c.get("closed_at") is None:  # held to expiry → project from the close
-                exp = c.get("expiry")
-                try:
-                    d = (_date.fromisoformat(exp) if exp
-                         else (c["opened_at"].date() if c.get("opened_at") else None))
-                except (ValueError, TypeError):
-                    d = None
-                if d is not None:
-                    spot = await _settlement_spot(d)
-            outcomes.append(build_condor_outcome(c, spot))
+        outcomes = await _condor_outcomes(sf, start=start, end=end)
 
         parts = []
         if trades:
@@ -860,15 +869,34 @@ async def _daily_summary_job(*, trade_poster: Poster, log_poster: Poster = _noop
 
 
 async def _weekly_summary_job(*, trade_poster: Poster, log_poster: Poster = _noop_poster) -> None:
-    """Friday EOD tabular breakdown of the week's closed trades → #trades."""
+    """Friday EOD tabular breakdown of the week's closed trades → #trades.
+
+    Covers the condor as well as directional. It used to query directional ONLY,
+    so once directional went signals-only (2026-09-04) every Friday reported
+    "No trades" on weeks the condor actually traded — e.g. week of 09-21 posted
+    "No trades" against +$2,968 realized.
+    """
     try:
         from trademaster.db import get_closed_directional_trades, week_bounds_utc
-        from trademaster.reporting import format_trades_summary
+        from trademaster.reporting import format_condor_summary, format_trades_summary
         start, end = week_bounds_utc()
-        trades = get_closed_directional_trades(make_session_factory(), start=start, end=end)
+        sf = make_session_factory()
         period = f"week of {start.date().isoformat()}"
-        await trade_poster(format_trades_summary(
-            trades, title="Weekly Trade Summary", period=period))
+        trades = get_closed_directional_trades(sf, start=start, end=end)
+        outcomes = await _condor_outcomes(sf, start=start, end=end)
+
+        parts = []
+        if trades:
+            parts.append(format_trades_summary(
+                trades, title="Weekly Trade Summary", period=period))
+        if outcomes:
+            parts.append(format_condor_summary(outcomes, period=period))
+        if not parts:
+            # Unlike the daily job we do NOT go silent: a week with nothing at all
+            # means the daemon or the strategy was down, which is worth saying.
+            parts.append(format_trades_summary(
+                [], title="Weekly Trade Summary", period=period))
+        await trade_poster("\n\n".join(parts))
     except Exception as e:  # noqa: BLE001
         log.warning("weekly_summary_failed", error=str(e))
         await log_poster(f"⚠️ Weekly summary failed: `{type(e).__name__}: {e}`")
