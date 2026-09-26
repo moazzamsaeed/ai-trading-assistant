@@ -1524,3 +1524,72 @@ async def test_condor_settlement_job_failure_routes_to_logs(monkeypatch):
 
     await sch._condor_settlement_job(trade_poster=tr, log_poster=lg)
     assert len(logs) == 1 and "failed" in logs[0].lower()
+
+
+# ----------------- directional shutdown (2026-09-25) -----------------
+
+# The whole directional apparatus is off for good. These lock in that
+# ENABLE_DIRECTIONAL=false de-registers every directional job — including the
+# intraday scan and the exit/trailing monitors, which used to be registered
+# unconditionally — and that the condor is untouched by it.
+
+_DIRECTIONAL_JOBS = (
+    "directional_scan",
+    "shadow_score",
+    "shadow_score_force",
+    "directional_exit",
+    "directional_0dte_final_close",
+    "trailing_stop_tick",
+    "intraday_scan",
+)
+
+_CONDOR_JOBS = (
+    "iron_condor_entry",
+    "iron_condor_exit",
+    "iron_condor_force_close",
+    "condor_settlement",
+    "daily_trade_summary",
+    "weekly_trade_summary",
+)
+
+
+def _build(monkeypatch, *, directional: bool, equities: bool = False):
+    monkeypatch.setattr(sch.get_settings(), "enable_directional", directional)
+    monkeypatch.setattr(sch.get_settings(), "directional_signals_only", True)
+    monkeypatch.setattr(sch.get_settings(), "enable_equities_scanner", equities)
+    monkeypatch.setattr(sch.get_settings(), "enable_research", False)
+    return sch.make_scheduler(
+        research_poster=_noop_poster, signal_poster=_noop_poster,
+        trade_poster=_noop_poster, log_poster=_noop_poster,
+        stock_signal_poster=_noop_poster, enable_iron_condor=True,
+    )
+
+
+def test_directional_off_deregisters_every_directional_job(monkeypatch):
+    scheduler = _build(monkeypatch, directional=False)
+    ids = {j.id for j in scheduler.get_jobs()}
+    still_there = sorted(ids & set(_DIRECTIONAL_JOBS))
+    assert not still_there, f"directional jobs survived the shutdown: {still_there}"
+
+
+def test_directional_off_leaves_the_condor_intact(monkeypatch):
+    """The shutdown must not touch the strategy that actually trades."""
+    scheduler = _build(monkeypatch, directional=False)
+    ids = {j.id for j in scheduler.get_jobs()}
+    missing = sorted(set(_CONDOR_JOBS) - ids)
+    assert not missing, f"condor/reporting jobs lost: {missing}"
+
+
+def test_directional_on_restores_the_whole_apparatus(monkeypatch):
+    """Flipping the flag back must bring the engine AND its exits back together."""
+    scheduler = _build(monkeypatch, directional=True)
+    ids = {j.id for j in scheduler.get_jobs()}
+    missing = sorted(set(_DIRECTIONAL_JOBS) - ids)
+    assert not missing, f"re-enable path is broken, missing: {missing}"
+
+
+def test_equities_scanner_follows_its_own_flag(monkeypatch):
+    off = {j.id for j in _build(monkeypatch, directional=False, equities=False).get_jobs()}
+    assert "equities_scan" not in off
+    on = {j.id for j in _build(monkeypatch, directional=False, equities=True).get_jobs()}
+    assert "equities_scan" in on

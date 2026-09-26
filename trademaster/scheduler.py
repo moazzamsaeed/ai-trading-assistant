@@ -1173,6 +1173,13 @@ def make_scheduler(
     # Discord. The condor jobs below keep the real posters. #logs (errors + condor
     # EOD) is always kept. Reversible via the config flag; no code change.
     _condor_only = get_settings().condor_alerts_only
+    # Master switch for the whole directional apparatus: the scan, the shadow
+    # scorer, the intraday manual-signal scan, and the exit/trailing monitors.
+    # The exits used to be registered unconditionally as a safety net for open
+    # positions, but they are gated on the same flag now — with the engine off
+    # nothing can open, so there is nothing to close, and flipping the flag back
+    # on restores the engine and its exits together.
+    _directional_on = get_settings().enable_directional
     nc_signal = _noop_poster if _condor_only else signal_poster
     nc_trade = _noop_poster if _condor_only else trade_poster
     nc_research = _noop_poster if _condor_only else research_poster
@@ -1194,28 +1201,29 @@ def make_scheduler(
 
     # RTH is 9:30-16:00 ET. The cron fires every 15 min from 9:00-15:45 to
     # be permissive; the in-job Alpaca clock check is authoritative for
-    # holidays and early-close days.
-    scheduler.add_job(
-        _intraday_scan_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="9-15",
-            minute="0,15,30,45",
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={"signal_poster": nc_signal, "log_poster": log_post},
-        id="intraday_scan",
-        replace_existing=True,
-        misfire_grace_time=120,
-    )
+    # holidays and early-close days. Part of the directional apparatus (it
+    # produces manual SPY call/put signals), so it follows the same flag.
+    if _directional_on:
+        scheduler.add_job(
+            _intraday_scan_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-15",
+                minute="0,15,30,45",
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={"signal_poster": nc_signal, "log_poster": log_post},
+            id="intraday_scan",
+            replace_existing=True,
+            misfire_grace_time=120,
+        )
 
     # Directional fallback scan — every 15 min during RTH.
     # Real-time triggers come from the WebSocket stream (alpaca_stream.py).
     # This fallback catches slow-building setups and guards against stream gaps.
     # SPY 0DTE timing is critical — 15 min ensures no setup is missed between surges.
-    # Suppressed entirely when the directional engine is disabled (condor-only mode);
-    # the directional EXIT job below is always registered so open positions still close.
-    if get_settings().enable_directional:
+    # Suppressed entirely when the directional engine is disabled (condor-only mode).
+    if _directional_on:
         scheduler.add_job(
             _directional_scan_job,
             CronTrigger(
@@ -1296,47 +1304,48 @@ def make_scheduler(
     # The 30-sec trailing_stop_tick still handles mechanical stops/scale-outs
     # between these LLM passes. coalesce + max_instances guard against a slow
     # LLM run overlapping the next minute.
-    scheduler.add_job(
-        _directional_exit_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="9-15",
-            minute="*",
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={
-            "signal_poster": nc_signal,
-            "trade_poster": nc_trade,
-            "log_poster": log_post,
-        },
-        id="directional_exit",
-        replace_existing=True,
-        misfire_grace_time=60,
-        max_instances=2,
-        coalesce=True,
-    )
+    if _directional_on:
+        scheduler.add_job(
+            _directional_exit_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-15",
+                minute="*",
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={
+                "signal_poster": nc_signal,
+                "trade_poster": nc_trade,
+                "log_poster": log_post,
+            },
+            id="directional_exit",
+            replace_existing=True,
+            misfire_grace_time=60,
+            max_instances=2,
+            coalesce=True,
+        )
 
-    # Safety net: re-run at 15:50 ET so any 0DTE position that failed to close
-    # at 15:45 gets one final attempt. force=False — market is still open at
-    # 15:50 so clock check passes, and per-trade expiry==today guard still
-    # applies so weekly positions are never touched.
-    scheduler.add_job(
-        _directional_exit_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour=15,
-            minute=50,
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={
-            "signal_poster": nc_signal,
-            "trade_poster": nc_trade,
-            "log_poster": log_post,
-        },
-        id="directional_0dte_final_close",
-        replace_existing=True,
-        misfire_grace_time=120,
-    )
+        # Safety net: re-run at 15:50 ET so any 0DTE position that failed to close
+        # at 15:45 gets one final attempt. force=False — market is still open at
+        # 15:50 so clock check passes, and per-trade expiry==today guard still
+        # applies so weekly positions are never touched.
+        scheduler.add_job(
+            _directional_exit_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=15,
+                minute=50,
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={
+                "signal_poster": nc_signal,
+                "trade_poster": nc_trade,
+                "log_poster": log_post,
+            },
+            id="directional_0dte_final_close",
+            replace_existing=True,
+            misfire_grace_time=120,
+        )
 
     # End-of-day trade health check — 16:15 ET Mon-Fri, after the 16:00 close
     # so closed_at and final extra fields are persisted. Scans trades closed
@@ -1403,26 +1412,29 @@ def make_scheduler(
 
     # Fast trailing stop tick — every 30 sec during RTH for 0DTE responsiveness.
     # Lightweight: no indicators, no LLM. Just peak update, scale-out, hard stop.
-    scheduler.add_job(
-        _trailing_stop_tick_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="9-15",
-            minute="*",
-            second="0,30",
-            timezone=PREMARKET_TZ,
-        ),
-        kwargs={
-            "signal_poster": nc_signal,
-            "trade_poster": nc_trade,
-            "log_poster": log_post,
-        },
-        id="trailing_stop_tick",
-        replace_existing=True,
-        misfire_grace_time=15,
-        max_instances=2,  # tolerate a slow tick without blocking the next
-        coalesce=True,    # collapse missed firings on restart
-    )
+    # Directional-only (the condor has its own exit monitor), so it follows the
+    # same flag — otherwise it wakes twice a minute all session to do nothing.
+    if _directional_on:
+        scheduler.add_job(
+            _trailing_stop_tick_job,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-15",
+                minute="*",
+                second="0,30",
+                timezone=PREMARKET_TZ,
+            ),
+            kwargs={
+                "signal_poster": nc_signal,
+                "trade_poster": nc_trade,
+                "log_poster": log_post,
+            },
+            id="trailing_stop_tick",
+            replace_existing=True,
+            misfire_grace_time=15,
+            max_instances=2,  # tolerate a slow tick without blocking the next
+            coalesce=True,    # collapse missed firings on restart
+        )
 
     if enable_iron_condor:
         # Condor entry: 10:00 ET Mon-Fri — matches the validated backtest entry
