@@ -2,6 +2,11 @@
 .env
 .env.local
 .env.*.local
+# Any .env copy, however suffixed — a hand-made backup like .env.bak-20260925
+# is a full credential dump and was NOT matched by the patterns above.
+.env*
+# ...except the committed template, which carries no real values.
+!.env.example
 *.key
 *.pem
 
