@@ -55,7 +55,7 @@ from trademaster.capital import (
 )
 from trademaster.config import get_settings
 from trademaster.db import get_today_realized_pnl, get_this_week_realized_pnl, get_today_trade_count, get_today_trade_count_by_conviction, get_today_directional_streak, get_today_failed_breakouts, make_session_factory
-from trademaster.event_calendar import is_blackout_day
+from trademaster.event_calendar import coverage_end, coverage_gaps, is_blackout_day
 from trademaster.logging import get_logger
 from trademaster.state import get_state
 from trademaster.timeutils import today_et, to_et
@@ -930,6 +930,21 @@ async def _iron_condor_entry_job(
     # covered by the scan's check, so it traded 2026-09-16 FOMC despite the blackout).
     # Distinct event name so a condor skip is unambiguous in the journal.
     if settings.enable_event_blackout:
+        # The calendar is hand-maintained and ends at a fixed date. Past that it
+        # returns None for every day, so the blackout reads as ON while doing
+        # nothing — the same silent shape as the 09-16 FOMC miss. Say so daily.
+        gaps = coverage_gaps(today_et())
+        if gaps:
+            detail = ", ".join(f"**{n}** (last {d:%Y-%m-%d})" for n, d in gaps)
+            log.error(
+                "event_blackout_calendar_expired",
+                lapsed=[n for n, _ in gaps], coverage_end=str(coverage_end()),
+            )
+            await log_poster(
+                f"⚠️ **Event blackout is ENABLED but its calendar has RUN OUT** for: "
+                f"{detail}. Those days are **no longer being skipped** — add the new "
+                f"dates to `_BLACKOUT_DATES` in trademaster/event_calendar.py."
+            )
         blackout_event = is_blackout_day(today_et())
         if blackout_event:
             log.info("condor_entry_skipped_event_blackout", blackout=blackout_event)

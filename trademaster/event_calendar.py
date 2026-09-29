@@ -57,6 +57,25 @@ _BLACKOUT_DATES: dict[date, str] = {
     date(2026, 10, 2): "NFP Release",
     date(2026, 11, 6): "NFP Release",
     date(2026, 12, 4): "NFP Release",
+
+    # --- 2027 ---
+    # FOMC decision days (the SECOND day of each two-day meeting, 2 PM ET
+    # statement). Source: Fed press release 2025-09-05, "FOMC announces its
+    # tentative meeting schedule for 2027". Tentative — re-verify during 2027.
+    date(2027, 1, 27): "FOMC Decision",
+    date(2027, 3, 17): "FOMC Decision",
+    date(2027, 4, 28): "FOMC Decision",
+    date(2027, 6, 9): "FOMC Decision",
+    date(2027, 7, 28): "FOMC Decision",
+    date(2027, 9, 15): "FOMC Decision",
+    date(2027, 10, 27): "FOMC Decision",
+    date(2027, 12, 8): "FOMC Decision",
+    # ⚠️ 2027 CPI and NFP dates are deliberately NOT here: as of 2026-09-29 the
+    # BLS has only published through Dec 2026. They are NOT derivable — the
+    # "first Friday" rule fails for NFP in practice (2026 has Jan 9 and Jul 10,
+    # both SECOND Fridays). Fill them from bls.gov/schedule/news_release once
+    # BLS publishes 2027. coverage_gaps() flags CPI/NFP as lapsed after
+    # 2026-12-10 / 2026-12-04 so this cannot go unnoticed.
 }
 
 
@@ -71,6 +90,47 @@ def is_blackout_day(today: date | None = None) -> str | None:
 def all_blackout_dates() -> dict[date, str]:
     """Return a copy of the full blackout calendar."""
     return dict(_BLACKOUT_DATES)
+
+
+def coverage_end_by_event() -> dict[str, date]:
+    """Last known date for EACH event type (FOMC / CPI / NFP separately).
+
+    Per-type on purpose. The types are published by different bodies on
+    different horizons — the Fed announces FOMC more than a year ahead while
+    BLS publishes CPI/NFP roughly a year out — so a plain max() over the whole
+    calendar reports healthy coverage off whichever type reaches furthest while
+    the others have quietly run out.
+    """
+    out: dict[str, date] = {}
+    for d, name in _BLACKOUT_DATES.items():
+        if name not in out or d > out[name]:
+            out[name] = d
+    return out
+
+
+def coverage_end() -> date:
+    """The date the calendar stops being COMPLETE — the earliest per-type end."""
+    return min(coverage_end_by_event().values())
+
+
+def coverage_gaps(today: date | None = None) -> list[tuple[str, date]]:
+    """Event types whose calendar has run out, as (name, last known date).
+
+    The calendar is hand-maintained. Past a type's last entry `is_blackout_day`
+    quietly returns None for every one of its days, so the blackout reads as ON
+    while doing nothing — the same silent-failure shape that let the condor
+    trade FOMC on 2026-09-16 for -$6,020. Callers must surface this rather than
+    trust the enabled flag.
+    """
+    if today is None:
+        from trademaster.timeutils import today_et
+        today = today_et()
+    return sorted((n, d) for n, d in coverage_end_by_event().items() if today > d)
+
+
+def coverage_expired(today: date | None = None) -> bool:
+    """True once ANY event type's calendar has run out."""
+    return bool(coverage_gaps(today))
 
 
 def upcoming_events(today: date | None = None, days: int = 10) -> list[tuple[date, str]]:
