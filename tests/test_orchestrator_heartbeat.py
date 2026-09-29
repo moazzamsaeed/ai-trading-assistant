@@ -90,5 +90,20 @@ def test_heartbeat_reports_directional_states():
     trading = build_startup_heartbeat(
         _settings(directional_signals_only=False, enable_directional=True), now=NOW
     )
+    signals = build_startup_heartbeat(
+        _settings(directional_signals_only=True, enable_directional=True), now=NOW
+    )
     assert "**Directional** off" in off
     assert "**Directional** trading" in trading
+    assert "**Directional** signals-only" in signals
+
+
+def test_disabled_engine_reports_off_even_with_signals_only_set():
+    """enable_directional is the master switch. DIRECTIONAL_SIGNALS_ONLY is left
+    true in .env as a historical record, so a heartbeat that checked it first
+    reported a fully-disabled engine as 'signals-only' (seen live 2026-09-29)."""
+    msg = build_startup_heartbeat(
+        _settings(enable_directional=False, directional_signals_only=True), now=NOW
+    )
+    assert "**Directional** off" in msg
+    assert "signals-only" not in msg

@@ -82,10 +82,13 @@ def build_startup_heartbeat(settings, scheduler=None, now=None) -> str:
         f" · event blackout {_flag(settings.enable_event_blackout)}",
         f"**Feed** options={settings.alpaca_options_feed}"
         f" · **Directional** "
+        # enable_directional is the master switch and must be checked FIRST:
+        # directional_signals_only stays true in .env as a historical record, so
+        # testing it first reported "signals-only" on a fully disabled engine.
         + (
-            "signals-only"
-            if settings.directional_signals_only
-            else ("trading" if settings.enable_directional else "off")
+            "off"
+            if not settings.enable_directional
+            else ("signals-only" if settings.directional_signals_only else "trading")
         ),
     ]
 
