@@ -79,6 +79,35 @@ _BLACKOUT_DATES: dict[date, str] = {
 }
 
 
+def _election_days(start_year: int, end_year: int) -> dict[date, str]:
+    """US federal election days: first Tuesday AFTER the first Monday in
+    November, even-numbered years (2 U.S.C. 7).
+
+    COMPUTED rather than hardcoded because the rule is exact — unlike the BLS
+    releases, whose dates are published administratively and cannot be derived.
+    So this event type never expires and needs no annual maintenance.
+
+    Added 2026-10-04: Election Day 2024-11-05 was the single WORST day in the
+    3.5-year backtest at -$29,095 on 28 contracts (and a tail day, R < -1), yet
+    elections were not an event type at all. 2026-11-03 (midterms) was
+    unprotected, with the FOMC decision landing the very next day.
+    """
+    out: dict[date, str] = {}
+    for year in range(start_year, end_year + 1):
+        if year % 2:
+            continue  # federal general elections fall in even years only
+        d = date(year, 11, 1)
+        while d.weekday() != 0:  # advance to the first Monday
+            d += timedelta(days=1)
+        out[d + timedelta(days=1)] = "Election Day"
+    return out
+
+
+# Elections are merged in rather than listed above so the rule stays the single
+# source of truth. Range is deliberately wide — it costs nothing and cannot drift.
+_BLACKOUT_DATES.update(_election_days(2024, 2040))
+
+
 def is_blackout_day(today: date | None = None) -> str | None:
     """Return the event name if today is a blackout day, else None."""
     if today is None:
