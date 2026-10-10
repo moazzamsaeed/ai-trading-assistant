@@ -276,6 +276,46 @@ class Settings(BaseSettings):
     # depending on real 4-leg close slippage, which paper cannot measure. Enable
     # only as a deliberate smoothness-for-return trade, not expecting more profit.
     condor_profit_target_pct: Decimal = Field(default=Decimal("0"), ge=0, lt=1)
+    # ABSOLUTE-dollar profit target: close once the position's OPEN PROFIT across
+    # all contracts reaches this many dollars. 0 = disabled.
+    #
+    # Behaves very differently from the pct target on HIGH-credit days: a fixed
+    # $500 is reached far earlier than 50% of a rich credit. On #173 (09-16,
+    # $59/ct credit) $500 needed the mark to fall to $41.10 and banked out in the
+    # morning (+$560), while 50% needed $29.50, was never reached, and the trade
+    # rode to -$6,020. That single trade is most of the $500 rule's historical
+    # advantage — and it was the FOMC-blackout bug, which is now fixed and cannot
+    # recur, so do not expect that edge to repeat.
+    #
+    # If BOTH this and condor_profit_target_pct are set, whichever is reached
+    # FIRST wins (the higher debit threshold, since the debit falls as profit
+    # accrues).
+    condor_profit_target_usd: Decimal = Field(default=Decimal("0"), ge=0)
+
+    # TRAILING profit lock (opt-in, 0 = off). Instead of one fixed take-profit,
+    # ratchet a floor upward as profit climbs and exit when profit falls back to
+    # it — so a trade that runs to $900 and reverses books ~$800 rather than
+    # giving it all back, while one that keeps running is not capped early.
+    #
+    #   trail_usd      the FIRST rung and the minimum the floor can ever be.
+    #                  Below this there is no floor and the existing strategy
+    #                  (stop / leg-out / full-credit expiry) runs untouched.
+    #   trail_step_usd rung spacing. The floor is the highest rung profit has
+    #                  touched; exit when profit falls back to it.
+    #   trail_cap_usd  hard take-profit — bank it and go flat. 0 = no cap.
+    #
+    # Worked example at 500/100/1000: peak $720 -> floor $700 -> exit if profit
+    # retreats to $700. Peak $650 -> floor $600. Peak $1,000 -> exit at once.
+    #
+    # ⚠️ The rungs are ABSOLUTE DOLLARS while max profit per trade varies a lot
+    # (28ct era: min $644, median $1,008, max $1,652), so the ladder bites very
+    # differently by day. $500-700 is reachable on ~100% of days, $800 on 80%,
+    # $1,000 on 53%. On a thin-credit day the whole ladder sits near max profit.
+    # ⚠️ The floor is only checked on the 5-minute exit sweep, so a fast
+    # round-trip between sweeps can skip past it.
+    condor_profit_trail_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    condor_profit_trail_step_usd: Decimal = Field(default=Decimal("100"), gt=0)
+    condor_profit_trail_cap_usd: Decimal = Field(default=Decimal("0"), ge=0)
     # Gate the profit target on the session's OPENING RANGE — SPY's 09:30-10:00
     # high-low as a percentage of the opening price. 0 = apply on EVERY day.
     # Measured distribution (28ct era, n=45): min 0.11, q1 0.20, median 0.24,

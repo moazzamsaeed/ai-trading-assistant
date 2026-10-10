@@ -123,7 +123,8 @@ def _format_legout_alert(trade, closed: list[dict], reason: str | None) -> str |
         "force_close": "⏰ close-time leg-out (assignment protection)",
     }.get(reason or "", (
         "✅ profit target hit — banked the gain early"
-        if (reason or "").startswith("profit_target") else f"leg-out ({reason})"
+        if (reason or "").startswith(("profit_target", "profit_trail"))
+        else f"leg-out ({reason})"
     ))
     qty = trade.qty
     credit = Decimal(str(trade.entry_price))
@@ -281,16 +282,80 @@ async def _opening_range_pct(
     return pct
 
 
-def _profit_target_debit(credit_received: Decimal) -> Decimal | None:
-    """Debit at which the profit target fires, or None when disabled.
+def _profit_target_debit(credit_received: Decimal, qty: int | None) -> Decimal | None:
+    """Debit at which the profit target fires, or None when both are disabled.
 
-    Banking `pct` of max profit means buying the condor back for the remaining
-    (1 - pct) of the credit.
+    Two independent targets, either or both:
+      pct — bank `pct` of max profit, i.e. buy back for (1 - pct) x credit.
+      usd — bank a fixed dollar amount across all contracts, i.e. buy back for
+            credit - usd/qty.
+
+    With both set, whichever is reached FIRST wins. The debit FALLS as profit
+    accrues, so "first" is the HIGHER threshold.
     """
-    pct = get_settings().condor_profit_target_pct
-    if pct <= 0:
+    s = get_settings()
+    candidates: list[Decimal] = []
+    if s.condor_profit_target_pct > 0:
+        candidates.append((Decimal("1") - s.condor_profit_target_pct) * credit_received)
+    if s.condor_profit_target_usd > 0 and qty:
+        candidates.append(credit_received - (s.condor_profit_target_usd / Decimal(str(qty))))
+    if not candidates:
         return None
-    return ((Decimal("1") - pct) * credit_received).quantize(Decimal("0.01"))
+    # A non-positive threshold means the target is unreachable (e.g. a $500 goal
+    # on a credit that cannot yield $500) — treat it as no target for this trade.
+    best = max(candidates)
+    return best.quantize(Decimal("0.01")) if best > 0 else None
+
+
+def _trail_rung(profit: Decimal) -> Decimal | None:
+    """Highest ladder rung this profit has reached, or None if below the first.
+
+    Rungs are start, start+step, start+2*step, … Pure function so the ladder
+    maths is testable without a DB.
+    """
+    s = get_settings()
+    start, step = s.condor_profit_trail_usd, s.condor_profit_trail_step_usd
+    if start <= 0 or step <= 0 or profit < start:
+        return None
+    steps = int((profit - start) / step)
+    return start + (Decimal(steps) * step)
+
+
+def _trail_floor(trade: Trade, profit: Decimal, factory: Callable[[], Session]
+                 ) -> Decimal | None:
+    """Ratchet the locked floor on `trade` and return it.
+
+    The floor only ever moves UP, so it must survive between 5-minute sweeps —
+    it is persisted on trade.extra. Returns the floor to compare profit against,
+    or None while profit has never reached the first rung.
+    """
+    rung = _trail_rung(profit)
+    extra = trade.extra or {}
+    prev = extra.get("profit_trail_floor")
+    prev_d = None
+    if prev is not None:
+        try:
+            prev_d = Decimal(str(prev))
+        except Exception:  # noqa: BLE001 — corrupt value: re-derive from scratch
+            prev_d = None
+    best = max([v for v in (rung, prev_d) if v is not None], default=None)
+    if best is None:
+        return None
+    if prev_d is None or best > prev_d:
+        # ratchet up — persist so a later sweep cannot lose the lock
+        try:
+            with factory() as session:
+                row = session.get(Trade, trade.id)
+                if row is not None:
+                    row.extra = {**(row.extra or {}), "profit_trail_floor": str(best)}
+                    session.commit()
+            trade.extra = {**extra, "profit_trail_floor": str(best)}
+        except Exception as e:  # noqa: BLE001 — losing the ratchet is not fatal
+            log.warning("exit_monitor_trail_persist_failed",
+                        trade_id=trade.id, error=str(e))
+        log.info("exit_monitor_trail_ratchet", trade_id=trade.id,
+                 profit=str(profit), floor=str(best))
+    return best
 
 
 def _profit_target_applies(open_range_pct: float | None) -> bool:
@@ -335,8 +400,10 @@ def _decide_exit(
     if force:
         return True, "force_close_15:50"
     if profit_target_debit is not None and exit_debit <= profit_target_debit:
-        pct = int(get_settings().condor_profit_target_pct * 100)
-        return True, f"profit_target_{pct}pct"
+        s = get_settings()
+        if s.condor_profit_target_usd > 0:
+            return True, f"profit_target_${int(s.condor_profit_target_usd)}"
+        return True, f"profit_target_{int(s.condor_profit_target_pct * 100)}pct"
     loss_per_ct = exit_debit - credit_received
     if daily_loss_cap_per_contract is not None and loss_per_ct >= daily_loss_cap_per_contract:
         return True, "daily_loss_cap"
@@ -375,7 +442,8 @@ def _format_exit_signal(trade: Trade, exit_debit: Decimal, reason: str) -> str:
     }.get(reason, (
         # the profit-target reason carries its percentage (profit_target_50pct)
         "✅ profit target hit — take the gain and go flat"
-        if (reason or "").startswith("profit_target") else f"closing ({reason})"
+        if (reason or "").startswith(("profit_target", "profit_trail"))
+        else f"closing ({reason})"
     ))
 
     pnl_word = "profit" if realized_per_contract >= 0 else "loss"
@@ -771,14 +839,30 @@ async def _process_one_condor_exit(
     if settings.condor_daily_loss_limit_pct > 0 and trade.qty:
         cap_total = settings.trading_capital_usd * settings.condor_daily_loss_limit_pct
         daily_cap_per_ct = (cap_total / Decimal(str(trade.qty))).quantize(Decimal("0.01"))
-    # PROFIT TARGET (opt-in, off by default). Gated on the session's opening
-    # range so it can be applied only to the kind of day you want it on — see
-    # condor_profit_target_on_quiet for which side of the threshold and why.
+    # PROFIT TARGET / TRAILING LOCK (opt-in, all off by default). Gated on the
+    # session's opening range — see condor_profit_target_on_quiet for which side
+    # of the threshold and why.
     pt_debit: Decimal | None = None
-    if settings.condor_profit_target_pct > 0 and not force_close:
+    trail_reason: str | None = None
+    pt_enabled = (settings.condor_profit_target_pct > 0
+                  or settings.condor_profit_target_usd > 0
+                  or settings.condor_profit_trail_usd > 0)
+    if pt_enabled and not force_close:
         rng = await _opening_range_pct(trade, bars_fetcher, factory)
         if _profit_target_applies(rng):
-            pt_debit = _profit_target_debit(credit)
+            pt_debit = _profit_target_debit(credit, trade.qty)
+            # TRAILING lock: ratchet a floor up as profit climbs and exit on a
+            # retreat back to it. Evaluated here rather than inside the pure
+            # _decide_exit because it needs dollar profit and persisted state.
+            if settings.condor_profit_trail_usd > 0 and trade.qty:
+                profit = (credit - exit_debit) * Decimal(str(trade.qty))
+                cap = settings.condor_profit_trail_cap_usd
+                if cap > 0 and profit >= cap:
+                    trail_reason = f"profit_trail_cap_${int(cap)}"
+                else:
+                    floor = _trail_floor(trade, profit, factory)
+                    if floor is not None and profit <= floor:
+                        trail_reason = f"profit_trail_${int(floor)}"
         else:
             log.info(
                 "exit_monitor_profit_target_not_in_scope",
@@ -786,13 +870,19 @@ async def _process_one_condor_exit(
                 threshold=settings.condor_profit_target_open_range_pct,
                 on_quiet=settings.condor_profit_target_on_quiet,
             )
-    should_exit, reason = _decide_exit(
-        credit_received=credit,
-        exit_debit=exit_debit,
-        force=force_close,
-        daily_loss_cap_per_contract=daily_cap_per_ct,
-        profit_target_debit=pt_debit,
-    )
+
+    if trail_reason is not None:
+        log.info("exit_monitor_trail_exit", trade_id=trade.id,
+                 reason=trail_reason, exit_debit=str(exit_debit))
+        should_exit, reason = True, trail_reason
+    else:
+        should_exit, reason = _decide_exit(
+            credit_received=credit,
+            exit_debit=exit_debit,
+            force=force_close,
+            daily_loss_cap_per_contract=daily_cap_per_ct,
+            profit_target_debit=pt_debit,
+        )
     if not should_exit:
         return {
             "trade_id": trade.id,
