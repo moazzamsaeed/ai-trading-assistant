@@ -263,6 +263,39 @@ class Settings(BaseSettings):
     condor_assignment_close: bool = False
     condor_assign_close_buffer_pct: float = Field(default=0.003, ge=0)
 
+    # PROFIT TARGET (opt-in, default OFF). Close the condor once the buy-back debit
+    # falls to (1 - pct) x credit, i.e. banking `pct` of max profit, instead of
+    # holding for the full credit at expiry. 0.5 = take 50% and go flat.
+    #
+    # ⚠️ TESTED AND NOT RECOMMENDED AS AN EDGE PLAY — see
+    # [project_condor_whipsaw_verdict]. Five formulations were measured on real
+    # option bars; every one's gain was the 2-3 whipsaw trades it rescues and a
+    # loss on everything else (the 75% variant helped 7 trades and hurt 29). What
+    # IS real and robust is VARIANCE reduction: ~-40% per-trade sd and roughly
+    # half the max drawdown, at a return cost between $0 and ~$1,500/month
+    # depending on real 4-leg close slippage, which paper cannot measure. Enable
+    # only as a deliberate smoothness-for-return trade, not expecting more profit.
+    condor_profit_target_pct: Decimal = Field(default=Decimal("0"), ge=0, lt=1)
+    # Gate the profit target on the session's OPENING RANGE — SPY's 09:30-10:00
+    # high-low as a percentage of the opening price. 0 = apply on EVERY day.
+    # Measured distribution (28ct era, n=45): min 0.11, q1 0.20, median 0.24,
+    # q3 0.31, max 0.59.
+    condor_profit_target_open_range_pct: float = Field(default=0.0, ge=0)
+    # Which SIDE of that threshold the target applies to.
+    #
+    # True (default) = apply on QUIET mornings (range <= threshold). This is the
+    # direction the data supports: quiet mornings produce a LOWER VIX1D, so the
+    # engine sets TIGHTER strikes (mean band 7.0pt vs 8.0pt) with less cushion,
+    # and they are where the losses are — calm mornings ran 13W/9L at -$416/trade
+    # vs active mornings 20W/3L at +$680/trade, and all seven worst trades in the
+    # 28ct era had a below-median opening range.
+    #
+    # False = apply on ACTIVE mornings (range >= threshold). Intuitive ("big
+    # movement will break the range") but BACKWARDS on this evidence: it caps the
+    # days that are already winning and leaves the losing days unprotected.
+    # Exposed so the intuition can be tested rather than argued about.
+    condor_profit_target_on_quiet: bool = True
+
     # STOP SINGLE-LEG (opt-in). The 1.5× stop / daily cap / force-close historically
     # unwound via a 4-leg MLEG combo order, which won't fill on illiquid/fast books —
     # it canceled unfilled on the 2026-09-16 FOMC breach and the loss rode to −$6k

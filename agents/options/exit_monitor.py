@@ -6,8 +6,12 @@ debit, and submits a closing order when any of these fire:
 
 - **1.5× stop loss**: exit when current debit ≥ 2.5 × credit_received
   (running loss is 1.5× the credit collected; the validated condor stop)
+- **Profit target** (OPT-IN, default OFF — `condor_profit_target_pct`): bank a
+  share of max profit early instead of holding for full credit, optionally gated
+  on the session's opening range. Measured as variance reduction, NOT extra
+  return — see [project_condor_whipsaw_verdict].
 - **Force close at/after 15:45 ET**: time-based; we never hold past close
-  (≈ the backtest's close settlement). NO profit target — the condor's edge is
+  (≈ the backtest's close settlement). With no profit target the condor's edge is
   full-credit expiries, so we hold winners to the force-close. SMART variant: at
   the deadline we only actually close when SPY is near a short strike (pin/breach
   risk); a condor comfortably inside its shorts is left to EXPIRE worthless for
@@ -117,7 +121,10 @@ def _format_legout_alert(trade, closed: list[dict], reason: str | None) -> str |
         "daily_loss_cap": "🛑 daily loss cap hit",
         "force_close_15:50": "⏰ close-time leg-out (assignment protection)",
         "force_close": "⏰ close-time leg-out (assignment protection)",
-    }.get(reason or "", f"leg-out ({reason})")
+    }.get(reason or "", (
+        "✅ profit target hit — banked the gain early"
+        if (reason or "").startswith("profit_target") else f"leg-out ({reason})"
+    ))
     qty = trade.qty
     credit = Decimal(str(trade.entry_price))
     buyback = sum(Decimal(str(c["fill"])) for c in closed if c.get("fill"))
@@ -226,17 +233,99 @@ def _compute_exit_debit_per_contract(
     return (cost_per_share * Decimal("100")).quantize(Decimal("0.01"))
 
 
+async def _opening_range_pct(
+    trade: Trade,
+    bars_fetcher: Callable[..., object],
+    factory: Callable[[], Session],
+) -> float | None:
+    """SPY's 09:30-10:00 high-low as a % of the opening price — "how much did it
+    move from the start". Fixed once 10:00 passes, so it is computed ONCE per
+    trade and cached in trade.extra rather than refetched on every 5-min sweep.
+    Returns None if bars are unavailable (caller then skips the gate).
+    """
+    extra = trade.extra or {}
+    cached = extra.get("opening_range_pct")
+    if cached is not None:
+        try:
+            return float(cached)
+        except (TypeError, ValueError):
+            pass
+    try:
+        bars = await bars_fetcher("SPY", timeframe_minutes=5, limit=30)
+    except Exception as e:  # noqa: BLE001 — feed blip; caller skips the gate
+        log.warning("exit_monitor_opening_range_failed", trade_id=trade.id, error=str(e))
+        return None
+    lo, hi, op = None, None, None
+    for b in bars or []:
+        hm = to_et(b.timestamp).strftime("%H:%M")
+        if not ("09:30" <= hm < "10:00"):
+            continue
+        h, low, o = float(b.high), float(b.low), float(b.open)
+        hi = h if hi is None else max(hi, h)
+        lo = low if lo is None else min(lo, low)
+        if op is None:
+            op = o
+    if lo is None or hi is None or not op:
+        return None
+    pct = (hi - lo) / op * 100.0
+    # persist so later sweeps (and the day-end report) reuse it
+    try:
+        with factory() as session:
+            row = session.get(Trade, trade.id)
+            if row is not None:
+                row.extra = {**(row.extra or {}), "opening_range_pct": f"{pct:.3f}"}
+                session.commit()
+    except Exception as e:  # noqa: BLE001 — caching is best-effort
+        log.warning("exit_monitor_opening_range_cache_failed",
+                    trade_id=trade.id, error=str(e))
+    return pct
+
+
+def _profit_target_debit(credit_received: Decimal) -> Decimal | None:
+    """Debit at which the profit target fires, or None when disabled.
+
+    Banking `pct` of max profit means buying the condor back for the remaining
+    (1 - pct) of the credit.
+    """
+    pct = get_settings().condor_profit_target_pct
+    if pct <= 0:
+        return None
+    return ((Decimal("1") - pct) * credit_received).quantize(Decimal("0.01"))
+
+
+def _profit_target_applies(open_range_pct: float | None) -> bool:
+    """Is the profit target in scope for this session's opening range?
+
+    No threshold configured → every day. Unknown range (feed failure) → False,
+    so a missing quote never silently changes exit behaviour.
+    """
+    s = get_settings()
+    thr = s.condor_profit_target_open_range_pct
+    if thr <= 0:
+        return True
+    if open_range_pct is None:
+        return False
+    return (open_range_pct <= thr) if s.condor_profit_target_on_quiet else (
+        open_range_pct >= thr)
+
+
 def _decide_exit(
     *,
     credit_received: Decimal,
     exit_debit: Decimal,
     force: bool,
     daily_loss_cap_per_contract: Decimal | None = None,
+    profit_target_debit: Decimal | None = None,
 ) -> tuple[bool, str]:
-    """Return (should_exit, reason) — matches the validated condor backtest:
-    a 1.5×-credit intraday stop + force-close, and NO profit target (the edge
-    comes from full-credit expiries; a 50% PT would cap winners and degrade it).
+    """Return (should_exit, reason) — a 1.5×-credit intraday stop + force-close,
+    plus an OPT-IN profit target (off by default; see condor_profit_target_pct).
     Stop fires when buy-back debit ≥ credit × (1 + STOP_MULT).
+
+    `profit_target_debit`, when supplied, fires once the buy-back debit has
+    fallen to it — banking part of the max profit instead of holding for full
+    credit. Checked BEFORE the loss exits: the two conditions are mutually
+    exclusive (one needs the debit low, the others need it high), so the order
+    only matters for clarity.
 
     `daily_loss_cap_per_contract` (option B) is a hard per-contract loss ceiling
     derived from condor_daily_loss_limit_pct × pool ÷ qty. It's a HIGHER threshold
@@ -245,6 +334,9 @@ def _decide_exit(
     daily % cap. All three exits close marketably (see _process_one_condor_exit)."""
     if force:
         return True, "force_close_15:50"
+    if profit_target_debit is not None and exit_debit <= profit_target_debit:
+        pct = int(get_settings().condor_profit_target_pct * 100)
+        return True, f"profit_target_{pct}pct"
     loss_per_ct = exit_debit - credit_received
     if daily_loss_cap_per_contract is not None and loss_per_ct >= daily_loss_cap_per_contract:
         return True, "daily_loss_cap"
@@ -276,12 +368,15 @@ def _format_exit_signal(trade: Trade, exit_debit: Decimal, reason: str) -> str:
 
     # Plain-language reason mapping.
     reason_text = {
-        "profit_target_50pct": "✅ profit target hit",
         "stop_loss_1.5x": "🛑 stop loss (1.5× credit) — cap the loss now",
         "daily_loss_cap": "🛑 daily loss cap hit — hard floor, close now",
         "force_close_15:50": "⏰ closing before market close",
         "force_close": "⏰ closing before market close",
-    }.get(reason, f"closing ({reason})")
+    }.get(reason, (
+        # the profit-target reason carries its percentage (profit_target_50pct)
+        "✅ profit target hit — take the gain and go flat"
+        if (reason or "").startswith("profit_target") else f"closing ({reason})"
+    ))
 
     pnl_word = "profit" if realized_per_contract >= 0 else "loss"
     pnl_amount = abs(realized_per_contract)
@@ -353,6 +448,7 @@ async def run_exit_monitor(
     position_fetcher: Callable[..., object] = alpaca_client.get_positions,
     position_closer: Callable[..., object] = alpaca_client.close_position,
     single_leg_closer: Callable[..., object] = alpaca_client.submit_single_option_buy_to_close,
+    bars_fetcher: Callable[..., object] = alpaca_client.get_recent_bars,
     force_close: bool | None = None,
     fill_timeout_s: float = 60.0,
 ) -> list[dict]:
@@ -387,6 +483,7 @@ async def run_exit_monitor(
                 canceller=canceller,
                 stock_fetcher=stock_fetcher,
                 single_leg_closer=single_leg_closer,
+                bars_fetcher=bars_fetcher,
                 force_close=force_close,
                 fill_timeout_s=fill_timeout_s,
             )
@@ -620,6 +717,7 @@ async def _process_one_condor_exit(
     canceller: Callable[..., object],
     stock_fetcher: Callable[..., object],
     single_leg_closer: Callable[..., object] = alpaca_client.submit_single_option_buy_to_close,
+    bars_fetcher: Callable[..., object] = alpaca_client.get_recent_bars,
     force_close: bool,
     fill_timeout_s: float,
 ) -> dict:
@@ -673,11 +771,27 @@ async def _process_one_condor_exit(
     if settings.condor_daily_loss_limit_pct > 0 and trade.qty:
         cap_total = settings.trading_capital_usd * settings.condor_daily_loss_limit_pct
         daily_cap_per_ct = (cap_total / Decimal(str(trade.qty))).quantize(Decimal("0.01"))
+    # PROFIT TARGET (opt-in, off by default). Gated on the session's opening
+    # range so it can be applied only to the kind of day you want it on — see
+    # condor_profit_target_on_quiet for which side of the threshold and why.
+    pt_debit: Decimal | None = None
+    if settings.condor_profit_target_pct > 0 and not force_close:
+        rng = await _opening_range_pct(trade, bars_fetcher, factory)
+        if _profit_target_applies(rng):
+            pt_debit = _profit_target_debit(credit)
+        else:
+            log.info(
+                "exit_monitor_profit_target_not_in_scope",
+                trade_id=trade.id, opening_range_pct=rng,
+                threshold=settings.condor_profit_target_open_range_pct,
+                on_quiet=settings.condor_profit_target_on_quiet,
+            )
     should_exit, reason = _decide_exit(
         credit_received=credit,
         exit_debit=exit_debit,
         force=force_close,
         daily_loss_cap_per_contract=daily_cap_per_ct,
+        profit_target_debit=pt_debit,
     )
     if not should_exit:
         return {
