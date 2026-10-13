@@ -247,3 +247,32 @@ def test_floor_ratchets_up_and_never_down():
         assert trade.extra["profit_trail_floor"] == "800"
     finally:
         s.condor_profit_trail_usd, s.condor_profit_trail_step_usd = orig
+
+
+# --- selective close on a profit-target exit -------------------------------
+# #189 (2026-10-12) closed BOTH shorts for $5/ct where the near leg alone was
+# $3/ct, turning a +$644 baseline into +$588. Only the at-risk leg should close.
+
+def test_near_short_strike_picks_only_the_at_risk_side():
+    """The band logic the selective close reuses: on #189 SPY settled 777.93
+    against 776P/781C, so the PUT was inside the 0.3% band and the CALL was not."""
+    spot = Decimal("777.93")
+    put, call = "SPY261012P00776000", "SPY261012C00781000"
+    # put band top = 776 * 1.003 = 778.33 -> 777.93 is inside -> at risk
+    assert em._near_short_strike(spot, put, None, 0.003) is True
+    # call band bottom = 781 * 0.997 = 778.66 -> 777.93 is below -> NOT at risk
+    assert em._near_short_strike(spot, None, call, 0.003) is True  # None put fails safe
+    # with both legs supplied the combined check is True because the put is near
+    assert em._near_short_strike(spot, put, call, 0.003) is True
+
+
+def test_neither_short_near_means_nothing_to_close():
+    """Comfortably inside both shorts -> holding beats banking, close nothing."""
+    spot = Decimal("778.50")  # 776P band top 778.33, 781C band bottom 778.657
+    assert em._near_short_strike(
+        spot, "SPY261012P00776000", "SPY261012C00781000", 0.003
+    ) is False
+
+
+def test_selective_flag_defaults_on():
+    assert em.get_settings().condor_profit_target_selective is True

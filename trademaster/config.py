@@ -313,6 +313,16 @@ class Settings(BaseSettings):
     # $1,000 on 53%. On a thin-credit day the whole ladder sits near max profit.
     # ⚠️ The floor is only checked on the 5-minute exit sweep, so a fast
     # round-trip between sweeps can skip past it.
+    # On a profit-target exit, buy back only the short(s) near the money and let
+    # the far short + both longs expire free, instead of closing both shorts.
+    # The far short is nearly worthless, so closing it is pure spread cost: on
+    # #189 (2026-10-12) closing BOTH cost $5/ct where the near leg alone was
+    # $3/ct, turning a +$644 baseline into +$588.
+    #
+    # ⚠️ Leaves the far short spread open to expiry. Harmless when the target
+    # fires late in the session (both firings so far were 15:40) but an early
+    # firing leaves that leg exposed for hours. Set false to close both shorts.
+    condor_profit_target_selective: bool = True
     condor_profit_trail_usd: Decimal = Field(default=Decimal("0"), ge=0)
     condor_profit_trail_step_usd: Decimal = Field(default=Decimal("100"), gt=0)
     condor_profit_trail_cap_usd: Decimal = Field(default=Decimal("0"), ge=0)

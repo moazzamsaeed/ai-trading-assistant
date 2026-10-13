@@ -949,6 +949,43 @@ async def _process_one_condor_exit(
                 fill_timeout_s=fill_timeout_s, factory=factory, reason=reason,
             )
 
+    # PROFIT-TARGET exits close SELECTIVELY (opt-in, default on): buy back only the
+    # short(s) actually near the money and let the far short + both longs expire
+    # free. The far short is nearly worthless, so closing it is pure spread cost —
+    # measured on #189 (10-12), closing BOTH shorts cost $5/ct where the near leg
+    # alone was $3/ct, turning a +$644 baseline into +$588.
+    #
+    # If NEITHER short is near the money the position is in no danger and will
+    # expire for MORE than the target, so holding beats banking: return without
+    # closing anything. The target simply re-evaluates on the next sweep.
+    #
+    # ⚠️ This leaves the far short spread open until expiry. Harmless when the
+    # target fires late (both firings so far were 15:40), but a target that fires
+    # early leaves that leg exposed for hours. Set
+    # CONDOR_PROFIT_TARGET_SELECTIVE=false to close both shorts instead.
+    if (settings.condor_profit_target_selective
+            and reason.startswith(("profit_target", "profit_trail"))):
+        spot = await _fetch_spot(stock_fetcher, trade.id)
+        if not _near_short_strike(
+            spot, legs[0], legs[2], settings.condor_assign_close_buffer_pct
+        ):
+            log.info(
+                "exit_monitor_target_expire_inside", trade_id=trade.id,
+                spot=str(spot), reason=reason, exit_debit=str(exit_debit),
+            )
+            return {
+                "trade_id": trade.id,
+                "status": "expire_inside",
+                "reason": reason,
+                "exit_debit": str(exit_debit),
+            }
+        return await _assignment_leg_out(
+            trade, spot=spot, legs=legs, chain=chain,
+            closer=single_leg_closer, waiter=waiter,
+            buf=settings.condor_assign_close_buffer_pct,
+            fill_timeout_s=fill_timeout_s, factory=factory, reason=reason,
+        )
+
     # SINGLE-LEG FIRST (primary path for loss-cuts). The 4-leg MLEG combo won't fill on
     # illiquid/fast books (the 2026-09-16 FOMC breach → −$6k). So for stop_loss /
     # daily_loss_cap / force_close that reach here, buy back BOTH shorts single-leg
