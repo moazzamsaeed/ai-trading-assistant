@@ -276,3 +276,41 @@ def test_neither_short_near_means_nothing_to_close():
 
 def test_selective_flag_defaults_on():
     assert em.get_settings().condor_profit_target_selective is True
+
+
+# --- observability: every leg-out must say WHAT triggered it ----------------
+# Three callers reach _assignment_leg_out (15:45 deadline, stop fallback,
+# profit target) and the reconciler later overwrites exit_reason on the trade
+# row with its own label — so without the reason in the result/journal, #191's
+# 14:25 exit could not be attributed to the target at all.
+
+def test_leg_out_result_carries_the_reason():
+    import asyncio
+    from types import SimpleNamespace
+
+    class _Order:
+        order_id = "o1"
+
+    async def closer(**_kw):
+        return _Order()
+
+    async def waiter(*_a, **_k):
+        return SimpleNamespace(status="filled", filled_avg_price=Decimal("0.23"))
+
+    class _S:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, *_a): return None
+        def commit(self): pass
+
+    trade = SimpleNamespace(id=191, qty=28, entry_price=Decimal("46"), extra={})
+    legs = ("SPY261015P00760000", "SPY261015P00755000",
+            "SPY261015C00771000", "SPY261015C00776000")
+    res = asyncio.run(em._assignment_leg_out(
+        trade, spot=Decimal("771.00"), legs=legs, chain=[],
+        closer=closer, waiter=waiter, buf=0.003, fill_timeout_s=1.0,
+        factory=lambda: _S(), reason="profit_target_$600",
+    ))
+    assert res["reason"] == "profit_target_$600"
+    # SPY 771.00: the CALL is at the strike (at risk), the PUT is $11 clear
+    assert res["legs_closed"] == ["call"]

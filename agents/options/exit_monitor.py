@@ -196,6 +196,11 @@ async def _assignment_leg_out(
     result = {
         "trade_id": trade.id, "status": "assignment_closed",
         "legs_closed": [c["side"] for c in closed],
+        # Carry WHAT triggered this leg-out. Three callers reach here — the 15:45
+        # deadline, the stop fallback, and the profit target — and without this
+        # the journal and the result dict cannot tell them apart (the exit_reason
+        # on the trade row is later overwritten by the reconciler's own label).
+        "reason": reason,
     }
     alert = _format_legout_alert(trade, closed, reason)
     if alert:
@@ -979,6 +984,10 @@ async def _process_one_condor_exit(
                 "reason": reason,
                 "exit_debit": str(exit_debit),
             }
+        log.info(
+            "exit_monitor_profit_target_close", trade_id=trade.id, reason=reason,
+            exit_debit=str(exit_debit), spot=str(spot), selective=True,
+        )
         return await _assignment_leg_out(
             trade, spot=spot, legs=legs, chain=chain,
             closer=single_leg_closer, waiter=waiter,
@@ -996,15 +1005,14 @@ async def _process_one_condor_exit(
     if settings.condor_stop_single_leg:
         log.info("exit_monitor_single_leg_close", trade_id=trade.id, reason=reason)
         spot = await _fetch_spot(stock_fetcher, trade.id)
-        result = await _assignment_leg_out(
+        # _assignment_leg_out now carries `reason` in its result for every caller.
+        return await _assignment_leg_out(
             trade, spot=spot, legs=legs, chain=chain,
             closer=single_leg_closer, waiter=waiter,
             buf=settings.condor_assign_close_buffer_pct,
             fill_timeout_s=fill_timeout_s, factory=factory, close_all=True,
             reason=reason,
         )
-        result["reason"] = reason
-        return result
 
     # Option A (legacy, flag off) — EVERY condor exit closes marketably. All condor
     # exits are loss-cuts or the time-based force-close (there's no profit target), so a
