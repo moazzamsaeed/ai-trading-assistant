@@ -1593,3 +1593,35 @@ def test_equities_scanner_follows_its_own_flag(monkeypatch):
     assert "equities_scan" not in off
     on = {j.id for j in _build(monkeypatch, directional=False, equities=True).get_jobs()}
     assert "equities_scan" in on
+
+
+def test_condor_exit_sweep_has_no_blind_spot(monkeypatch):
+    """The exit sweep must cover EVERY minute window during RTH.
+
+    It was minute="0,5,...,45", which left nothing at :50 or :55 — a
+    15-minute blind spot every hour, 90 minutes of a 345-minute session, with
+    an open 0DTE position and no stop evaluation. Trade #192 (2026-10-16) lost
+    its entire overshoot inside that hole.
+    """
+    import datetime
+    from trademaster.timeutils import ET
+
+    scheduler = _build(monkeypatch, directional=False)
+    job = scheduler.get_job("iron_condor_exit")
+    assert job is not None
+
+    # walk the firing times across one session and assert no gap > 2 min
+    t = datetime.datetime(2026, 10, 19, 10, 0, tzinfo=ET)
+    end = datetime.datetime(2026, 10, 19, 15, 45, tzinfo=ET)
+    fires, prev = [], None
+    while t <= end:
+        nxt = job.trigger.get_next_fire_time(prev, t)
+        if nxt is None or nxt > end:
+            break
+        fires.append(nxt)
+        prev, t = nxt, nxt + datetime.timedelta(seconds=1)
+    assert fires, "exit monitor never fires"
+    gaps = [(b - a).total_seconds() / 60 for a, b in zip(fires, fires[1:])]
+    assert max(gaps) <= 2, f"blind spot of {max(gaps):.0f} min in the exit sweep"
+    # 10:00-15:44 every 2 min
+    assert len(fires) >= 170, f"only {len(fires)} sweeps per session"

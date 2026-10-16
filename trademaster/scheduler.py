@@ -1472,13 +1472,26 @@ def make_scheduler(
             misfire_grace_time=300,
         )
 
-        # Exit monitor: every 5 min during RTH (10:00-15:45 ET).
+        # Exit monitor: every 2 min during RTH (10:00-15:58 ET).
+        #
+        # Was "0,5,...,45", which left a FIFTEEN-MINUTE BLIND SPOT every hour
+        # (nothing at :50 or :55) — 90 minutes of a 345-minute session, 26% of
+        # the time with an open 0DTE position and no stop evaluation. Trade #192
+        # (2026-10-16) lost its whole overshoot inside that hole: SPY was 768.82
+        # at the 11:45 sweep, broke through the 768 short put at 11:55 unwatched,
+        # and the 12:00 sweep found the debit at $151 against a $107.50 trigger.
+        #
+        # Measured on real 1-minute option bars across the 9 stopped trades, the
+        # 5-minute cadence paid $6,188 MORE than the debit at the first minute
+        # the stop was genuinely true ($3,024 of that on trades that can recur,
+        # ~$500 per stop). 2-minute closes most of that gap at ~2.5x the chain
+        # fetches rather than 5x for 1-minute.
         scheduler.add_job(
             _iron_condor_exit_job,
             CronTrigger(
                 day_of_week="mon-fri",
                 hour="10-15",
-                minute="0,5,10,15,20,25,30,35,40,45",
+                minute="*/2",
                 timezone=PREMARKET_TZ,
             ),
             kwargs={
