@@ -286,6 +286,28 @@ class Settings(BaseSettings):
     # position is usually a winner and the longs really are worthless.
     condor_sell_longs_on_stop: bool = True
 
+    # STOP PERSISTENCE (de-bounce). Require the stop condition — debit over the
+    # 1.5x trigger AND SPY through a short strike — to hold CONTINUOUSLY for this
+    # many seconds before cutting. 0 = fire on first observation (old behaviour).
+    #
+    # This is the only filter tested that separates a whipsaw from a real breach,
+    # and the reason is mechanical: a real breach STAYS through the strike, a
+    # whipsaw pops back. Depth filters ("how far through") cannot tell them apart
+    # because both start shallow; persistence ("how long through") can.
+    #
+    # Replayed on the 7 stop-outs with settlement data (real 1-min bars, within
+    # replay so the fill model is constant):
+    #     fire-on-sight -14,980 | 2min -13,608 | 3min -9,940 | 5min -10,220
+    #     8min -9,996 | 12min -8,764      (HOLD everything = -16,688)
+    # Improves across the whole range rather than at one value, and the genuine
+    # breaches (#192, #176) still get cut — only the whipsaws (#196, #173, #187)
+    # are allowed to recover.
+    #
+    # ⚠️ n=7. And with a 2-minute sweep the granularity is coarse: 180s needs two
+    # or three consecutive armed sweeps. A tier-1 spot poll at 15s would make this
+    # precise — that is the real argument for two-tier monitoring.
+    condor_stop_persist_seconds: int = Field(default=0, ge=0, le=900)
+
     # ASSIGNMENT CONFIG (opt-in, default OFF; SPY-only — XSP is cash-settled and needs
     # none). SPY options are physically settled, so an ITM short at expiry delivers
     # shares (assignment) = unbounded overnight risk. When on, at the force-close

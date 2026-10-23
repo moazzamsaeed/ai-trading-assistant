@@ -199,3 +199,73 @@ def test_settlement_sold_long_in_the_money_still_credits_the_sale():
     assert held == Decimal("100.00")
     assert sold == Decimal("120.00")
     assert sold > held          # selling early for less than intrinsic costs us
+
+
+# --- stop persistence (de-bounce) ----------------------------------------
+# The only filter found that separates a whipsaw from a real breach: a real
+# breach STAYS through the strike, a whipsaw pops back. Replay on the 7
+# stop-outs: fire-on-sight -14,980 vs 3min persistence -9,940.
+
+class _MemSess:
+    """Session whose Trade row is a shared mutable stand-in."""
+    def __init__(self, store): self.store = store
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def get(self, _model, _id): return self.store
+    def commit(self): pass
+
+
+def _persist_rig(monkeypatch, need):
+    monkeypatch.setattr(em.get_settings(), "condor_stop_persist_seconds", need)
+    store = SimpleNamespace(id=1, extra={})
+    trade = SimpleNamespace(id=1, extra={})
+    return trade, (lambda: _MemSess(store))
+
+
+def _t(sec):
+    return datetime(2026, 10, 22, 14, 0, sec % 60, tzinfo=UTC) \
+        if sec < 60 else datetime(2026, 10, 22, 14, sec // 60, sec % 60, tzinfo=UTC)
+
+
+def test_zero_persistence_fires_immediately(monkeypatch):
+    trade, f = _persist_rig(monkeypatch, 0)
+    assert em._stop_persist_ok(trade, _t(0), True, f) is True
+
+
+def test_zero_persistence_still_respects_armed(monkeypatch):
+    """Regression: returning True regardless of `armed` when persistence is
+    disabled destroyed the distance-aware suppression entirely."""
+    trade, f = _persist_rig(monkeypatch, 0)
+    assert em._stop_persist_ok(trade, _t(0), False, f) is False
+
+
+def test_first_armed_sweep_only_starts_the_clock(monkeypatch):
+    trade, f = _persist_rig(monkeypatch, 180)
+    assert em._stop_persist_ok(trade, _t(0), True, f) is False
+    assert trade.extra.get("stop_armed_since") is not None
+
+
+def test_fires_once_the_breach_has_held_long_enough(monkeypatch):
+    trade, f = _persist_rig(monkeypatch, 180)
+    em._stop_persist_ok(trade, _t(0), True, f)
+    assert em._stop_persist_ok(trade, _t(120), True, f) is False   # 2min, not yet
+    assert em._stop_persist_ok(trade, _t(180), True, f) is True    # 3min
+
+
+def test_a_lapse_resets_the_clock(monkeypatch):
+    """This is the whole point — SPY popping back inside restarts the count."""
+    trade, f = _persist_rig(monkeypatch, 180)
+    em._stop_persist_ok(trade, _t(0), True, f)
+    em._stop_persist_ok(trade, _t(120), True, f)
+    assert em._stop_persist_ok(trade, _t(140), False, f) is False  # lapsed
+    assert "stop_armed_since" not in trade.extra
+    # clock restarts: 120s of prior accumulation must not count
+    em._stop_persist_ok(trade, _t(160), True, f)
+    assert em._stop_persist_ok(trade, _t(280), True, f) is False
+    assert em._stop_persist_ok(trade, _t(340), True, f) is True
+
+
+def test_corrupt_timestamp_restarts_rather_than_crashing(monkeypatch):
+    trade, f = _persist_rig(monkeypatch, 180)
+    trade.extra = {"stop_armed_since": "not-a-date"}
+    assert em._stop_persist_ok(trade, _t(0), True, f) is False

@@ -144,6 +144,71 @@ def _through_short_strike(
     return spot <= sp * (Decimal("1") - d) or spot >= sc * (Decimal("1") + d)
 
 
+def _stop_persist_ok(
+    trade: Trade, now: datetime, armed: bool, factory: Callable[[], Session],
+) -> bool:
+    """De-bounce the stop: has the condition held continuously long enough?
+
+    Tracks the instant the stop condition was FIRST seen on `trade.extra` and
+    clears it the moment the condition lapses, so only an uninterrupted breach
+    accumulates. Returns True when the stop may fire.
+
+    0 seconds configured → returns `armed` unchanged, i.e. fire on first
+    observation. It must NOT return True here regardless of `armed`, or the
+    distance-aware suppression is silently destroyed.
+    """
+    need = get_settings().condor_stop_persist_seconds
+    if need <= 0:
+        return armed
+    extra = trade.extra or {}
+    prev = extra.get("stop_armed_since")
+
+    def _write(value: str | None) -> None:
+        try:
+            with factory() as s:
+                row = s.get(Trade, trade.id)
+                if row is not None:
+                    ex = dict(row.extra or {})
+                    if value is None:
+                        ex.pop("stop_armed_since", None)
+                    else:
+                        ex["stop_armed_since"] = value
+                    row.extra = ex
+                    s.commit()
+            trade.extra = {**extra, **({} if value is None else
+                                       {"stop_armed_since": value})}
+            if value is None:
+                trade.extra.pop("stop_armed_since", None)
+        except Exception as e:  # noqa: BLE001 — de-bounce state is best-effort
+            log.warning("exit_monitor_persist_write_failed",
+                        trade_id=trade.id, error=str(e))
+
+    if not armed:
+        if prev is not None:
+            log.info("exit_monitor_stop_persist_reset", trade_id=trade.id)
+            _write(None)
+        return False
+
+    if prev is None:
+        _write(now.isoformat())
+        log.info("exit_monitor_stop_persist_start", trade_id=trade.id,
+                 need_seconds=need)
+        return False
+    try:
+        since = datetime.fromisoformat(str(prev))
+    except ValueError:
+        _write(now.isoformat())
+        return False
+    held = (now - since).total_seconds()
+    if held < need:
+        log.info("exit_monitor_stop_persist_waiting", trade_id=trade.id,
+                 held_seconds=int(held), need_seconds=need)
+        return False
+    log.info("exit_monitor_stop_persist_confirmed", trade_id=trade.id,
+             held_seconds=int(held))
+    return True
+
+
 async def _fetch_spot(stock_fetcher, trade_id) -> Decimal | None:
     """Best-effort SPY spot for the near-strike gates. Returns None on a feed blip;
     callers pass None to _near_short_strike, which FAIL-SAFEs to 'near' (→ close)."""
@@ -1008,12 +1073,15 @@ async def _process_one_condor_exit(
             else _near_short_strike(spot, legs[0], legs[2],
                                     settings.condor_stop_arm_band_pct)
         )
-        if not armed:
+        # DE-BOUNCE: a real breach stays through the strike; a whipsaw pops back.
+        # Require the armed condition to hold continuously before cutting.
+        if not _stop_persist_ok(trade, now, armed, factory):
             log.info(
                 "exit_monitor_stop_suppressed_inside", trade_id=trade.id,
                 spot=str(spot), short_put=legs[0], short_call=legs[2],
                 reason=reason, exit_debit=str(exit_debit),
-                arm_depth_pct=f"{depth:.5f}",
+                arm_depth_pct=f"{depth:.5f}", armed=armed,
+                persist_seconds=settings.condor_stop_persist_seconds,
             )
             return {
                 "trade_id": trade.id,
