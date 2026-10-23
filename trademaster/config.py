@@ -308,6 +308,25 @@ class Settings(BaseSettings):
     # precise — that is the real argument for two-tier monitoring.
     condor_stop_persist_seconds: int = Field(default=0, ge=0, le=900)
 
+    # TIER-1 SPOT POLLING. Seconds between cheap spot-only proximity checks
+    # (0 = disabled; tier-2's own cron is then the only sweep).
+    #
+    # Two-tier exit monitoring: tier-1 fetches ONE SPY quote and escalates to the
+    # full tier-2 sweep (chain fetch, debit, stop/target/force-close) only when
+    # SPY is within condor_tier1_band_pct of a short strike. The rest of the
+    # session costs one quote per tick and no chain at all.
+    #
+    # The payoff is PRECISION, not raw speed. The stop de-bounce measures how
+    # long a breach has HELD, and at a 2-minute sweep 180s is only 2-3 coarse
+    # samples; at 15s it is 12. Speed alone was shown to be harmful (#196,
+    # 2026-10-22, cost $3,808 when the */2 sweep caught a 2-minute arming
+    # window the */5 sweep would have missed) — it only pays WITH the de-bounce.
+    condor_tier1_seconds: int = Field(default=0, ge=0, le=300)
+    # Proximity band for escalation. Deliberately WIDER than the stop's own arm
+    # band so tier-1 wakes tier-2 just BEFORE the touch — otherwise the de-bounce
+    # clock would not start until the breach was already underway.
+    condor_tier1_band_pct: float = Field(default=0.001, ge=0, lt=0.02)
+
     # ASSIGNMENT CONFIG (opt-in, default OFF; SPY-only — XSP is cash-settled and needs
     # none). SPY options are physically settled, so an ITM short at expiry delivers
     # shares (assignment) = unbounded overnight risk. When on, at the force-close

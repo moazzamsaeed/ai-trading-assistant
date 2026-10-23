@@ -1622,6 +1622,9 @@ def test_condor_exit_sweep_has_no_blind_spot(monkeypatch):
         prev, t = nxt, nxt + datetime.timedelta(seconds=1)
     assert fires, "exit monitor never fires"
     gaps = [(b - a).total_seconds() / 60 for a, b in zip(fires, fires[1:])]
-    assert max(gaps) <= 2, f"blind spot of {max(gaps):.0f} min in the exit sweep"
-    # 10:00-15:44 every 2 min
-    assert len(fires) >= 170, f"only {len(fires)} sweeps per session"
+    # The original bug was gaps of 5,5,...,5,15 — a 15-minute hole at :50/:55.
+    # The invariant is UNIFORM spacing, not a particular cadence: tier-1 spot
+    # polling now supplies the fine resolution, so tier-2 may legitimately be
+    # slower, but it must never again skip part of the hour.
+    assert len(set(gaps)) == 1, f"non-uniform exit sweep spacing: {sorted(set(gaps))}"
+    assert max(gaps) <= 5, f"blind spot of {max(gaps):.0f} min in the exit sweep"

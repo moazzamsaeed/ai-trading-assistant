@@ -144,6 +144,55 @@ def _through_short_strike(
     return spot <= sp * (Decimal("1") - d) or spot >= sc * (Decimal("1") + d)
 
 
+async def spot_near_any_open_condor(
+    *,
+    stock_fetcher: Callable[..., object] = alpaca_client.get_latest_stock_quote,
+    session_factory: Callable[[], Session] | None = None,
+    band_pct: float | None = None,
+) -> dict | None:
+    """TIER-1 cheap proximity check. One SPY quote, NO option chain.
+
+    Returns a summary dict when at least one open condor has SPY within
+    `band_pct` of a short strike (or already through it) — i.e. when the
+    expensive tier-2 sweep is worth running — and None otherwise.
+
+    The point is precision, not speed for its own sake: the stop de-bounce
+    (condor_stop_persist_seconds) measures how long a breach has HELD, and at a
+    2-minute sweep that is only 2-3 coarse samples. Polling spot every 15s and
+    escalating only on proximity makes the de-bounce exact while leaving the
+    chain untouched for the ~95% of the session that is nowhere near a strike.
+
+    Deliberately returns None on any failure: tier-1 is an accelerator, never
+    the thing that decides. The scheduled tier-2 sweep remains the safety net.
+    """
+    if band_pct is None:
+        band_pct = get_settings().condor_tier1_band_pct
+    factory = session_factory or make_session_factory()
+    with factory() as session:
+        trades = _open_iron_condor_trades(session)
+        # read the legs inside the session; the rows detach afterwards
+        legs = [
+            (t.id, (t.extra or {}).get("short_put"), (t.extra or {}).get("short_call"))
+            for t in trades
+        ]
+    if not legs:
+        return None                      # nothing open: not even a quote needed
+
+    spot = await _fetch_spot(stock_fetcher, None)
+    if spot is None:
+        # A blind quote must not silently suppress tier-2; escalate so the
+        # full sweep can apply its own fail-safes.
+        return {"spot": None, "reason": "spot_unavailable", "trade_ids": [i for i, _, _ in legs]}
+
+    near = [
+        tid for tid, sp, sc in legs
+        if _near_short_strike(spot, sp, sc, band_pct)
+    ]
+    if not near:
+        return None
+    return {"spot": str(spot), "band_pct": band_pct, "trade_ids": near}
+
+
 def _stop_persist_ok(
     trade: Trade, now: datetime, armed: bool, factory: Callable[[], Session],
 ) -> bool:

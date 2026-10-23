@@ -38,7 +38,11 @@ from agents.directional.intraday import (
     run_directional_scan,
 )
 from agents.intraday.scan import run_intraday_scan
-from agents.options.exit_monitor import STRATEGY_NAME as STRATEGY_NAME_CONDOR, run_exit_monitor
+from agents.options.exit_monitor import (
+    STRATEGY_NAME as STRATEGY_NAME_CONDOR,
+    run_exit_monitor,
+    spot_near_any_open_condor,
+)
 from agents.options.strategist import (
     run_deterministic_condor,
     run_iron_condor_strategist,
@@ -1014,6 +1018,48 @@ async def _iron_condor_entry_job(
 # ----------------- iron-condor exit monitor -----------------
 
 
+async def _condor_tier1_job(
+    *,
+    signal_poster: Poster,
+    trade_poster: Poster,
+    log_poster: Poster = _noop_poster,
+    clock_fetcher: ClockFetcher = alpaca_client.get_market_clock,
+) -> None:
+    """TIER-1 spot poll (every condor_tier1_seconds). Escalates to the full
+    tier-2 sweep only when SPY is actually near a short strike.
+
+    Cheap by construction: no open condor → no API call at all; otherwise ONE
+    spot quote and no option chain. Tier-2's own cron still runs independently
+    as the safety net, so a tier-1 failure can only cost precision, never an
+    exit.
+    """
+    if get_state().is_paused():
+        return
+    try:
+        clock = await clock_fetcher()
+        if not clock.is_open:
+            return
+    except Exception as e:  # noqa: BLE001 — tier-1 is best-effort
+        log.warning("condor_tier1_clock_failed", error=str(e))
+        return
+
+    try:
+        hit = await spot_near_any_open_condor()
+    except Exception as e:  # noqa: BLE001
+        log.warning("condor_tier1_probe_failed", error=str(e))
+        return
+    if hit is None:
+        return
+
+    log.info("condor_tier1_escalating", **hit)
+    await _iron_condor_exit_job(
+        signal_poster=signal_poster,
+        trade_poster=trade_poster,
+        log_poster=log_poster,
+        clock_fetcher=clock_fetcher,
+    )
+
+
 async def _iron_condor_exit_job(
     *,
     signal_poster: Poster,
@@ -1472,7 +1518,24 @@ def make_scheduler(
             misfire_grace_time=300,
         )
 
-        # Exit monitor: every 2 min during RTH (10:00-15:58 ET).
+        # Exit monitor (TIER 2): every 5 min during RTH (10:00-15:55 ET).
+        #
+        # Cadence history, because it is easy to get wrong twice:
+        #   "0,5,...,45"  left a FIFTEEN-MINUTE blind spot every hour (nothing at
+        #                 :50/:55) — 26% of the session unwatched. #192 lost its
+        #                 whole overshoot inside that hole.
+        #   "*/2"         closed the hole but OVERSAMPLED: on #196 it caught a
+        #                 2-minute arming window */5 would have missed, turning a
+        #                 +$1,204 expiry into -$2,604.
+        #   "*/5" + tier-1 (now): no hole, no oversampling. Tier-1 polls spot
+        #                 every 15s and escalates HERE on proximity, so the
+        #                 danger zone is covered at 15s precision while this cron
+        #                 is just the periodic safety net plus the profit-target
+        #                 and force-close checks, none of which are time-critical.
+        #
+        # Frequency stopped being a loss/benefit trade-off once the stop gained its
+        # de-bounce (bbd7081) — it is now purely about measurement precision, and
+        # tier-1 provides that far more cheaply than a fast chain-fetching cron.
         #
         # Was "0,5,...,45", which left a FIFTEEN-MINUTE BLIND SPOT every hour
         # (nothing at :50 or :55) — 90 minutes of a 345-minute session, 26% of
@@ -1491,7 +1554,7 @@ def make_scheduler(
             CronTrigger(
                 day_of_week="mon-fri",
                 hour="10-15",
-                minute="*/2",
+                minute="*/5",
                 timezone=PREMARKET_TZ,
             ),
             kwargs={
@@ -1503,6 +1566,33 @@ def make_scheduler(
             replace_existing=True,
             misfire_grace_time=120,
         )
+
+        # TIER-1 spot poll (opt-in via condor_tier1_seconds). One SPY quote per
+        # tick, no option chain; escalates to the tier-2 sweep above only when
+        # SPY is near a short strike. max_instances=1 + coalesce so a slow
+        # escalation cannot stack: in the danger zone tier-2 runs back-to-back,
+        # which is exactly when that is wanted, but never concurrently.
+        tier1_s = get_settings().condor_tier1_seconds
+        if tier1_s > 0:
+            scheduler.add_job(
+                _condor_tier1_job,
+                CronTrigger(
+                    day_of_week="mon-fri",
+                    hour="10-15",
+                    second=f"*/{tier1_s}",
+                    timezone=PREMARKET_TZ,
+                ),
+                kwargs={
+                    "signal_poster": signal_poster,
+                    "trade_poster": trade_poster,
+                    "log_poster": log_post,
+                },
+                id="condor_tier1_spot",
+                replace_existing=True,
+                misfire_grace_time=10,
+                max_instances=1,
+                coalesce=True,
+            )
 
         # Safety-net force-close at 15:50 ET. The PRIMARY smart force-close now runs
         # in the 15:45 sweep (FORCE_CLOSE_AFTER=15:45) while the position is still
