@@ -99,6 +99,51 @@ def _near_short_strike(
     return spot <= sp * (Decimal("1") + band) or spot >= sc * (Decimal("1") - band)
 
 
+#: Minutes from the 10:00 ET entry to the 15:45 force-close deadline.
+SESSION_MINUTES = 345.0
+
+
+def _stop_arm_depth(now: datetime) -> float:
+    """Required breach depth (fraction of the strike) for the stop to arm.
+
+    Linearly scaled by time remaining to the force-close deadline: deep early,
+    shallow late. Both config values 0 → returns 0.0, i.e. arm at the touch,
+    which is the pre-existing behaviour.
+    """
+    s = get_settings()
+    hi = s.condor_stop_arm_through_pct_open
+    lo = s.condor_stop_arm_through_pct_close
+    if hi <= 0 and lo <= 0:
+        return 0.0
+    et = to_et(now)
+    deadline = et.replace(hour=FORCE_CLOSE_AFTER.hour, minute=FORCE_CLOSE_AFTER.minute,
+                          second=0, microsecond=0)
+    mtc = max((deadline - et).total_seconds() / 60.0, 0.0)
+    frac = min(mtc / SESSION_MINUTES, 1.0)
+    return lo + (hi - lo) * frac
+
+
+def _through_short_strike(
+    spot: Decimal | None, short_put_occ: str | None, short_call_occ: str | None,
+    depth: float,
+) -> bool:
+    """True once SPY is `depth` (fraction of strike) THROUGH a short strike.
+
+    depth = 0 is identical to _near_short_strike with band 0 (arms at the touch).
+    FAIL-SAFE: unknown spot or unparseable strikes → True, so a blind quote still
+    cuts rather than silently holding a losing position.
+    """
+    if spot is None:
+        return True
+    sp = _occ_strike(short_put_occ)
+    sc = _occ_strike(short_call_occ)
+    if sp is None or sc is None:
+        return True
+    spot = Decimal(str(spot))
+    d = Decimal(str(depth))
+    return spot <= sp * (Decimal("1") - d) or spot >= sc * (Decimal("1") + d)
+
+
 async def _fetch_spot(stock_fetcher, trade_id) -> Decimal | None:
     """Best-effort SPY spot for the near-strike gates. Returns None on a feed blip;
     callers pass None to _near_short_strike, which FAIL-SAFEs to 'near' (→ close)."""
@@ -146,6 +191,7 @@ def _format_legout_alert(trade, closed: list[dict], reason: str | None) -> str |
 async def _assignment_leg_out(
     trade, *, spot, legs, chain, closer, waiter, buf, fill_timeout_s, factory,
     close_all: bool = False, reason: str | None = None,
+    long_seller: Callable[..., object] | None = None,
 ) -> dict:
     """Buy back short leg(s) via single-leg market orders — the reliable unwind (each
     leg hits its own deep book, unlike the 4-leg MLEG combo). Longs are left to expire;
@@ -156,10 +202,12 @@ async def _assignment_leg_out(
     physically-settled short can't assign — comfortably-OTM shorts expire free.
     Stop fallback (close_all=True): flatten BOTH shorts to actually cut a losing trade
     when the MLEG close failed. FAIL-SAFE: unknown spot/strike → close the leg."""
-    short_put, _long_put, short_call, _long_call = legs
+    short_put, long_put, short_call, long_call = legs
+    paired_long = {short_put: long_put, short_call: long_call}
     band = Decimal(str(buf))
     spot_d = Decimal(str(spot)) if spot is not None else None
     closed: list[dict] = []
+    longs_sold: list[dict] = []
     for occ, is_put in ((short_put, True), (short_call, False)):
         strike = _occ_strike(occ)
         if close_all or strike is None or spot_d is None:
@@ -183,6 +231,41 @@ async def _assignment_leg_out(
             side="put" if is_put else "call", status=final.status,
             fill=str(final.filled_avg_price) if final.filled_avg_price else None,
         )
+        # Recover the paired LONG's residual value instead of letting it expire.
+        # Only on loss-cuts: the stop fires with SPY at/through the short, so the
+        # long is just the wing width further out and still carries premium
+        # ($186/stop measured over the 11 stop-outs to 2026-10-22). At the 15:45
+        # assignment leg-out the position is usually a winner and the longs really
+        # are worthless, so selling them there would just pay spread for nothing.
+        if long_seller is not None:
+            lg = paired_long.get(occ)
+            if lg:
+                lq = _quote_by_occ(chain, lg)
+                lref = (lq.bid if lq and getattr(lq, "bid", None) else Decimal("0"))
+                try:
+                    lo = await long_seller(
+                        qty=int(Decimal(str(trade.qty))), occ_symbol=lg,
+                        limit_price=lref,
+                    )
+                    lfin = await waiter(lo.order_id, timeout_s=fill_timeout_s)
+                    longs_sold.append({
+                        "occ": lg, "side": "put" if is_put else "call",
+                        "order_id": lo.order_id, "status": lfin.status,
+                        "fill": (str(lfin.filled_avg_price)
+                                 if lfin.filled_avg_price else None),
+                    })
+                    log.info(
+                        "exit_monitor_long_leg_sold", trade_id=trade.id, occ=lg,
+                        status=lfin.status,
+                        fill=(str(lfin.filled_avg_price)
+                              if lfin.filled_avg_price else None),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # The short is already flat — that is the risk-critical half.
+                    # A failed long sale just leaves it to expire, i.e. the old
+                    # behaviour, so never let it break the unwind.
+                    log.warning("exit_monitor_long_leg_sell_failed",
+                                trade_id=trade.id, occ=lg, error=str(e))
     with factory() as s:
         row = s.get(Trade, trade.id)
         if row is not None:
@@ -191,11 +274,16 @@ async def _assignment_leg_out(
             # that dropped this record on the first live leg-out, 2026-09-14).
             ex = dict(row.extra or {})
             ex["assignment_legs_closed"] = closed
+            if longs_sold:
+                # The reconciler prices the residual off these fills, so a sold
+                # long must be recorded or its recovered premium is lost.
+                ex["long_legs_sold"] = longs_sold
             row.extra = ex
             s.commit()
     result = {
         "trade_id": trade.id, "status": "assignment_closed",
         "legs_closed": [c["side"] for c in closed],
+        "longs_sold": [c["side"] for c in longs_sold],
         # Carry WHAT triggered this leg-out. Three callers reach here — the 15:45
         # deadline, the stop fallback, and the profit target — and without this
         # the journal and the result dict cannot tell them apart (the exit_reason
@@ -521,6 +609,7 @@ async def run_exit_monitor(
     position_fetcher: Callable[..., object] = alpaca_client.get_positions,
     position_closer: Callable[..., object] = alpaca_client.close_position,
     single_leg_closer: Callable[..., object] = alpaca_client.submit_single_option_buy_to_close,
+    long_seller: Callable[..., object] = alpaca_client.submit_single_option_sell,
     bars_fetcher: Callable[..., object] = alpaca_client.get_recent_bars,
     force_close: bool | None = None,
     fill_timeout_s: float = 60.0,
@@ -556,6 +645,7 @@ async def run_exit_monitor(
                 canceller=canceller,
                 stock_fetcher=stock_fetcher,
                 single_leg_closer=single_leg_closer,
+                long_seller=long_seller,
                 bars_fetcher=bars_fetcher,
                 force_close=force_close,
                 fill_timeout_s=fill_timeout_s,
@@ -790,6 +880,7 @@ async def _process_one_condor_exit(
     canceller: Callable[..., object],
     stock_fetcher: Callable[..., object],
     single_leg_closer: Callable[..., object] = alpaca_client.submit_single_option_buy_to_close,
+    long_seller: Callable[..., object] = alpaca_client.submit_single_option_sell,
     bars_fetcher: Callable[..., object] = alpaca_client.get_recent_bars,
     force_close: bool,
     fill_timeout_s: float,
@@ -904,13 +995,25 @@ async def _process_one_condor_exit(
     # breach. Only stop_loss reasons are gated: daily_loss_cap is the fast-gap backstop
     # and force_close has its own near-strike logic below. FAIL-SAFE: unknown spot →
     # _near_short_strike True → the stop still fires (we don't gamble on a blind quote).
+    #
+    # TIME-SCALED variant (condor_stop_arm_through_pct_*, both 0 = off): instead of
+    # arming at the touch, require SPY to be measurably THROUGH the strike, deeper
+    # early in the session than late. The stop otherwise fires at peak time value —
+    # $1,786/stop measured — which is premium that decays for free if held.
     if settings.condor_distance_aware_stop and reason.startswith("stop_loss"):
         spot = await _fetch_spot(stock_fetcher, trade.id)
-        if not _near_short_strike(spot, legs[0], legs[2], settings.condor_stop_arm_band_pct):
+        depth = _stop_arm_depth(now)
+        armed = (
+            _through_short_strike(spot, legs[0], legs[2], depth) if depth > 0
+            else _near_short_strike(spot, legs[0], legs[2],
+                                    settings.condor_stop_arm_band_pct)
+        )
+        if not armed:
             log.info(
                 "exit_monitor_stop_suppressed_inside", trade_id=trade.id,
                 spot=str(spot), short_put=legs[0], short_call=legs[2],
                 reason=reason, exit_debit=str(exit_debit),
+                arm_depth_pct=f"{depth:.5f}",
             )
             return {
                 "trade_id": trade.id,
@@ -1006,12 +1109,17 @@ async def _process_one_condor_exit(
         log.info("exit_monitor_single_leg_close", trade_id=trade.id, reason=reason)
         spot = await _fetch_spot(stock_fetcher, trade.id)
         # _assignment_leg_out now carries `reason` in its result for every caller.
+        # On a LOSS-CUT also sell the paired long — the stop fires with SPY at/through
+        # the short, so the long still has premium ($186/stop measured). Passing the
+        # seller ONLY here keeps the 15:45 assignment leg-out unchanged, where the
+        # longs really are worthless and selling them would pay spread for nothing.
         return await _assignment_leg_out(
             trade, spot=spot, legs=legs, chain=chain,
             closer=single_leg_closer, waiter=waiter,
             buf=settings.condor_assign_close_buffer_pct,
             fill_timeout_s=fill_timeout_s, factory=factory, close_all=True,
             reason=reason,
+            long_seller=long_seller if settings.condor_sell_longs_on_stop else None,
         )
 
     # Option A (legacy, flag off) — EVERY condor exit closes marketably. All condor

@@ -251,6 +251,41 @@ class Settings(BaseSettings):
     # a touch more whipsaw). Ignored unless condor_distance_aware_stop is True.
     condor_stop_arm_band_pct: float = Field(default=0.0, ge=0)
 
+    # TIME-SCALED STOP ARMING (opt-in; both 0 = off, keeps the band behaviour above).
+    #
+    # The 1.5x stop fires when SPY sits ON a short strike — which is exactly when
+    # the short's TIME VALUE is at its maximum. Measured over the 11 stop-outs to
+    # 2026-10-22: $1,786 per stop was time value, only the remainder was intrinsic
+    # (#192 was 95% time value, #196 73%). That premium decays to zero on its own;
+    # buying it back converts a recoverable position into a realised loss.
+    #
+    # So require SPY to be measurably THROUGH the strike before arming, and scale
+    # the requirement by time remaining — deep early (expensive to close, lots of
+    # time to recover), shallow late (cheap to close, a late breach tends to stick):
+    #
+    #   depth(mtc) = close_pct + (open_pct - close_pct) x (mtc / 345)
+    #
+    # armed  <=>  spot <= short_put x (1 - depth)  OR  spot >= short_call x (1 + depth)
+    #
+    # 0.0026 ~= $2.00 on SPY at 770; 0.0003 ~= $0.25. On those settings neither
+    # #196 (0.36 through, 73% TV) nor #192 (0.07 through, 95% TV) would have armed
+    # in the morning, and both settled back inside their bands.
+    #
+    # ⚠️ TRADE-OFF: a deeper requirement lets a genuine trend-day breach run further
+    # before cutting. The band sweep (scratchpad, 2026-10-22) showed 3 whipsaws
+    # recovered but 2 real breaches ran ~$5k deeper, non-monotonically — which is
+    # why this is time-scaled rather than a flat deeper band.
+    condor_stop_arm_through_pct_open: float = Field(default=0.0, ge=0, lt=0.05)
+    condor_stop_arm_through_pct_close: float = Field(default=0.0, ge=0, lt=0.05)
+
+    # On a LOSS-CUT (stop / daily cap), also sell the paired LONG leg instead of
+    # letting it expire. The stop fires with SPY at/through the short, so the long
+    # is only the wing width further out and still carries premium — measured at
+    # $186 per stop across the 11 stop-outs. One extra sell order at the same
+    # moment recovers it. Not applied to the 15:45 assignment leg-out, where the
+    # position is usually a winner and the longs really are worthless.
+    condor_sell_longs_on_stop: bool = True
+
     # ASSIGNMENT CONFIG (opt-in, default OFF; SPY-only — XSP is cash-settled and needs
     # none). SPY options are physically settled, so an ITM short at expiry delivers
     # shares (assignment) = unbounded overnight risk. When on, at the force-close

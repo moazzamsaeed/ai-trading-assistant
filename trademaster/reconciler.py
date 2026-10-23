@@ -73,21 +73,32 @@ def _condor_settlement_debit_legout(
     closed_put_fill: Decimal | None,
     closed_call_fill: Decimal | None,
     max_loss_per_contract: Decimal | None,
+    sold_put_fill: Decimal | None = None,
+    sold_call_fill: Decimal | None = None,
 ) -> Decimal:
     """Settlement debit for a condor whose short leg(s) were bought back by the
     assignment config's 15:50 leg-out. For a CLOSED short, the cost is the actual
-    buyback price we paid (not intrinsic), and the same-side LONG is still held so it
-    still pays its expiry intrinsic. A non-closed side settles at normal spread
+    buyback price we paid (not intrinsic). A non-closed side settles at normal spread
     intrinsic. A closed side CAN net a credit (naked long finishes ITM) — so it is
     NOT floored at 0, unlike a held spread. Result is $/contract to match entry_price.
+
+    The same-side LONG is credited one of two ways, and getting this wrong
+    double-counts it:
+      * `sold_*_fill` given — the loss-cut also SOLD the long, so credit the ACTUAL
+        sale proceeds. The leg is gone; it cannot also pay expiry intrinsic.
+      * otherwise — the long is still held, so credit its expiry intrinsic.
     """
     sp, lp, sc, lc = float(short_put), float(long_put), float(short_call), float(long_call)
     if closed_put_fill is not None:
-        put_cost = float(closed_put_fill) - max(0.0, lp - spot)   # paid buyback − long-put intrinsic
+        long_put_credit = (float(sold_put_fill) if sold_put_fill is not None
+                           else max(0.0, lp - spot))
+        put_cost = float(closed_put_fill) - long_put_credit
     else:
         put_cost = max(0.0, max(0.0, sp - spot) - max(0.0, lp - spot))
     if closed_call_fill is not None:
-        call_cost = float(closed_call_fill) - max(0.0, spot - lc)  # paid buyback − long-call intrinsic
+        long_call_credit = (float(sold_call_fill) if sold_call_fill is not None
+                            else max(0.0, spot - lc))
+        call_cost = float(closed_call_fill) - long_call_credit
     else:
         call_cost = max(0.0, max(0.0, spot - sc) - max(0.0, spot - lc))
     debit = Decimal(str(round((put_cost + call_cost) * 100, 2)))
@@ -209,11 +220,20 @@ async def settle_expired_condors(
             for c in (extra.get("assignment_legs_closed") or [])
             if c.get("status") == "filled" and c.get("fill")
         }
+        # A loss-cut may ALSO have sold the paired long. Those legs are gone, so they
+        # must be credited at their actual sale proceeds rather than expiry intrinsic.
+        sold = {
+            c.get("side"): c.get("fill")
+            for c in (extra.get("long_legs_sold") or [])
+            if c.get("status") == "filled" and c.get("fill")
+        }
         if legout:
             debit = _condor_settlement_debit_legout(
                 spot, **strikes,
                 closed_put_fill=Decimal(str(legout["put"])) if "put" in legout else None,
                 closed_call_fill=Decimal(str(legout["call"])) if "call" in legout else None,
+                sold_put_fill=Decimal(str(sold["put"])) if "put" in sold else None,
+                sold_call_fill=Decimal(str(sold["call"])) if "call" in sold else None,
                 max_loss_per_contract=max_loss,
             )
         else:
