@@ -291,3 +291,31 @@ async def test_get_options_chain_passes_configured_feed(monkeypatch):
 
     await alpaca_client.get_options_chain("SPY")
     assert captured["feed"] == OptionsFeed.OPRA
+
+
+def test_bounded_client_applies_default_timeout():
+    # A hung Alpaca response once froze the condor spot poller for ~5 min
+    # (`read timeout=None`). Every client must send a timeout to the socket.
+    seen = []
+
+    class _Session:
+        def request(self, method, url, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return "ok"
+
+    client = SimpleNamespace(_session=_Session())
+    alpaca_client._bounded(client)
+
+    assert client._session.request("GET", "https://x") == "ok"
+    client._session.request("GET", "https://x", timeout=3)
+    assert seen == [alpaca_client.HTTP_TIMEOUT_S, 3]
+
+
+def test_all_factories_are_bounded(monkeypatch):
+    monkeypatch.setattr(alpaca_client, "_bounded", lambda c: ("bounded", c))
+    for cls in ("NewsClient", "TradingClient", "OptionHistoricalDataClient",
+                "StockHistoricalDataClient"):
+        monkeypatch.setattr(alpaca_client, cls, lambda **kw: object())
+    for factory in (alpaca_client._client, alpaca_client._trading_client,
+                    alpaca_client._options_client, alpaca_client._stock_client):
+        assert factory()[0] == "bounded"

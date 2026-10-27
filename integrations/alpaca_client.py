@@ -11,6 +11,7 @@ Phase 2 trade execution. Every write call logs structured event lines.
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -56,22 +57,44 @@ class NewsArticle:
     source: str
 
 
+# alpaca-py sends every request through a requests.Session with NO timeout, so a
+# stalled Alpaca response blocks the calling job forever (`read timeout=None`). On
+# 2026-10-27 a hung get_clock froze the 15s condor spot poller for ~5 min while a
+# stop was arming. Bound every request at the socket so callers get an exception
+# (which they already handle) instead of a hang.
+HTTP_TIMEOUT_S = (5.0, 20.0)  # (connect, read)
+
+
+def _bounded(client):
+    """Give `client`'s HTTP session a default timeout; an explicit one still wins."""
+    session = client._session
+    unbounded = session.request
+
+    @functools.wraps(unbounded)
+    def request(method, url, **kwargs):
+        kwargs.setdefault("timeout", HTTP_TIMEOUT_S)
+        return unbounded(method, url, **kwargs)
+
+    session.request = request
+    return client
+
+
 def _client() -> NewsClient:
     settings = get_settings()
-    return NewsClient(
+    return _bounded(NewsClient(
         api_key=settings.alpaca_api_key.get_secret_value(),
         secret_key=settings.alpaca_api_secret.get_secret_value(),
-    )
+    ))
 
 
 def _trading_client() -> TradingClient:
     """Trading client. Uses `paper=True` when TRADING_MODE=paper."""
     settings = get_settings()
-    return TradingClient(
+    return _bounded(TradingClient(
         api_key=settings.alpaca_api_key.get_secret_value(),
         secret_key=settings.alpaca_api_secret.get_secret_value(),
         paper=settings.trading_mode == "paper",
-    )
+    ))
 
 
 @dataclass(frozen=True)
@@ -373,10 +396,10 @@ def parse_occ_symbol(occ: str) -> tuple[str, date, str, Decimal]:
 
 def _options_client() -> OptionHistoricalDataClient:
     settings = get_settings()
-    return OptionHistoricalDataClient(
+    return _bounded(OptionHistoricalDataClient(
         api_key=settings.alpaca_api_key.get_secret_value(),
         secret_key=settings.alpaca_api_secret.get_secret_value(),
-    )
+    ))
 
 
 def _options_feed() -> OptionsFeed:
@@ -509,10 +532,10 @@ class StockQuote:
 
 def _stock_client() -> StockHistoricalDataClient:
     settings = get_settings()
-    return StockHistoricalDataClient(
+    return _bounded(StockHistoricalDataClient(
         api_key=settings.alpaca_api_key.get_secret_value(),
         secret_key=settings.alpaca_api_secret.get_secret_value(),
-    )
+    ))
 
 
 async def get_latest_stock_quote(symbol: str) -> StockQuote:
